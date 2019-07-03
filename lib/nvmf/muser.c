@@ -30,9 +30,12 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <muser.h>
+
 #include "spdk/stdinc.h"
 #include "spdk/assert.h"
 #include "spdk/thread.h"
+#include "spdk/nvme_spec.h"
 #include "spdk/nvmf.h"
 #include "spdk/nvmf_spec.h"
 #include "spdk/sock.h"
@@ -63,15 +66,19 @@ struct muser_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
 };
 
-struct muser_uuid {
+struct muser_dev {
 	struct spdk_nvme_transport_id		trid;
-	TAILQ_ENTRY(muser_uuid)			link;
+	char					uuid[37];
+	pthread_t				lm_thr;
+	lm_ctx_t				*lm_ctx;
+	struct spdk_nvme_registers		*bar0;
+	TAILQ_ENTRY(muser_dev)			link;
 };
 
 struct muser_transport {
 	struct spdk_nvmf_transport		transport;
 	pthread_mutex_t				lock;
-	TAILQ_HEAD(, muser_uuid)		uuids;
+	TAILQ_HEAD(, muser_dev)			devs;
 };
 
 static int
@@ -83,12 +90,167 @@ muser_req_free(struct spdk_nvmf_request *req)
 static int
 muser_destroy(struct spdk_nvmf_transport *transport)
 {
-	return -1;
+	struct muser_transport *muser_transport;
+
+	muser_transport = (struct muser_transport *)transport;
+
+	(void)pthread_mutex_destroy(&muser_transport->lock);
+
+	free(muser_transport);
+
+	return 0;
 }
 
 static struct spdk_nvmf_transport *
 muser_create(struct spdk_nvmf_transport_opts *opts)
 {
+	struct muser_transport *muser_transport;
+	int err;
+
+	muser_transport = calloc(1, sizeof(*muser_transport));
+	if (muser_transport == NULL) {
+		SPDK_ERRLOG("Transport alloc fail: %m\n");
+		return NULL;
+	}
+
+	err = pthread_mutex_init(&muser_transport->lock, NULL);
+	if (err != 0) {
+		SPDK_ERRLOG("Pthread initialisation failed (%d)\n", err);
+		goto err;
+	}
+
+	TAILQ_INIT(&muser_transport->devs);
+
+	return &muser_transport->transport;
+
+err:
+	free(muser_transport);
+
+	return NULL;
+}
+
+#define MDEV_CREATE_PATH "/sys/class/muser/muser/mdev_supported_types/muser-1/create"
+
+static void
+mdev_remove(const char *uuid)
+{ /* TODO: Implement me */ }
+
+static int
+mdev_create(const char *uuid)
+{
+	int fd;
+	int err;
+
+	fd = open(MDEV_CREATE_PATH, O_WRONLY);
+	if (fd == -1) {
+		SPDK_ERRLOG("Error opening '%s': %m\n", MDEV_CREATE_PATH);
+		return -1;
+	}
+
+	err = write(fd, uuid, strlen(uuid));
+	if (err != (int)strlen(uuid)) {
+		SPDK_ERRLOG("Error creating device '%s': %m\n", uuid);
+		err = -1;
+	} else {
+		err = 0;
+	}
+
+	(void)close(fd);
+
+	sleep(1);
+
+	/* TODO: Wait until dev appears on /dev/muser/<uuid> */
+
+	return err;
+}
+
+static ssize_t
+muser_read(void *pvt, const int index, char *buf, size_t count, loff_t pos)
+{
+	struct muser_dev *muser_dev = pvt;
+
+	SPDK_NOTICELOG("dev: %p, idx=%d, count=%zu, pos=%"PRIX64"\n",
+		       muser_dev, index, count, pos);
+
+	if (index == 0) {
+	    /* TODO: Ensure pos/count is within boundaries */
+	    memcpy(buf, muser_dev->bar0 + pos, count);
+	}
+
+	return count;
+}
+
+static ssize_t
+muser_write(void *pvt, const int index, char *buf, size_t count, loff_t pos)
+{
+	struct muser_dev *muser_dev = pvt;
+	union spdk_nvme_cc_register *cc;
+
+	SPDK_NOTICELOG("dev: %p, idx=%d, count=%zu, pos=%"PRIX64"\n",
+		       muser_dev, index, count, pos);
+	spdk_log_dump(stdout, "muser_write", buf, count);
+
+	if (index == 0) {
+		switch (pos) {
+		case offsetof(struct spdk_nvme_registers, cc):
+			if (count != 4) {
+				errno = EINVAL;
+				return -1;
+			}
+			cc = (union spdk_nvme_cc_register *)buf;
+			if (cc->bits.en == 1) {
+				SPDK_NOTICELOG("ENABLE SET TO 1\n");
+			}
+			break;
+		default:
+			errno = EINVAL;
+			return -1;
+		}
+	}
+
+	return count;
+}
+
+static void
+dev_info_fill(lm_dev_info_t *dev_info, struct muser_dev *muser_dev)
+{
+	int i;
+
+	dev_info->pvt = muser_dev;
+	dev_info->uuid = muser_dev->uuid;
+	dev_info->id.vid = 0x4e58;
+	dev_info->id.did = 0x0001;
+	dev_info->cc.pi = 0x02;
+	dev_info->cc.scc = 0x08;
+	dev_info->cc.bcc = 0x01;
+
+	dev_info->fops.read = muser_read;
+	dev_info->fops.write = muser_write;
+
+	dev_info->irq_count[LM_DEV_INTX_IRQ_IDX] = 1;
+	dev_info->irq_count[LM_DEV_MSI_IRQ_IDX]  = 1;
+	dev_info->irq_count[LM_DEV_MSIX_IRQ_IDX] = 32;
+
+	dev_info->nr_dma_regions = 0x10;
+
+	for (i = 0; i < LM_DEV_NUM_REGS; i++) {
+		dev_info->reg_info[i].offset = i * (1UL << 36);
+	}
+
+	dev_info->reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
+	dev_info->reg_info[LM_DEV_BAR0_REG_IDX].size  = 0x4000;
+
+	dev_info->reg_info[LM_DEV_CFG_REG_IDX].flags  = LM_REG_FLAG_RW;
+	dev_info->reg_info[LM_DEV_CFG_REG_IDX].size   = 0x1000;
+}
+
+static void *
+drive(void *arg)
+{
+	lm_ctx_t *lm_ctx = arg;
+
+	lm_ctx_drive(lm_ctx);
+
 	return NULL;
 }
 
@@ -96,6 +258,60 @@ static int
 muser_listen(struct spdk_nvmf_transport *transport,
 	     const struct spdk_nvme_transport_id *trid)
 {
+	struct muser_transport *muser_transport;
+	struct muser_dev *muser_dev;
+	lm_dev_info_t dev_info = { 0 };
+	int err;
+
+	muser_transport = (struct muser_transport *)transport;
+
+	err = mdev_create(trid->traddr);
+	if (err == -1) {
+		return -1;
+	}
+
+	muser_dev = calloc(1, sizeof(*muser_dev));
+	if (muser_dev == NULL) {
+		SPDK_ERRLOG("Error allocating dev: %m\n");
+		goto err;
+	}
+	memcpy(muser_dev->uuid, trid->traddr, sizeof(muser_dev->uuid));
+
+	muser_dev->bar0 = calloc(1, sizeof(*muser_dev->bar0));
+	if (muser_dev->bar0 == NULL) {
+		SPDK_ERRLOG("Error allocating bar0: %m\n");
+		goto err_free;
+	}
+
+	dev_info_fill(&dev_info, muser_dev);
+	muser_dev->lm_ctx = lm_ctx_create(&dev_info);
+	if (muser_dev->lm_ctx == NULL) {
+		/* TODO: lm_create doesn't set errno */
+		SPDK_ERRLOG("Error creating libmuser ctx: %m\n");
+		goto err_free_bar0;
+	}
+
+	err = pthread_create(&muser_dev->lm_thr, NULL,
+			     drive, muser_dev->lm_ctx);
+	if (err != 0) {
+		/* TODO: pthread_create doesn't set errno */
+		SPDK_ERRLOG("Error creating lm_drive thread: %m\n");
+		goto err_destroy;
+	}
+
+	TAILQ_INSERT_TAIL(&muser_transport->devs, muser_dev, link);
+
+	return 0;
+
+err_destroy:
+	lm_ctx_destroy(muser_dev->lm_ctx);
+err_free_bar0:
+	free(muser_dev->bar0);
+err_free:
+	free(muser_dev);
+err:
+	mdev_remove(trid->traddr);
+
 	return -1;
 }
 
@@ -119,12 +335,26 @@ muser_discover(struct spdk_nvmf_transport *transport,
 static struct spdk_nvmf_transport_poll_group *
 muser_poll_group_create(struct spdk_nvmf_transport *transport)
 {
-	return NULL;
+    struct muser_poll_group *poll_group;
+
+    poll_group = calloc(1, sizeof(*poll_group));
+    if (poll_group == NULL) {
+        SPDK_ERRLOG("Error allocating poll group: %m");
+        return NULL;
+    }
+
+    return (struct spdk_nvmf_transport_poll_group *)poll_group;
 }
 
 static void
 muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
-{ }
+{
+    struct muser_poll_group *poll_group;
+
+    poll_group = (struct muser_poll_group *)group;
+
+    free(poll_group);
+}
 
 static int
 muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
