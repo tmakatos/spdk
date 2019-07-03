@@ -47,6 +47,21 @@
 
 #include "spdk_internal/log.h"
 
+#define MUSER_DEFAULT_MAX_QUEUE_DEPTH 128
+#define MUSER_DEFAULT_AQ_DEPTH 32
+#define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
+#define MUSER_DEFAULT_IN_CAPSULE_DATA_SIZE 0
+#define MUSER_DEFAULT_MAX_IO_SIZE 131072
+#define MUSER_DEFAULT_IO_UNIT_SIZE 131072
+#define MUSER_DEFAULT_NUM_SHARED_BUFFERS 512 /* internal buf size */
+#define MUSER_DEFAULT_BUFFER_CACHE_SIZE 0
+
+enum muser_nvmf_dir {
+	MUSER_NVMF_INVALID,
+	MUSER_NVMF_READ,
+	MUSER_NVMF_WRITE
+};
+
 struct muser_req  {
 	struct spdk_nvmf_request		req;
 	struct spdk_nvme_cpl			*rsp;
@@ -55,23 +70,39 @@ struct muser_req  {
 	TAILQ_ENTRY(muser_req)			link;
 };
 
+struct muser_nvmf_prop_req {
+	enum muser_nvmf_dir			dir;
+	sem_t					wait;
+	char 					*buf;
+	size_t					count;
+	loff_t					pos;
+	ssize_t					ret;
+};
+
 struct muser_qpair {
 	struct spdk_nvmf_qpair			qpair;
 	struct spdk_nvmf_muser_poll_group	*group;
-
+	struct muser_dev			*dev;
+	struct muser_nvmf_prop_req		prop_req;
+	struct muser_req			*reqs_internal;
+	union nvmf_h2c_msg			*cmds_internal;
+	union nvmf_c2h_msg			*rsps_internal;
+	TAILQ_HEAD(, muser_req)			reqs;
 	TAILQ_ENTRY(muser_qpair)		link;
 };
 
 struct muser_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
+	TAILQ_HEAD(, muser_qpair)		qps;
 };
 
 struct muser_dev {
 	struct spdk_nvme_transport_id		trid;
+	struct muser_qpair			admin_qp;
 	char					uuid[37];
 	pthread_t				lm_thr;
 	lm_ctx_t				*lm_ctx;
-	struct spdk_nvme_registers		*bar0;
+	bool					setup;
 	TAILQ_ENTRY(muser_dev)			link;
 };
 
@@ -80,12 +111,6 @@ struct muser_transport {
 	pthread_mutex_t				lock;
 	TAILQ_HEAD(, muser_dev)			devs;
 };
-
-static int
-muser_req_free(struct spdk_nvmf_request *req)
-{
-	return -1;
-}
 
 static int
 muser_destroy(struct spdk_nvmf_transport *transport)
@@ -168,13 +193,22 @@ static ssize_t
 muser_read(void *pvt, const int index, char *buf, size_t count, loff_t pos)
 {
 	struct muser_dev *muser_dev = pvt;
+	int err;
 
 	SPDK_NOTICELOG("dev: %p, idx=%d, count=%zu, pos=%"PRIX64"\n",
 		       muser_dev, index, count, pos);
 
 	if (index == 0) {
-	    /* TODO: Ensure pos/count is within boundaries */
-	    memcpy(buf, muser_dev->bar0 + pos, count);
+		muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_READ;
+		muser_dev->admin_qp.prop_req.buf = buf;
+		muser_dev->admin_qp.prop_req.count = count;
+		muser_dev->admin_qp.prop_req.pos = pos;
+
+		do {
+			err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
+		} while (err != 0 && errno != EINTR);
+
+		return muser_dev->admin_qp.prop_req.ret;
 	}
 
 	return count;
@@ -184,28 +218,23 @@ static ssize_t
 muser_write(void *pvt, const int index, char *buf, size_t count, loff_t pos)
 {
 	struct muser_dev *muser_dev = pvt;
-	union spdk_nvme_cc_register *cc;
+	int err;
 
 	SPDK_NOTICELOG("dev: %p, idx=%d, count=%zu, pos=%"PRIX64"\n",
 		       muser_dev, index, count, pos);
 	spdk_log_dump(stdout, "muser_write", buf, count);
 
 	if (index == 0) {
-		switch (pos) {
-		case offsetof(struct spdk_nvme_registers, cc):
-			if (count != 4) {
-				errno = EINVAL;
-				return -1;
-			}
-			cc = (union spdk_nvme_cc_register *)buf;
-			if (cc->bits.en == 1) {
-				SPDK_NOTICELOG("ENABLE SET TO 1\n");
-			}
-			break;
-		default:
-			errno = EINVAL;
-			return -1;
-		}
+		muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
+		muser_dev->admin_qp.prop_req.buf = buf;
+		muser_dev->admin_qp.prop_req.count = count;
+		muser_dev->admin_qp.prop_req.pos = pos;
+
+		do {
+			err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
+		} while (err != 0 && errno != EINTR);
+
+		return muser_dev->admin_qp.prop_req.ret;
 	}
 
 	return count;
@@ -261,6 +290,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	struct muser_transport *muser_transport;
 	struct muser_dev *muser_dev;
 	lm_dev_info_t dev_info = { 0 };
+	int i;
 	int err;
 
 	muser_transport = (struct muser_transport *)transport;
@@ -276,19 +306,57 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto err;
 	}
 	memcpy(muser_dev->uuid, trid->traddr, sizeof(muser_dev->uuid));
+	memcpy(&muser_dev->trid, trid, sizeof(muser_dev->trid));
 
-	muser_dev->bar0 = calloc(1, sizeof(*muser_dev->bar0));
-	if (muser_dev->bar0 == NULL) {
-		SPDK_ERRLOG("Error allocating bar0: %m\n");
-		goto err_free;
+	/* Admin QP setup */
+	muser_dev->admin_qp.qpair.transport = transport;
+	muser_dev->admin_qp.dev = muser_dev;
+
+	TAILQ_INIT(&muser_dev->admin_qp.reqs);
+
+	err = sem_init(&muser_dev->admin_qp.prop_req.wait, 0, 0);
+	assert(err == 0);
+
+	muser_dev->admin_qp.rsps_internal = calloc(MUSER_DEFAULT_AQ_DEPTH,
+						   sizeof(union nvmf_c2h_msg));
+	if (muser_dev->admin_qp.rsps_internal == NULL) {
+		SPDK_ERRLOG("Error allocating rsps: %m\n");
+		goto err_free_dev;
 	}
 
+	muser_dev->admin_qp.cmds_internal = calloc(MUSER_DEFAULT_AQ_DEPTH,
+						   sizeof(union nvmf_h2c_msg));
+	if (muser_dev->admin_qp.cmds_internal == NULL) {
+		SPDK_ERRLOG("Error allocating cmds: %m\n");
+		goto err_free_rsps;
+	}
+
+	muser_dev->admin_qp.reqs_internal = calloc(MUSER_DEFAULT_AQ_DEPTH,
+					           sizeof(struct muser_req));
+	if (muser_dev->admin_qp.reqs_internal == NULL) {
+		SPDK_ERRLOG("Error allocating reqs: %m\n");
+		goto err_free_cmds;
+	}
+
+	for (i = 0; i < MUSER_DEFAULT_AQ_DEPTH; i++) {
+		muser_dev->admin_qp.reqs_internal[i].req.qpair =
+				&muser_dev->admin_qp.qpair;
+		muser_dev->admin_qp.reqs_internal[i].req.rsp =
+				&muser_dev->admin_qp.rsps_internal[i];
+		muser_dev->admin_qp.reqs_internal[i].req.cmd =
+				&muser_dev->admin_qp.cmds_internal[i];
+		TAILQ_INSERT_TAIL(&muser_dev->admin_qp.reqs,
+				  &muser_dev->admin_qp.reqs_internal[i],
+				  link);
+	}
+
+	/* LM setup */
 	dev_info_fill(&dev_info, muser_dev);
 	muser_dev->lm_ctx = lm_ctx_create(&dev_info);
 	if (muser_dev->lm_ctx == NULL) {
 		/* TODO: lm_create doesn't set errno */
 		SPDK_ERRLOG("Error creating libmuser ctx: %m\n");
-		goto err_free_bar0;
+		goto err_free_reqs;
 	}
 
 	err = pthread_create(&muser_dev->lm_thr, NULL,
@@ -305,9 +373,13 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 err_destroy:
 	lm_ctx_destroy(muser_dev->lm_ctx);
-err_free_bar0:
-	free(muser_dev->bar0);
-err_free:
+err_free_reqs:
+	free(muser_dev->admin_qp.reqs_internal);
+err_free_cmds:
+	free(muser_dev->admin_qp.cmds_internal);
+err_free_rsps:
+	free(muser_dev->admin_qp.rsps_internal);
+err_free_dev:
 	free(muser_dev);
 err:
 	mdev_remove(trid->traddr);
@@ -324,7 +396,19 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 
 static void
 muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn)
-{ }
+{
+	struct muser_transport *muser_transport;
+	struct muser_dev *muser_dev;
+
+	muser_transport = (struct muser_transport *)transport;
+
+	TAILQ_FOREACH(muser_dev, &muser_transport->devs, link) {
+		if (muser_dev->setup == false) {
+			cb_fn(&muser_dev->admin_qp.qpair);
+			muser_dev->setup = true;
+		}
+	}
+}
 
 static void
 muser_discover(struct spdk_nvmf_transport *transport,
@@ -335,15 +419,17 @@ muser_discover(struct spdk_nvmf_transport *transport,
 static struct spdk_nvmf_transport_poll_group *
 muser_poll_group_create(struct spdk_nvmf_transport *transport)
 {
-    struct muser_poll_group *poll_group;
+	struct muser_poll_group *muser_group;
 
-    poll_group = calloc(1, sizeof(*poll_group));
-    if (poll_group == NULL) {
-        SPDK_ERRLOG("Error allocating poll group: %m");
-        return NULL;
-    }
+	muser_group = calloc(1, sizeof(*muser_group));
+	if (muser_group == NULL) {
+		SPDK_ERRLOG("Error allocating poll group: %m");
+		return NULL;
+	}
 
-    return (struct spdk_nvmf_transport_poll_group *)poll_group;
+	TAILQ_INIT(&muser_group->qps);
+
+	return (struct spdk_nvmf_transport_poll_group *)muser_group;
 }
 
 static void
@@ -360,7 +446,49 @@ static int
 muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 		     struct spdk_nvmf_qpair *qpair)
 {
-	return -1;
+	struct muser_poll_group *muser_group;
+	struct muser_qpair *muser_qpair;
+	struct muser_req *muser_req;
+	struct muser_dev *muser_dev;
+
+	muser_group = (struct muser_poll_group *)group;
+	muser_qpair = (struct muser_qpair *)qpair;
+	muser_dev = muser_qpair->dev;
+
+	/* Admin QP */
+	if (qpair->qid == 0) {
+		struct spdk_nvmf_request *req;
+		struct spdk_nvmf_fabric_connect_data *data;
+
+		muser_req = TAILQ_FIRST(&muser_qpair->reqs);
+		TAILQ_REMOVE(&muser_qpair->reqs, muser_req, link);
+
+		req = &muser_req->req;
+		req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
+		req->cmd->connect_cmd.cid = 0;
+		req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
+		req->cmd->connect_cmd.recfmt = 0;
+		req->cmd->connect_cmd.sqsize = MUSER_DEFAULT_AQ_DEPTH - 1;
+		req->cmd->connect_cmd.qid = 0;
+
+		req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
+		req->data = calloc(1, req->length);
+		assert(req->data != NULL);
+		/* TODO: Pre-allocate memory */
+
+		data = (struct spdk_nvmf_fabric_connect_data *)req->data;
+		/* data->hostid = { 0 } */
+		data->cntlid = 0xffff;
+		snprintf(data->subnqn, sizeof(data->subnqn),
+			 "nqn.2019-07.io.spdk.muser:%s", muser_dev->uuid);
+		/* data->hostnqn = { 0 } */
+
+		spdk_nvmf_request_exec(req);
+	}
+
+	TAILQ_INSERT_TAIL(&muser_group->qps, muser_qpair, link);
+
+	return 0;
 }
 
 static int
@@ -370,10 +498,42 @@ muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	return -1;
 }
 
+static void
+muser_req_done(struct spdk_nvmf_request *req)
+{
+	struct muser_qpair *muser_qpair;
+	struct muser_req *muser_req;
+
+	muser_qpair = (struct muser_qpair *)req->qpair;
+	muser_req = (struct muser_req *)req;
+
+	if (req->cmd->connect_cmd.opcode == SPDK_NVME_OPC_FABRIC &&
+	    req->cmd->connect_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_CONNECT) {
+		free(req->data);
+		req->data = NULL;
+	}
+
+	TAILQ_INSERT_TAIL(&muser_qpair->reqs, muser_req, link);
+}
+
+static int
+muser_req_free(struct spdk_nvmf_request *req)
+{
+	muser_req_done(req);
+	return 0;
+}
+
 static int
 muser_req_complete(struct spdk_nvmf_request *req)
 {
-	return -1;
+	if (req->cmd->connect_cmd.opcode != SPDK_NVME_OPC_FABRIC &&
+	    req->cmd->connect_cmd.fctype != SPDK_NVMF_FABRIC_COMMAND_CONNECT) {
+		/* TODO: do cqe business */
+	}
+
+	muser_req_done(req);
+
+	return 0;
 }
 
 static void
@@ -383,44 +543,86 @@ muser_close_qpair(struct spdk_nvmf_qpair *qpair)
 static int
 muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
-	return -1;
+	struct muser_poll_group *muser_group;
+	struct muser_qpair *muser_qpair;
+	int err;
+
+	muser_group = (struct muser_poll_group *)group;
+
+	TAILQ_FOREACH(muser_qpair, &muser_group->qps, link) {
+		if (muser_qpair->prop_req.dir != MUSER_NVMF_INVALID) {
+			struct spdk_nvmf_request *req;
+			struct muser_req *muser_req;
+
+			muser_req = TAILQ_FIRST(&muser_qpair->reqs);
+			TAILQ_REMOVE(&muser_qpair->reqs, muser_req, link);
+
+			req = &muser_req->req;
+			req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
+			req->cmd->prop_set_cmd.cid = 0;
+			req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
+			req->cmd->prop_set_cmd.attrib.size = (muser_qpair->prop_req.count/4)-1;
+			req->cmd->prop_set_cmd.ofst = muser_qpair->prop_req.pos;
+			req->cmd->prop_set_cmd.value.u32.high = 0;
+			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)muser_qpair->prop_req.buf;
+		
+			req->length = 0;
+			req->data = NULL;
+		
+			spdk_nvmf_request_exec(req);
+
+			/* The below should prob. be in complete or something */
+
+			muser_qpair->prop_req.dir = MUSER_NVMF_INVALID;
+			err = sem_post(&muser_qpair->prop_req.wait);
+			assert(err == 0);
+			(void)err;
+		}
+	}
+
+	return 0;
 }
 
 static int
 muser_qpair_get_local_trid(struct spdk_nvmf_qpair *qpair,
 			   struct spdk_nvme_transport_id *trid)
 {
-	return -1;
+	struct muser_qpair *muser_qpair;
+	struct muser_dev *muser_dev;
+
+	muser_qpair = (struct muser_qpair *)qpair;
+	muser_dev = muser_qpair->dev;
+
+	memcpy(trid, &muser_dev->trid, sizeof(*trid));
+	return 0;
 }
 
 static int
 muser_qpair_get_peer_trid(struct spdk_nvmf_qpair *qpair,
 			  struct spdk_nvme_transport_id *trid)
 {
-	return -1;
+	return 0;
 }
 
 static int
 muser_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 			    struct spdk_nvme_transport_id *trid)
 {
-	return -1;
+	struct muser_qpair *muser_qpair;
+	struct muser_dev *muser_dev;
+
+	muser_qpair = (struct muser_qpair *)qpair;
+	muser_dev = muser_qpair->dev;
+
+	memcpy(trid, &muser_dev->trid, sizeof(*trid));
+	return 0;
 }
 
 static int
 muser_qpair_set_sq_size(struct spdk_nvmf_qpair *qpair)
 {
-	return -1;
+	return 0;
 }
-
-#define MUSER_DEFAULT_MAX_QUEUE_DEPTH 128
-#define MUSER_DEFAULT_AQ_DEPTH 128
-#define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
-#define MUSER_DEFAULT_IN_CAPSULE_DATA_SIZE 0
-#define MUSER_DEFAULT_MAX_IO_SIZE 131072
-#define MUSER_DEFAULT_IO_UNIT_SIZE 131072
-#define MUSER_DEFAULT_NUM_SHARED_BUFFERS 512 /* internal buf size */
-#define MUSER_DEFAULT_BUFFER_CACHE_SIZE 0
 
 static void
 muser_opts_init(struct spdk_nvmf_transport_opts *opts)
