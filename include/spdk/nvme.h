@@ -264,6 +264,11 @@ enum spdk_nvme_transport_type {
 	 * TCP Transport
 	 */
 	SPDK_NVME_TRANSPORT_TCP = SPDK_NVMF_TRTYPE_TCP,
+
+	/**
+	 * Kernel mdev-based Transport
+	 */
+	SPDK_NVME_TRANSPORT_MUSER = SPDK_NVMF_TRTYPE_MUSER,
 };
 
 /* typedef added for coding style reasons */
