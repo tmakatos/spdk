@@ -32,6 +32,7 @@
 
 #include <muser.h>
 
+#include "spdk/barrier.h"
 #include "spdk/stdinc.h"
 #include "spdk/assert.h"
 #include "spdk/thread.h"
@@ -199,10 +200,12 @@ muser_read(void *pvt, const int index, char *buf, size_t count, loff_t pos)
 		       muser_dev, index, count, pos);
 
 	if (index == 0) {
-		muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_READ;
 		muser_dev->admin_qp.prop_req.buf = buf;
+		/* TODO: count must never be more than 8, otherwise we need to split it */
 		muser_dev->admin_qp.prop_req.count = count;
 		muser_dev->admin_qp.prop_req.pos = pos;
+		spdk_wmb();
+		muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_READ;
 
 		do {
 			err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
@@ -225,10 +228,11 @@ muser_write(void *pvt, const int index, char *buf, size_t count, loff_t pos)
 	spdk_log_dump(stdout, "muser_write", buf, count);
 
 	if (index == 0) {
-		muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
 		muser_dev->admin_qp.prop_req.buf = buf;
 		muser_dev->admin_qp.prop_req.count = count;
 		muser_dev->admin_qp.prop_req.pos = pos;
+		spdk_wmb();
+		muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
 
 		do {
 			err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
@@ -257,7 +261,6 @@ dev_info_fill(lm_dev_info_t *dev_info, struct muser_dev *muser_dev)
 	dev_info->fops.write = muser_write;
 
 	dev_info->irq_count[LM_DEV_INTX_IRQ_IDX] = 1;
-	dev_info->irq_count[LM_DEV_MSI_IRQ_IDX]  = 1;
 	dev_info->irq_count[LM_DEV_MSIX_IRQ_IDX] = 32;
 
 	dev_info->nr_dma_regions = 0x10;
@@ -550,6 +553,7 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	muser_group = (struct muser_poll_group *)group;
 
 	TAILQ_FOREACH(muser_qpair, &muser_group->qps, link) {
+		spdk_rmb();
 		if (muser_qpair->prop_req.dir != MUSER_NVMF_INVALID) {
 			struct spdk_nvmf_request *req;
 			struct muser_req *muser_req;
@@ -560,18 +564,31 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			req = &muser_req->req;
 			req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 			req->cmd->prop_set_cmd.cid = 0;
-			req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
+			if (muser_qpair->prop_req.dir == MUSER_NVMF_WRITE) {
+				req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
+				req->cmd->prop_set_cmd.value.u32.high = 0;
+				req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)muser_qpair->prop_req.buf;
+			} else {
+				req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
+			}
 			req->cmd->prop_set_cmd.attrib.size = (muser_qpair->prop_req.count/4)-1;
 			req->cmd->prop_set_cmd.ofst = muser_qpair->prop_req.pos;
-			req->cmd->prop_set_cmd.value.u32.high = 0;
-			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)muser_qpair->prop_req.buf;
 		
 			req->length = 0;
 			req->data = NULL;
 		
 			spdk_nvmf_request_exec(req);
 
-			/* The below should prob. be in complete or something */
+			/*
+			 * The below should prob. be in complete or something
+			 * This only works because the above will be sync
+			 */
+
+			if (muser_qpair->prop_req.dir == MUSER_NVMF_READ) {
+				memcpy(muser_qpair->prop_req.buf,
+				       &req->rsp->prop_get_rsp.value.u64,
+				       muser_qpair->prop_req.count);
+			}
 
 			muser_qpair->prop_req.dir = MUSER_NVMF_INVALID;
 			err = sem_post(&muser_qpair->prop_req.wait);
