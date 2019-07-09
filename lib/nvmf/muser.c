@@ -30,7 +30,7 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <muser.h>
+#include <muser/muser.h>
 
 #include "spdk/barrier.h"
 #include "spdk/stdinc.h"
@@ -48,6 +48,8 @@
 
 #include "spdk_internal/log.h"
 
+#include "muser-nvme_pci.h"
+
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 128
 #define MUSER_DEFAULT_AQ_DEPTH 32
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
@@ -56,6 +58,15 @@
 #define MUSER_DEFAULT_IO_UNIT_SIZE 131072
 #define MUSER_DEFAULT_NUM_SHARED_BUFFERS 512 /* internal buf size */
 #define MUSER_DEFAULT_BUFFER_CACHE_SIZE 0
+
+#define NVME_REG_CFG_SIZE       0x1000
+#define NVME_REG_BAR0_SIZE      0x4000
+
+#define NVME_IRQ_INTX_NUM       1
+#define NVME_IRQ_MSIX_NUM       32
+
+/* TODO 36 comes from a real NVMe device, does it have to be 36? */
+#define NVME_REG_OFFSET         (1UL << 36)
 
 enum muser_nvmf_dir {
 	MUSER_NVMF_INVALID,
@@ -104,6 +115,7 @@ struct muser_dev {
 	pthread_t				lm_thr;
 	lm_ctx_t				*lm_ctx;
 	bool					setup;
+    	lm_pci_config_space_t			*pci_config_space;
 	TAILQ_ENTRY(muser_dev)			link;
 };
 
@@ -191,89 +203,164 @@ mdev_create(const char *uuid)
 }
 
 static ssize_t
-muser_read(void *pvt, const int index, char *buf, size_t count, loff_t pos)
+read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 {
 	struct muser_dev *muser_dev = pvt;
 	int err;
 
-	SPDK_NOTICELOG("dev: %p, idx=%d, count=%zu, pos=%"PRIX64"\n",
-		       muser_dev, index, count, pos);
+	SPDK_NOTICELOG("dev: %p, count=%zu, pos=%"PRIX64"\n",
+		       muser_dev, count, pos);
 
-	if (index == 0) {
-		muser_dev->admin_qp.prop_req.buf = buf;
-		/* TODO: count must never be more than 8, otherwise we need to split it */
-		muser_dev->admin_qp.prop_req.count = count;
-		muser_dev->admin_qp.prop_req.pos = pos;
-		spdk_wmb();
-		muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_READ;
+	muser_dev->admin_qp.prop_req.buf = buf;
+	/* TODO: count must never be more than 8, otherwise we need to split it */
+	muser_dev->admin_qp.prop_req.count = count;
+	muser_dev->admin_qp.prop_req.pos = pos;
+	spdk_wmb();
+	muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_READ;
 
-		do {
-			err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
-		} while (err != 0 && errno != EINTR);
+	do {
+		err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
+	} while (err != 0 && errno != EINTR);
 
-		return muser_dev->admin_qp.prop_req.ret;
-	}
-
-	return count;
+	return muser_dev->admin_qp.prop_req.ret;
 }
 
 static ssize_t
-muser_write(void *pvt, const int index, char *buf, size_t count, loff_t pos)
+write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 {
 	struct muser_dev *muser_dev = pvt;
 	int err;
 
-	SPDK_NOTICELOG("dev: %p, idx=%d, count=%zu, pos=%"PRIX64"\n",
-		       muser_dev, index, count, pos);
+	SPDK_NOTICELOG("dev: %p, count=%zu, pos=%"PRIX64"\n",
+		       muser_dev, count, pos);
 	spdk_log_dump(stdout, "muser_write", buf, count);
 
-	if (index == 0) {
-		muser_dev->admin_qp.prop_req.buf = buf;
-		muser_dev->admin_qp.prop_req.count = count;
-		muser_dev->admin_qp.prop_req.pos = pos;
-		spdk_wmb();
-		muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
+	muser_dev->admin_qp.prop_req.buf = buf;
+	muser_dev->admin_qp.prop_req.count = count;
+	muser_dev->admin_qp.prop_req.pos = pos;
+	spdk_wmb();
+	muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
 
-		do {
-			err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
-		} while (err != 0 && errno != EINTR);
+	do {
+		err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
+	} while (err != 0 && errno != EINTR);
 
-		return muser_dev->admin_qp.prop_req.ret;
-	}
+	return muser_dev->admin_qp.prop_req.ret;
+}
 
-	return count;
+static ssize_t
+access_bar_fn(void *pvt, const int region_index, char * const buf, size_t count,
+              loff_t offset, const bool is_write)
+{
+	if (region_index != LM_DEV_BAR0_REG_IDX) {
+		SPDK_NOTICELOG("unsupported access to BAR%d, dev: %p, count=%zu, pos=%"PRIX64"\n",
+		       region_index, pvt, count, offset);
+		return -1;
+	}	
+
+	if (is_write)
+		return write_bar0(pvt, buf, count, offset);
+
+	return read_bar0(pvt, buf, count, offset);
+}
+
+/* 
+ * NVMe driver reads 4096 bytes, which is the extended PCI configuration space 
+ * available on PCI-X 2.0 and PCI Express buses
+ */
+static ssize_t
+access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
+                  const bool is_write)
+{
+    struct muser_dev * const muser_dev = (struct muser_dev*)pvt;
+
+    if (is_write) {
+        switch (offset) {
+            case offsetof(struct nvme_config_space, pci_expr_cap.pxdc):
+                fprintf(stderr, "writing to PXDC\n");
+                return count;
+        }
+
+        fprintf(stderr, "writes non supported\n");
+        return -EINVAL;
+    }
+
+    if (offset + count > PCI_EXTENDED_CONFIG_SPACE_SIZEOF) {
+        fprintf(stderr, "access past end of extended PCI configuration space, want=%ld+%ld, max=%d\n",
+                offset, count, PCI_EXTENDED_CONFIG_SPACE_SIZEOF);
+        return -ERANGE;
+    }
+
+    memcpy(buf, ((unsigned char*)muser_dev->pci_config_space) + offset, count);
+
+    return count;
 }
 
 static void
-dev_info_fill(lm_dev_info_t *dev_info, struct muser_dev *muser_dev)
+nvme_reg_info_fill(lm_reg_info_t *reg_info)
 {
-	int i;
+    int i;
+
+    assert(reg_info != NULL);
+
+    memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
+
+    for (i = 0; i < LM_DEV_NUM_REGS; i++) {
+        reg_info[i].offset = i * NVME_REG_OFFSET;
+    }
+
+    reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
+    reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
+
+    reg_info[LM_DEV_CFG_REG_IDX].flags = LM_REG_FLAG_RW;
+    reg_info[LM_DEV_CFG_REG_IDX].size  = NVME_REG_CFG_SIZE;
+}
+
+static void
+nvme_log(void *pvt, char const * const msg) {
+    fprintf(stderr, "%s", msg);
+}
+
+static void
+nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
+                   struct muser_dev *muser_dev)
+{
+	assert(dev_info != NULL);
+	assert(muser_dev != NULL);
 
 	dev_info->pvt = muser_dev;
+
 	dev_info->uuid = muser_dev->uuid;
-	dev_info->id.vid = 0x4e58;
+
+	dev_info->id.vid = 0x4e58;     // TODO: LE ?
 	dev_info->id.did = 0x0001;
+
+	/* controller uses the NVM Express programming interface */
 	dev_info->cc.pi = 0x02;
+
+	/* non-volatile memory controller */
 	dev_info->cc.scc = 0x08;
+
+	/* mass storage controller */
 	dev_info->cc.bcc = 0x01;
 
-	dev_info->fops.read = muser_read;
-	dev_info->fops.write = muser_write;
+	if (fops)
+		dev_info->fops = *fops;
 
-	dev_info->irq_count[LM_DEV_INTX_IRQ_IDX] = 1;
-	dev_info->irq_count[LM_DEV_MSIX_IRQ_IDX] = 32;
+	dev_info->irq_count[LM_DEV_INTX_IRQ_IDX] = NVME_IRQ_INTX_NUM;
+	dev_info->irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
 
 	dev_info->nr_dma_regions = 0x10;
 
-	for (i = 0; i < LM_DEV_NUM_REGS; i++) {
-		dev_info->reg_info[i].offset = i * (1UL << 36);
-	}
+	dev_info->bar_fn = &access_bar_fn;
+	dev_info->pci_config_fn = &access_pci_config;
 
-	dev_info->reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
-	dev_info->reg_info[LM_DEV_BAR0_REG_IDX].size  = 0x4000;
+	dev_info->extended = true;
 
-	dev_info->reg_info[LM_DEV_CFG_REG_IDX].flags  = LM_REG_FLAG_RW;
-	dev_info->reg_info[LM_DEV_CFG_REG_IDX].size   = 0x1000;
+	nvme_reg_info_fill(dev_info->reg_info);
+
+	dev_info->log = nvme_log;
+	dev_info->log_lvl = LM_DBG;
 }
 
 static void *
@@ -284,6 +371,56 @@ drive(void *arg)
 	lm_ctx_drive(lm_ctx);
 
 	return NULL;
+}
+
+static void
+init_pci_config_space(struct nvme_config_space * const p)
+{
+    mlbar_t *mlbar;
+    nvme_bar2_t *nvme_bar2;
+
+    /* MLBAR */
+    mlbar = (mlbar_t*)&p->hdr.bars[0].raw;
+    mlbar->raw = 0x0; /* initialize register to 0 */
+
+    /* MUBAR */
+    p->hdr.bars[1].raw = 0x0;
+
+    /*
+     * BAR2, index/data pair register base address or vendor specific (optional)
+     */
+    nvme_bar2 = (nvme_bar2_t*)&p->hdr.bars[2].raw;
+    nvme_bar2->raw = 0x0;
+    nvme_bar2->rte = 0x1;
+
+    /* vendor specific, let's set them to zero for now */
+    p->hdr.bars[3].raw = 0x0;
+    p->hdr.bars[4].raw = 0x0;
+    p->hdr.bars[5].raw = 0x0;
+
+    p->hdr.intr.ipin = 0x1;
+
+    /* enables capabilities */
+    p->hdr.sts.cl = 0x1;
+
+    /*
+     * TODO add function that adds a capability (takes care of updating the
+     * next pointers etc.)
+     */
+   
+    p->hdr.cap = offsetof(struct nvme_config_space, pmcap); 
+    assert(p->hdr.cap = 0x40);
+    /* initialize PMCAP */
+    p->pmcap.pid.cid = 0x1; /* PCI power management capability */
+    p->pmcap.pmcs.nsfrst = 0x1;
+
+    p->pmcap.pid.next = offsetof(struct nvme_config_space, pci_expr_cap);
+    /* initialize PXCAP */
+    p->pci_expr_cap.pxid.cid = 0x10; /* PCI Express capability */
+    p->pci_expr_cap.pxcap.ver = 0x2;
+    p->pci_expr_cap.pxdcap.per = 0x1;
+    p->pci_expr_cap.pxdcap.flrc = 0x1;
+    p->pci_expr_cap.pxdcap2.ctds = 0x1;
 }
 
 static int
@@ -354,13 +491,17 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	}
 
 	/* LM setup */
-	dev_info_fill(&dev_info, muser_dev);
+	nvme_dev_info_fill(&dev_info, NULL, muser_dev);
 	muser_dev->lm_ctx = lm_ctx_create(&dev_info);
 	if (muser_dev->lm_ctx == NULL) {
 		/* TODO: lm_create doesn't set errno */
 		SPDK_ERRLOG("Error creating libmuser ctx: %m\n");
 		goto err_free_reqs;
 	}
+
+
+	muser_dev->pci_config_space = lm_get_pci_config_space(muser_dev->lm_ctx);
+	init_pci_config_space((struct nvme_config_space*)muser_dev->pci_config_space);
 
 	err = pthread_create(&muser_dev->lm_thr, NULL,
 			     drive, muser_dev->lm_ctx);
