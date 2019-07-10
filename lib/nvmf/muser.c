@@ -85,7 +85,7 @@ struct muser_req  {
 struct muser_nvmf_prop_req {
 	enum muser_nvmf_dir			dir;
 	sem_t					wait;
-	char 					*buf;
+	char					*buf;
 	size_t					count;
 	loff_t					pos;
 	ssize_t					ret;
@@ -115,7 +115,7 @@ struct muser_dev {
 	pthread_t				lm_thr;
 	lm_ctx_t				*lm_ctx;
 	bool					setup;
-    	lm_pci_config_space_t			*pci_config_space;
+	lm_pci_config_space_t			*pci_config_space;
 	TAILQ_ENTRY(muser_dev)			link;
 };
 
@@ -267,7 +267,7 @@ access_bar_fn(void *pvt, const int region_index, char * const buf, size_t count,
 
 	if (ret != 0) {
 		SPDK_WARNLOG("failed to %s %lx@%lx BAR0: %zu\n",
-		               is_write ? "write" : "read", offset, count, ret);
+			       is_write ? "write" : "read", offset, count, ret);
 		return -1;
 	}
 	return count;
@@ -485,7 +485,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	}
 
 	muser_dev->admin_qp.reqs_internal = calloc(MUSER_DEFAULT_AQ_DEPTH,
-					           sizeof(struct muser_req));
+						   sizeof(struct muser_req));
 	if (muser_dev->admin_qp.reqs_internal == NULL) {
 		SPDK_ERRLOG("Error allocating reqs: %m\n");
 		goto err_free_cmds;
