@@ -252,16 +252,25 @@ static ssize_t
 access_bar_fn(void *pvt, const int region_index, char * const buf, size_t count,
               loff_t offset, const bool is_write)
 {
+	ssize_t ret;
+
 	if (region_index != LM_DEV_BAR0_REG_IDX) {
-		SPDK_NOTICELOG("unsupported access to BAR%d, dev: %p, count=%zu, pos=%"PRIX64"\n",
+		SPDK_WARNLOG("unsupported access to BAR%d, dev: %p, count=%zu, pos=%"PRIX64"\n",
 		       region_index, pvt, count, offset);
 		return -1;
 	}	
 
 	if (is_write)
-		return write_bar0(pvt, buf, count, offset);
+		ret = write_bar0(pvt, buf, count, offset);
+	else
+		ret = read_bar0(pvt, buf, count, offset);
 
-	return read_bar0(pvt, buf, count, offset);
+	if (ret != 0) {
+		SPDK_WARNLOG("failed to %s %lx@%lx BAR0: %zu\n",
+		               is_write ? "write" : "read", offset, count, ret);
+		return -1;
+	}
+	return count;
 }
 
 /* 
@@ -277,7 +286,11 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
     if (is_write) {
         switch (offset) {
             case offsetof(struct nvme_config_space, pci_expr_cap.pxdc):
-                fprintf(stderr, "writing to PXDC\n");
+		if (count != sizeof (struct pxdc)) {
+			SPDK_WARNLOG("bad write size to PXDC %zu\n", count);
+			return -EINVAL;
+		} 
+                SPDK_NOTICELOG("writing to PXDC 0x%hx\n", *(struct pxdc*)buf);
                 return count;
         }
 
