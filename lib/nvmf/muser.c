@@ -116,6 +116,12 @@ struct muser_dev {
 	lm_ctx_t				*lm_ctx;
 	bool					setup;
 	lm_pci_config_space_t			*pci_config_space;
+
+	/* TODO group admin queues in a struct? */
+	union spdk_nvme_aqa_register		aqa;
+	uint64_t				asq;
+	uint64_t				acq;
+
 	TAILQ_ENTRY(muser_dev)			link;
 };
 
@@ -203,6 +209,31 @@ mdev_create(const char *uuid)
 }
 
 static ssize_t
+read_cap(struct muser_dev const * const dev, char * const buf,
+         const size_t count, loff_t pos)
+{
+	/*
+	 * FIXME need to validate count and pos
+	 * FIXME is it OK to read it like that? Do we need to submit a request
+	 * to the NVMf layer?
+	 * TODO this line is far too long
+	 */
+	assert(d);
+	memcpy(buf, ((uint8_t*)&dev->admin_qp.qpair.ctrlr->vcprop.cap.raw) + pos - offsetof(struct spdk_nvme_registers, cap), count);
+	return 0;
+}
+
+static bool
+is_cap(const loff_t pos)
+{
+	const size_t off = offsetof(struct spdk_nvme_registers, cap);
+	return (size_t)pos >= off && (size_t)pos < off + sizeof(uint64_t);
+}
+
+/*
+ * FIXME read_bar0 and write_bar0 are very similar, merge
+ */
+static ssize_t
 read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 {
 	struct muser_dev *muser_dev = pvt;
@@ -210,6 +241,13 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 
 	SPDK_NOTICELOG("dev: %p, count=%zu, pos=%"PRIX64"\n",
 		       muser_dev, count, pos);
+
+	/*
+	 * CAP is 8 bytes long however the driver reads it 4 bytes at a time.
+	 * NVMf doesn't like this.
+	 */
+	if (is_cap(pos))
+		return read_cap(muser_dev, buf, count, pos);
 
 	muser_dev->admin_qp.prop_req.buf = buf;
 	/* TODO: count must never be more than 8, otherwise we need to split it */
@@ -226,6 +264,107 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 }
 
 static ssize_t
+aqa_write(union spdk_nvme_aqa_register * const to,
+          union spdk_nvme_aqa_register const * const from)
+{
+	to->raw = from->raw;
+	return 0;
+}
+
+static void
+write_partial(uint8_t const * const buf, const loff_t pos, const size_t count,
+              const size_t reg_off, uint64_t * const reg)
+{
+	memcpy(reg, buf + pos - reg_off, count);
+}
+
+static ssize_t
+asq_or_acq_write(uint8_t const * const buf, const loff_t pos,
+                 const size_t count, uint64_t * const reg, const size_t reg_off)
+{
+	/*
+	 * The NVMe driver seems to write those only in 4 upper/lower bytes.
+	 */
+	if (count != sizeof(uint32_t)) {
+		SPDK_ERRLOG("bad write count %zu\n", count);
+		return -EINVAL;
+	}
+
+	if ((size_t)pos != reg_off && (size_t)pos != reg_off + sizeof(uint32_t)) {
+		SPDK_ERRLOG("bad write offset 0x%lx\n", pos);
+		return -EINVAL;
+	}
+
+	write_partial(buf, pos, count, reg_off, reg);
+
+	return 0;
+}
+
+static ssize_t
+asq_write(uint64_t * const asq, uint8_t const * const buf,
+          const loff_t pos, const size_t count)
+{
+	return asq_or_acq_write(buf, pos, count, asq,
+	                        offsetof(struct spdk_nvme_registers, asq));
+}
+
+static ssize_t
+acq_write(uint64_t * const acq, uint8_t const * const buf,
+          const loff_t pos, const size_t count)
+{
+	return asq_or_acq_write(buf, pos, count, acq,
+	                        offsetof(struct spdk_nvme_registers, acq));
+}
+
+#define REGISTER_RANGE(name, size) \
+	offsetof(struct spdk_nvme_registers, name) ... \
+		offsetof(struct spdk_nvme_registers, name) + size - 1
+
+#define ASQ \
+	REGISTER_RANGE(asq, sizeof(uint64_t))
+
+#define ACQ \
+	REGISTER_RANGE(acq, sizeof(uint64_t))
+
+#define ADMIN_QUEUES \
+	offsetof(struct spdk_nvme_registers, aqa) ... \
+		offsetof(struct spdk_nvme_registers, acq) + sizeof(uint64_t) - 1
+
+#define SQ_DOORBELL \
+	offsetof(struct spdk_nvme_registers, doorbell[0].sq_tdbl)
+
+static ssize_t
+admin_queue_write(struct muser_dev * const dev, uint8_t const * const buf,
+                  const size_t count, const loff_t pos)
+{
+	switch (pos) {
+		case offsetof(struct spdk_nvme_registers, aqa):
+			return aqa_write((union spdk_nvme_aqa_register*)buf,
+			                 &dev->aqa);
+		case ASQ:
+			return asq_write(&dev->asq, buf, pos, count);
+		case ACQ:
+			return acq_write(&dev->acq, buf, pos, count);
+		default:
+			break;
+	}
+	SPDK_ERRLOG("bad admin queue write offset 0x%lx\n", pos);
+	return -EINVAL;
+}
+
+static ssize_t
+sq_write(struct muser_dev * const dev, char const * const buf,
+         const size_t count, const loff_t pos)
+{
+	if (count != sizeof(uint32_t)) {
+		SPDK_ERRLOG("bad write SQ size %zu\n", count);
+		return -EINVAL;
+	}
+	SPDK_NOTICELOG("write to SQ 0x%x\n", *(uint32_t*)buf);
+	return 0;
+}
+
+static ssize_t
 write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 {
 	struct muser_dev *muser_dev = pvt;
@@ -234,6 +373,15 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	SPDK_NOTICELOG("dev: %p, count=%zu, pos=%"PRIX64"\n",
 		       muser_dev, count, pos);
 	spdk_log_dump(stdout, "muser_write", buf, count);
+
+	switch (pos) {
+		case ADMIN_QUEUES:
+			return admin_queue_write(muser_dev, buf, count, pos);
+		case SQ_DOORBELL:
+			return sq_write(muser_dev, buf, count, pos);
+		default:
+			break;
+	}
 
 	muser_dev->admin_qp.prop_req.buf = buf;
 	muser_dev->admin_qp.prop_req.count = count;
@@ -286,11 +434,12 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
     if (is_write) {
         switch (offset) {
             case offsetof(struct nvme_config_space, pci_expr_cap.pxdc):
-		if (count != sizeof (struct pxdc)) {
+		if (count != sizeof (union pxdc)) {
 			SPDK_WARNLOG("bad write size to PXDC %zu\n", count);
 			return -EINVAL;
 		} 
-                SPDK_NOTICELOG("writing to PXDC 0x%hx\n", *(struct pxdc*)buf);
+                SPDK_NOTICELOG("writing to PXDC 0x%hx\n",
+		               ((union pxdc*)buf)->raw);
                 return count;
         }
 
