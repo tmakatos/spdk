@@ -120,6 +120,7 @@ struct muser_dev {
 	/* TODO group admin queues in a struct? */
 	union spdk_nvme_aqa_register		aqa;
 	uint64_t				asq;
+	void					*asq_addr;
 	uint64_t				acq;
 
 	TAILQ_ENTRY(muser_dev)			link;
@@ -218,7 +219,7 @@ read_cap(struct muser_dev const * const dev, char * const buf,
 	 * to the NVMf layer?
 	 * TODO this line is far too long
 	 */
-	assert(d);
+	assert(dev);
 	memcpy(buf, ((uint8_t*)&dev->admin_qp.qpair.ctrlr->vcprop.cap.raw) + pos - offsetof(struct spdk_nvme_registers, cap), count);
 	return 0;
 }
@@ -268,6 +269,7 @@ aqa_write(union spdk_nvme_aqa_register * const to,
           union spdk_nvme_aqa_register const * const from)
 {
 	to->raw = from->raw;
+	SPDK_NOTICELOG("write to AQA %x\n", to->raw);
 	return 0;
 }
 
@@ -304,8 +306,10 @@ static ssize_t
 asq_write(uint64_t * const asq, uint8_t const * const buf,
           const loff_t pos, const size_t count)
 {
-	return asq_or_acq_write(buf, pos, count, asq,
-	                        offsetof(struct spdk_nvme_registers, asq));
+	int ret = asq_or_acq_write(buf, pos, count, asq,
+	                           offsetof(struct spdk_nvme_registers, asq));
+	SPDK_NOTICELOG("ASQ=0x%lx\n", *asq);
+	return ret;
 }
 
 static ssize_t
@@ -330,7 +334,7 @@ acq_write(uint64_t * const acq, uint8_t const * const buf,
 	offsetof(struct spdk_nvme_registers, aqa) ... \
 		offsetof(struct spdk_nvme_registers, acq) + sizeof(uint64_t) - 1
 
-#define SQ_DOORBELL \
+#define SQ0TBDL \
 	offsetof(struct spdk_nvme_registers, doorbell[0].sq_tdbl)
 
 static ssize_t
@@ -352,16 +356,76 @@ admin_queue_write(struct muser_dev * const dev, uint8_t const * const buf,
 	return -EINVAL;
 }
 
+static int
+asq_map(struct muser_dev * const dev)
+{
+	dma_scattergather_t sg[1];
+	struct iovec iov;
+	int ret;
+
+	assert(dev);
+	assert(!dev->asq_addr);
+	assert(dev->asq);
+
+	/* FIXME this is the number of entries, need to figure out size of memory */
+	ret = lm_addr_to_sg(dev->lm_ctx, dev->asq, dev->aqa.bits.acqs + 1, sg,
+	                    1);
+	if (ret != 1) {
+		SPDK_ERRLOG("failed to map SQ 0x%lx: %d\n", dev->asq, ret);
+		return -1;
+	}
+
+	ret = lm_map_sg(dev->lm_ctx, PROT_READ | PROT_WRITE, sg, &iov, 1);
+	if (ret != 0) {
+		SPDK_ERRLOG("failed to map segment: %d\n", ret);
+		return -1;
+	}
+
+	dev->asq_addr = iov.iov_base;
+	return 0;
+}
+
+static int
+consume_admin_req(struct spdk_nvme_cmd * const asq, const uint32_t index)
+{
+	struct spdk_nvme_cmd *cmd = asq + index;	
+	return 0;
+}
+
+/*
+ * Callback that gets triggered when the driver writes to the admin submission
+ * queue doorbell.
+ */
 static ssize_t
-sq_write(struct muser_dev * const dev, char const * const buf,
+sq0tbdl_write(struct muser_dev * const dev, char const * const buf,
          const size_t count, const loff_t pos)
 {
+	int ret;
+	uint32_t index;
+
 	if (count != sizeof(uint32_t)) {
 		SPDK_ERRLOG("bad write SQ size %zu\n", count);
 		return -EINVAL;
 	}
-	SPDK_NOTICELOG("write to SQ 0x%x\n", *(uint32_t*)buf);
-	return 0;
+	index = *(uint32_t*)buf;
+	SPDK_NOTICELOG("write to SQ 0x%x\n", index);
+
+	/*
+	 * TODO we should be mapping the queue when ASQ gets written, however
+	 * the NVMe driver writes it in two steps and this complicates things,
+	 * e.g. is it guaranteed to write both upper and lower portions?
+	 */
+	if (!dev->asq_addr) {
+		ret = asq_map(dev);
+		if (ret) {
+			SPDK_ERRLOG("failed to map SQ: %d\n", ret);
+			return -1;
+		}
+	}
+
+	ret = consume_admin_req((struct spdk_nvme_cmd*)dev->asq_addr, index);
+
+	return ret;
 }
 
 static ssize_t
@@ -377,8 +441,8 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	switch (pos) {
 		case ADMIN_QUEUES:
 			return admin_queue_write(muser_dev, buf, count, pos);
-		case SQ_DOORBELL:
-			return sq_write(muser_dev, buf, count, pos);
+		case SQ0TBDL:
+			return sq0tbdl_write(muser_dev, buf, count, pos);
 		default:
 			break;
 	}
