@@ -117,11 +117,8 @@ struct muser_dev {
 	bool					setup;
 	lm_pci_config_space_t			*pci_config_space;
 
-	/* TODO group admin queues in a struct? */
-	union spdk_nvme_aqa_register		aqa;
-	uint64_t				asq;
+	struct spdk_nvme_registers		regs;
 	void					*asq_addr;
-	uint64_t				acq;
 
 	TAILQ_ENTRY(muser_dev)			link;
 };
@@ -344,11 +341,11 @@ admin_queue_write(struct muser_dev * const dev, uint8_t const * const buf,
 	switch (pos) {
 		case offsetof(struct spdk_nvme_registers, aqa):
 			return aqa_write((union spdk_nvme_aqa_register*)buf,
-			                 &dev->aqa);
+			                 &dev->regs.aqa);
 		case ASQ:
-			return asq_write(&dev->asq, buf, pos, count);
+			return asq_write(&dev->regs.asq, buf, pos, count);
 		case ACQ:
-			return acq_write(&dev->acq, buf, pos, count);
+			return acq_write(&dev->regs.acq, buf, pos, count);
 		default:
 			break;
 	}
@@ -365,13 +362,13 @@ asq_map(struct muser_dev * const dev)
 
 	assert(dev);
 	assert(!dev->asq_addr);
-	assert(dev->asq);
+	assert(dev->regs.asq);
 
 	/* FIXME this is the number of entries, need to figure out size of memory */
-	ret = lm_addr_to_sg(dev->lm_ctx, dev->asq, dev->aqa.bits.acqs + 1, sg,
-	                    1);
+	ret = lm_addr_to_sg(dev->lm_ctx, dev->regs.asq,
+	                    dev->regs.aqa.bits.acqs + 1, sg, 1);
 	if (ret != 1) {
-		SPDK_ERRLOG("failed to map SQ 0x%lx: %d\n", dev->asq, ret);
+		SPDK_ERRLOG("failed to map SQ 0x%lx: %d\n", dev->regs.asq, ret);
 		return -1;
 	}
 
@@ -386,9 +383,14 @@ asq_map(struct muser_dev * const dev)
 }
 
 static int
-consume_admin_req(struct spdk_nvme_cmd * const asq, const uint32_t index)
+consume_admin_req(struct muser_dev * dev, const uint32_t val)
 {
-	struct spdk_nvme_cmd *cmd = asq + index;	
+	struct spdk_nvme_cmd *admin_queue = dev->regs.asq;
+	/*
+	 * XXX dev->regs.sq0tdbl is the current tail pointer,
+	 * val is the new one, the difference is the number of requests added
+	 * in the queue
+	 */
 	return 0;
 }
 
@@ -401,14 +403,14 @@ sq0tbdl_write(struct muser_dev * const dev, char const * const buf,
          const size_t count, const loff_t pos)
 {
 	int ret;
-	uint32_t index;
+	uint32_t val;
 
 	if (count != sizeof(uint32_t)) {
 		SPDK_ERRLOG("bad write SQ size %zu\n", count);
 		return -EINVAL;
 	}
-	index = *(uint32_t*)buf;
-	SPDK_NOTICELOG("write to SQ 0x%x\n", index);
+	val = *(uint32_t*)buf;
+	SPDK_NOTICELOG("write to SQ=0x%x\n", val);
 
 	/*
 	 * TODO we should be mapping the queue when ASQ gets written, however
@@ -423,7 +425,7 @@ sq0tbdl_write(struct muser_dev * const dev, char const * const buf,
 		}
 	}
 
-	ret = consume_admin_req((struct spdk_nvme_cmd*)dev->asq_addr, index);
+	ret = consume_admin_req(dev, val);
 
 	return ret;
 }
