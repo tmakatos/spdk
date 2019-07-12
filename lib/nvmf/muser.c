@@ -277,7 +277,7 @@ static void
 write_partial(uint8_t const * const buf, const loff_t pos, const size_t count,
               const size_t reg_off, uint64_t * const reg)
 {
-	memcpy(reg, buf + pos - reg_off, count);
+	memcpy(reg + pos - reg_off, buf, count);
 }
 
 static ssize_t
