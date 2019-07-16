@@ -442,7 +442,7 @@ asq_map(struct muser_dev * const dev)
 {
 	assert(dev);
 	assert(!dev->asq_addr);
-	assert(dev->regs.asq);
+	/* XXX dev->regs.asq == 0 is a valid memory address */
 
 	dev->asq_addr = map_one(dev->lm_ctx, dev->regs.asq, asq_size(dev));
 	return dev->asq_addr ? 0 : -1;
