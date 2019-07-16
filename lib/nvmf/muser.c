@@ -340,8 +340,8 @@ admin_queue_write(struct muser_dev * const dev, uint8_t const * const buf,
 {
 	switch (pos) {
 		case offsetof(struct spdk_nvme_registers, aqa):
-			return aqa_write((union spdk_nvme_aqa_register*)buf,
-			                 &dev->regs.aqa);
+			return aqa_write(&dev->regs.aqa,
+			                 (union spdk_nvme_aqa_register*)buf);
 		case ASQ:
 			return asq_write(&dev->regs.asq, buf, pos, count);
 		case ACQ:
