@@ -96,6 +96,7 @@ struct muser_qpair {
 	struct spdk_nvmf_muser_poll_group	*group;
 	struct muser_dev			*dev;
 	struct muser_nvmf_prop_req		prop_req;
+	struct spdk_nvme_cmd			*cmd;
 	struct muser_req			*reqs_internal;
 	union nvmf_h2c_msg			*cmds_internal;
 	union nvmf_c2h_msg			*rsps_internal;
@@ -119,6 +120,10 @@ struct muser_dev {
 
 	struct spdk_nvme_registers		regs;
 	void					*asq_addr;
+	void					*acq_addr;
+	uint16_t				admin_sq_head;
+	uint32_t				old_admin_sq_tail;
+	uint32_t				admin_cq_tail;
 
 	TAILQ_ENTRY(muser_dev)			link;
 };
@@ -353,64 +358,174 @@ admin_queue_write(struct muser_dev * const dev, uint8_t const * const buf,
 	return -EINVAL;
 }
 
-static int
-asq_map(struct muser_dev * const dev)
+/* TODO this should be a libmuser public function */
+static void*
+map_one(lm_ctx_t * const ctx, const uint64_t addr, const size_t len)
 {
 	dma_scattergather_t sg[1];
 	struct iovec iov;
 	int ret;
 
+	ret = lm_addr_to_sg(ctx, addr, len, sg, 1);
+	if (ret != 1) {
+		SPDK_ERRLOG("failed to map 0x%lx-0x%lx\n", addr, addr + len);
+		return NULL;
+	}
+
+	ret = lm_map_sg(ctx, PROT_READ | PROT_WRITE, sg, &iov, 1);
+	if (ret != 0) {
+		SPDK_ERRLOG("failed to map segment: %d\n", ret);
+		return NULL;
+	}
+
+	return iov.iov_base;
+}
+
+static inline uint32_t
+asq_entries(struct muser_dev const * const dev)
+{
+	return dev->regs.aqa.bits.asqs + 1;
+}
+
+static inline uint32_t
+asq_tail(struct muser_dev const * const dev)
+{
+	return dev->old_admin_sq_tail % asq_entries(dev);
+}
+
+static inline void
+asq_tail_advance(struct muser_dev * const dev)
+{
+	dev->old_admin_sq_tail = (asq_tail(dev) + 1) % asq_entries(dev);
+}
+
+/*
+ * Returns size, in bytes, of the admin submission queue.
+ */
+static int
+asq_size(struct muser_dev const * const dev)
+{
+	return asq_entries(dev) * sizeof(struct spdk_nvme_cmd);
+}
+
+static int
+asq_map(struct muser_dev * const dev)
+{
 	assert(dev);
 	assert(!dev->asq_addr);
 	assert(dev->regs.asq);
 
-	/* FIXME this is the number of entries, need to figure out size of memory */
-	ret = lm_addr_to_sg(dev->lm_ctx, dev->regs.asq,
-	                    dev->regs.aqa.bits.acqs + 1, sg, 1);
-	if (ret != 1) {
-		SPDK_ERRLOG("failed to map SQ 0x%lx: %d\n", dev->regs.asq, ret);
+	dev->asq_addr = map_one(dev->lm_ctx, dev->regs.asq, asq_size(dev));
+	return dev->asq_addr ? 0 : -1;
+}
+
+static inline uint32_t
+acq_entries(struct muser_dev const * const dev)
+{
+	return dev->regs.aqa.bits.acqs + 1;
+}
+
+/*
+ * Returns size, in bytes, of the admin completion queue.
+ */
+static int
+acq_size(struct muser_dev const * const dev)
+{
+	return acq_entries(dev) * sizeof(struct spdk_nvme_cmd);
+}
+
+static int
+acq_map(struct muser_dev * const dev)
+{
+	assert(dev);
+	assert(!dev->acq_addr);
+	assert(dev->regs.acq);
+
+	dev->acq_addr = map_one(dev->lm_ctx, dev->regs.acq, acq_size(dev));
+	return dev->acq_addr ? 0 : -1;
+}
+
+static int
+handle_identify_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
+{
+	void *p;
+
+	assert(dev);
+	assert(cmd);
+
+	/* FIXME implement */
+	assert(!cmd->psdt);
+	assert(!cmd->dptr.prp.prp2);
+
+	SPDK_NOTICELOG("PRP1=%lx, PRP2=%lx\n",
+		cmd->dptr.prp.prp1, cmd->dptr.prp.prp2);
+
+	p = map_one(dev->lm_ctx, cmd->dptr.prp.prp1 << dev->regs.cc.bits.mps,
+		sizeof(struct spdk_nvme_cmd));
+	if (!p) {
+		SPDK_ERRLOG("failed to map PRP1 0x%lx for identify command\n",
+		            cmd->dptr.prp.prp1);
 		return -1;
 	}
 
-	ret = lm_map_sg(dev->lm_ctx, PROT_READ | PROT_WRITE, sg, &iov, 1);
-	if (ret != 0) {
-		SPDK_ERRLOG("failed to map segment: %d\n", ret);
-		return -1;
-	}
+	cmd->dptr.prp.prp1 = (uint64_t)p >> dev->regs.cc.bits.mps;
 
-	dev->asq_addr = iov.iov_base;
+	dev->admin_qp.cmd = cmd;
+	spdk_wmb();
+	dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
+
 	return 0;
 }
 
 static int
-consume_admin_req(struct muser_dev * dev, const uint32_t val)
+consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
 {
-	struct spdk_nvme_cmd *admin_queue = dev->regs.asq;
-	/*
-	 * XXX dev->regs.sq0tdbl is the current tail pointer,
-	 * val is the new one, the difference is the number of requests added
-	 * in the queue
-	 */
+	assert(dev);
+	assert(cmd);
+
+	switch(cmd->opc) {
+		case SPDK_NVME_OPC_IDENTIFY:
+			return handle_identify_req(dev, cmd);
+		case SPDK_NVME_OPC_GET_LOG_PAGE:
+		default:
+			SPDK_ERRLOG("unsupported command 0x%x\n", cmd->opc);
+			return -1;
+	}
 	return 0;
 }
 
-/*
- * Callback that gets triggered when the driver writes to the admin submission
- * queue doorbell.
- */
-static ssize_t
-sq0tbdl_write(struct muser_dev * const dev, char const * const buf,
-         const size_t count, const loff_t pos)
+static int
+consume_admin_reqs(struct muser_dev * dev, const uint32_t new_asq_tail)
 {
-	int ret;
-	uint32_t val;
+	struct spdk_nvme_cmd *admin_queue;
 
-	if (count != sizeof(uint32_t)) {
-		SPDK_ERRLOG("bad write SQ size %zu\n", count);
-		return -EINVAL;
+	assert(dev);
+
+	admin_queue = (struct spdk_nvme_cmd*)dev->asq_addr;
+	assert(admin_queue);
+
+	/* FIXME need to validate new_sq_tail */
+	/*
+	 * FIXME can queue size change arbitrarily? Shall we operate on a copy ?
+	 */
+	while (asq_tail(dev) != new_asq_tail) {
+		int ret = consume_admin_req(dev, &admin_queue[asq_tail(dev)]);
+		if (ret) {
+			/* FIXME how should we proceed now? */
+			SPDK_ERRLOG("failed to process request\n");
+			assert(0);
+		}
+		asq_tail_advance(dev);
 	}
-	val = *(uint32_t*)buf;
-	SPDK_NOTICELOG("write to SQ=0x%x\n", val);
+	return 0;
+}
+
+static ssize_t
+do_sq0tdbl_write(struct muser_dev * const dev, const uint32_t new_tail)
+{
+	assert(dev);
+
+	SPDK_NOTICELOG("write to SQ0=0x%x\n", new_tail);
 
 	/*
 	 * TODO we should be mapping the queue when ASQ gets written, however
@@ -418,22 +533,100 @@ sq0tbdl_write(struct muser_dev * const dev, char const * const buf,
 	 * e.g. is it guaranteed to write both upper and lower portions?
 	 */
 	if (!dev->asq_addr) {
-		ret = asq_map(dev);
+		int ret = asq_map(dev);
 		if (ret) {
-			SPDK_ERRLOG("failed to map SQ: %d\n", ret);
+			SPDK_ERRLOG("failed to map SQ0: %d\n", ret);
 			return -1;
 		}
 	}
 
-	ret = consume_admin_req(dev, val);
+	return consume_admin_reqs(dev, new_tail);
+}
+/*
+ * Callback that gets triggered when the driver writes to the admin submission
+ * queue doorbell.
+ */
+static ssize_t
+handle_sq0tbdl_write(struct muser_dev * const dev, char const * const buf,
+         const size_t count, const loff_t pos)
+{
+	assert(dev);
+	if (count != sizeof(uint32_t)) {
+		SPDK_ERRLOG("bad write SQ0 size %zu\n", count);
+		return -EINVAL;
+	}
+	assert(buf);
+	return do_sq0tdbl_write(dev, *(uint32_t*)buf);
+}
 
-	return ret;
+static inline uint16_t
+acq_next(struct muser_dev * const dev)
+{
+	return (dev->admin_cq_tail + 1) % acq_entries(dev);
+}
+
+static bool
+cq0_is_full(struct muser_dev * const dev)
+{
+	return acq_next(dev) == dev->regs.doorbell[0].cq_hdbl;
+}
+
+static inline void
+acq_tail_advance(struct muser_dev * const dev)
+{
+	dev->admin_cq_tail = acq_next(dev);
+}
+
+static int
+do_admin_queue_complete(struct muser_dev * const dev,
+                        struct spdk_nvme_cmd * const cmd)
+{
+	struct spdk_nvme_cpl *cpl;
+
+	assert(dev);
+	assert(cmd);
+
+	if (cq0_is_full(dev)) {
+		SPDK_ERRLOG("CQ0 full\n");
+		return -1;
+	}
+
+	cpl = ((struct spdk_nvme_cpl*)dev->acq_addr) + dev->admin_cq_tail;
+	cpl->sqhd = dev->admin_sq_head;
+	cpl->cid = cmd->cid;
+	cpl->status.dnr = 0x0;
+	cpl->status.m = 0x0;
+	cpl->status.sct = 0x0;
+	cpl->status.p = ~cpl->status.p; /* FIXME */
+	cpl->status.sc = 0x0;
+
+	acq_tail_advance(dev);
+
+	return 0;
+}
+
+static int
+admin_queue_complete(struct muser_dev * const dev,
+                     struct spdk_nvme_cmd * const cmd)
+{
+	assert(dev);
+	assert(cmd);
+
+	if (!dev->acq_addr) {
+		int ret = acq_map(dev);
+		if (ret) {
+			SPDK_ERRLOG("failed to map CQ0: %d\n", ret);
+			return -1;
+		}
+	}
+	do_admin_queue_complete(dev, cmd);
+	return 0;
 }
 
 static ssize_t
 write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 {
-	struct muser_dev *muser_dev = pvt;
+	struct muser_dev * const muser_dev = pvt;
 	int err;
 
 	SPDK_NOTICELOG("dev: %p, count=%zu, pos=%"PRIX64"\n",
@@ -444,20 +637,28 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		case ADMIN_QUEUES:
 			return admin_queue_write(muser_dev, buf, count, pos);
 		case SQ0TBDL:
-			return sq0tbdl_write(muser_dev, buf, count, pos);
+			err = handle_sq0tbdl_write(muser_dev, buf, count, pos);
+			if (err) {
+				SPDK_ERRLOG("failed to handle write to submission queue 0 doorbell: %d\n", err);
+				return err;
+			}
 		default:
+			muser_dev->admin_qp.prop_req.buf = buf;
+			muser_dev->admin_qp.prop_req.count = count;
+			muser_dev->admin_qp.prop_req.pos = pos;
+			spdk_wmb();
+			muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
 			break;
 	}
 
-	muser_dev->admin_qp.prop_req.buf = buf;
-	muser_dev->admin_qp.prop_req.count = count;
-	muser_dev->admin_qp.prop_req.pos = pos;
-	spdk_wmb();
-	muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
 
 	do {
 		err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
 	} while (err != 0 && errno != EINTR);
+
+	if (pos == SQ0TBDL) {
+		admin_queue_complete(muser_dev, muser_dev->admin_qp.cmd);
+	}
 
 	return muser_dev->admin_qp.prop_req.ret;
 }
@@ -731,6 +932,13 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	muser_dev->pci_config_space = lm_get_pci_config_space(muser_dev->lm_ctx);
 	init_pci_config_space((struct nvme_config_space*)muser_dev->pci_config_space);
 
+	/* initialise head for admin queue */
+	/* FIXME does the NVMe driver initialize admin SQ0 doorbell? If so then
+	* we need to initialize head when that happens */
+	muser_dev->old_admin_sq_tail = 0;
+	muser_dev->admin_sq_head = muser_dev->regs.doorbell[0].sq_tdbl;
+	muser_dev->admin_cq_tail = 0;
+
 	err = pthread_create(&muser_dev->lm_thr, NULL,
 			     drive, muser_dev->lm_ctx);
 	if (err != 0) {
@@ -913,6 +1121,61 @@ muser_close_qpair(struct spdk_nvmf_qpair *qpair)
 { }
 
 static int
+handle_req(struct muser_qpair * const muser_qpair)
+{
+	struct spdk_nvmf_request *req;
+	struct muser_req *muser_req;
+
+	assert(muser_qpair);
+
+	muser_req = TAILQ_FIRST(&muser_qpair->reqs);
+	TAILQ_REMOVE(&muser_qpair->reqs, muser_req, link);
+
+	req = &muser_req->req;
+
+	if (muser_qpair->cmd) {
+		/* FIXME figure out how to initialize this field. */
+		req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
+		req->cmd->nvme_cmd = *muser_qpair->cmd;
+		req->length = 1 << 12;
+		req->data = (void*)(req->cmd->nvme_cmd.dptr.prp.prp1 << muser_qpair->dev->regs.cc.bits.mps);
+	} else {
+		req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
+		req->cmd->prop_set_cmd.cid = 0;
+		if (muser_qpair->prop_req.dir == MUSER_NVMF_WRITE) {
+			req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
+			req->cmd->prop_set_cmd.value.u32.high = 0;
+			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)muser_qpair->prop_req.buf;
+		} else {
+			req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
+		}
+		req->cmd->prop_set_cmd.attrib.size = (muser_qpair->prop_req.count/4)-1;
+		req->cmd->prop_set_cmd.ofst = muser_qpair->prop_req.pos;
+		req->length = 0;
+		req->data = NULL;
+	}
+
+	spdk_nvmf_request_exec(req);
+
+	/*
+	 * The below should prob. be in complete or something
+	 * This only works because the above will be sync
+	 */
+
+	if (muser_qpair->cmd) {
+		/* FIXME we must now queue the response, either here or in write_bar0 */
+		;
+	} else if (muser_qpair->prop_req.dir == MUSER_NVMF_READ) {
+		memcpy(muser_qpair->prop_req.buf,
+		       &req->rsp->prop_get_rsp.value.u64,
+		       muser_qpair->prop_req.count);
+	}
+
+	muser_qpair->prop_req.dir = MUSER_NVMF_INVALID;
+	return sem_post(&muser_qpair->prop_req.wait);
+}
+
+static int
 muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct muser_poll_group *muser_group;
@@ -924,43 +1187,7 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	TAILQ_FOREACH(muser_qpair, &muser_group->qps, link) {
 		spdk_rmb();
 		if (muser_qpair->prop_req.dir != MUSER_NVMF_INVALID) {
-			struct spdk_nvmf_request *req;
-			struct muser_req *muser_req;
-
-			muser_req = TAILQ_FIRST(&muser_qpair->reqs);
-			TAILQ_REMOVE(&muser_qpair->reqs, muser_req, link);
-
-			req = &muser_req->req;
-			req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
-			req->cmd->prop_set_cmd.cid = 0;
-			if (muser_qpair->prop_req.dir == MUSER_NVMF_WRITE) {
-				req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
-				req->cmd->prop_set_cmd.value.u32.high = 0;
-				req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)muser_qpair->prop_req.buf;
-			} else {
-				req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
-			}
-			req->cmd->prop_set_cmd.attrib.size = (muser_qpair->prop_req.count/4)-1;
-			req->cmd->prop_set_cmd.ofst = muser_qpair->prop_req.pos;
-		
-			req->length = 0;
-			req->data = NULL;
-		
-			spdk_nvmf_request_exec(req);
-
-			/*
-			 * The below should prob. be in complete or something
-			 * This only works because the above will be sync
-			 */
-
-			if (muser_qpair->prop_req.dir == MUSER_NVMF_READ) {
-				memcpy(muser_qpair->prop_req.buf,
-				       &req->rsp->prop_get_rsp.value.u64,
-				       muser_qpair->prop_req.count);
-			}
-
-			muser_qpair->prop_req.dir = MUSER_NVMF_INVALID;
-			err = sem_post(&muser_qpair->prop_req.wait);
+			err = handle_req(muser_qpair);
 			assert(err == 0);
 			(void)err;
 		}
