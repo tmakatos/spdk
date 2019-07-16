@@ -282,20 +282,49 @@ write_partial(uint8_t const * const buf, const loff_t pos, const size_t count,
 	memcpy(reg + pos - reg_off, buf, count);
 }
 
+/*
+ * Tells whether either the lower 4 bytes are written at the beginning of the
+ * 8-byte register, or the higher 4 starting at the middle.
+ */
+static inline bool
+_is_half(const size_t p, const size_t c, const size_t o)
+{
+	return c == sizeof(uint32_t) && (p == o || (p == o + sizeof(uint32_t)));
+}
+
+/*
+ * Tells whether the full 8 bytes are written at the correct offset.
+ */
+static inline bool
+_is_full(const size_t p, const size_t c, const size_t o)
+{
+	return c == sizeof(uint64_t) && p == o;
+}
+
+/*
+ * Either write or lower/upper 4 bytes, or the full 8 bytes.
+ *
+ * p: position
+ * c: count
+ * o: register offset
+ */
+static inline bool
+is_valid_asq_or_acq_write(const size_t p, const size_t c, const size_t o)
+{
+	return _is_half(p, c, o) || _is_full(p, c, o);
+}
+
 static ssize_t
 asq_or_acq_write(uint8_t const * const buf, const loff_t pos,
                  const size_t count, uint64_t * const reg, const size_t reg_off)
 {
 	/*
-	 * The NVMe driver seems to write those only in 4 upper/lower bytes.
+	 * The NVMe driver seems to write those only in 4 upper/lower bytes, but
+	 * we still have to support writing the whole register in one go.
 	 */
-	if (count != sizeof(uint32_t)) {
-		SPDK_ERRLOG("bad write count %zu\n", count);
-		return -EINVAL;
-	}
-
-	if ((size_t)pos != reg_off && (size_t)pos != reg_off + sizeof(uint32_t)) {
-		SPDK_ERRLOG("bad write offset 0x%lx\n", pos);
+	if (!is_valid_asq_or_acq_write((size_t)pos, count, reg_off)) {
+		SPDK_ERRLOG("bad write count %zu and/or offset 0x%lx\n",
+		            count, reg_off);
 		return -EINVAL;
 	}
 
