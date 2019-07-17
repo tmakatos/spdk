@@ -527,8 +527,11 @@ consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd
 
 	switch(cmd->opc) {
 		case SPDK_NVME_OPC_IDENTIFY:
-			return handle_identify_req(dev, cmd);
+		case SPDK_NVME_OPC_SET_FEATURES:
 		case SPDK_NVME_OPC_GET_LOG_PAGE:
+			return handle_identify_req(dev, cmd);
+		case SPDK_NVME_OPC_CREATE_IO_CQ:
+			break;
 		default:
 			SPDK_ERRLOG("unsupported command 0x%x\n", cmd->opc);
 			return -1;
