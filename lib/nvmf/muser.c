@@ -726,8 +726,16 @@ consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd
 		case SPDK_NVME_OPC_GET_LOG_PAGE:
 		case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
 			err = handle_identify_req(dev, cmd);
-			if (!err)
+			if (!err) {
+
+				/*
+				 * FIXME This request is now probably lost.
+				 */
+				if (cmd->opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST)
+					return 0;
+
 				return 1;
+			}
 			return err;
 		case SPDK_NVME_OPC_CREATE_IO_CQ:
 			return handle_create_io_q(dev, cmd, &dev->cq, true);
