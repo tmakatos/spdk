@@ -657,7 +657,8 @@ do_admin_queue_complete(struct muser_dev * const dev,
 	assert(cmd);
 
 	if (cq0_is_full(dev)) {
-		SPDK_ERRLOG("CQ0 full\n");
+		SPDK_ERRLOG("CQ0 full (tail=%d, head=%d)\n",
+		            dev->admin_cq_tail, dev->regs.doorbell[0].cq_hdbl);
 		return -1;
 	}
 
