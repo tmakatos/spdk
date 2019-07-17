@@ -724,6 +724,7 @@ consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd
 		case SPDK_NVME_OPC_IDENTIFY:
 		case SPDK_NVME_OPC_SET_FEATURES:
 		case SPDK_NVME_OPC_GET_LOG_PAGE:
+		case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
 			err = handle_identify_req(dev, cmd);
 			if (!err)
 				return 1;
