@@ -719,6 +719,8 @@ consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd
 	assert(dev);
 	assert(cmd);
 
+	SPDK_NOTICELOG("handle admin req opc=0x%x\n", cmd->opc);
+
 	switch(cmd->opc) {
 		/* TODO put all cases in order */
 		case SPDK_NVME_OPC_IDENTIFY:
