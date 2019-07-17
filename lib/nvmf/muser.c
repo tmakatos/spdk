@@ -475,29 +475,40 @@ acq_map(struct muser_dev * const dev)
 }
 
 static int
-handle_identify_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
+dptr_remap(struct muser_dev const * const dev, union spdk_nvme_dptr * const dptr)
 {
 	void *p;
+
+	assert(dev);
+	assert(dptr);
+
+	/* FIXME implement */
+	assert(!dptr->prp.prp2);
+
+	p = map_one(dev->lm_ctx, dptr->prp.prp1 << dev->regs.cc.bits.mps,
+		sizeof(struct spdk_nvme_cmd));
+	if (!p)
+		return -1;
+	dptr->prp.prp1 = (uint64_t)p >> dev->regs.cc.bits.mps;
+	return 0;
+}
+
+static int
+handle_identify_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
+{
+	int err;
 
 	assert(dev);
 	assert(cmd);
 
 	/* FIXME implement */
 	assert(!cmd->psdt);
-	assert(!cmd->dptr.prp.prp2);
 
-	SPDK_NOTICELOG("PRP1=%lx, PRP2=%lx\n",
-		cmd->dptr.prp.prp1, cmd->dptr.prp.prp2);
-
-	p = map_one(dev->lm_ctx, cmd->dptr.prp.prp1 << dev->regs.cc.bits.mps,
-		sizeof(struct spdk_nvme_cmd));
-	if (!p) {
-		SPDK_ERRLOG("failed to map PRP1 0x%lx for identify command\n",
-		            cmd->dptr.prp.prp1);
+	err = dptr_remap(dev, &cmd->dptr);
+	if (err) {
+		SPDK_ERRLOG("failed to remap DPTR: %d\n", err);
 		return -1;
 	}
-
-	cmd->dptr.prp.prp1 = (uint64_t)p >> dev->regs.cc.bits.mps;
 
 	dev->admin_qp.cmd = cmd;
 	spdk_wmb();
