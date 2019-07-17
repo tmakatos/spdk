@@ -367,9 +367,6 @@ acq_write(uint64_t * const acq, uint8_t const * const buf,
 	offsetof(struct spdk_nvme_registers, aqa) ... \
 		offsetof(struct spdk_nvme_registers, acq) + sizeof(uint64_t) - 1
 
-#define SQ0TBDL \
-	offsetof(struct spdk_nvme_registers, doorbell[0].sq_tdbl)
-
 static ssize_t
 admin_queue_write(struct muser_dev * const dev, uint8_t const * const buf,
                   const size_t count, const loff_t pos)
@@ -570,7 +567,7 @@ do_sq0tdbl_write(struct muser_dev * const dev, const uint32_t new_tail)
 {
 	assert(dev);
 
-	SPDK_NOTICELOG("write to SQ0=0x%x\n", new_tail);
+	SPDK_NOTICELOG("write to SQ0 tail=0x%x\n", new_tail);
 
 	/*
 	 * TODO we should be mapping the queue when ASQ gets written, however
@@ -603,6 +600,34 @@ handle_sq0tbdl_write(struct muser_dev * const dev, char const * const buf,
 	assert(buf);
 	return do_sq0tdbl_write(dev, *(uint32_t*)buf);
 }
+
+static ssize_t
+do_cq0hdbl_write(struct muser_dev * const dev, const uint32_t new_head)
+{
+	assert(dev);
+	/*
+	 * FIXME is there anything we need to do with the new CQ0 head?
+	 * Incrementing the head means the host consumed completions, right?
+	 */
+	SPDK_NOTICELOG("write to CQ0 head=0x%x\n", new_head);
+	dev->regs.doorbell[0].cq_hdbl = new_head;
+	return 0;
+}
+
+
+static ssize_t
+handle_cq0hdbl_write(struct muser_dev * const dev, char const * const buf,
+         const size_t count, const loff_t pos)
+{
+	assert(dev);
+	if (count != sizeof(uint32_t)) {
+		SPDK_ERRLOG("bad write CQ0 size %zu\n", count);
+		return -EINVAL;
+	}
+	assert(buf);
+	return do_cq0hdbl_write(dev, *(uint32_t*)buf);
+}
+
 
 static inline uint16_t
 acq_next(struct muser_dev * const dev)
@@ -687,13 +712,24 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 				SPDK_ERRLOG("failed to handle write to submission queue 0 doorbell: %d\n", err);
 				return err;
 			}
-		default:
+			break;
+		case CQ0HDBL:
+			err = handle_cq0hdbl_write(muser_dev, buf, count, pos);
+			if (err) {
+				SPDK_ERRLOG("failed to handle write to completion queue 0 head: %d\n", err);
+				return err;
+			}
+			return 0;
+		case CC:
 			muser_dev->admin_qp.prop_req.buf = buf;
 			muser_dev->admin_qp.prop_req.count = count;
 			muser_dev->admin_qp.prop_req.pos = pos;
 			spdk_wmb();
 			muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
 			break;
+		default:
+			SPDK_ERRLOG("write to 0x%x not implemented\n", pos);
+			return -ENOTSUP;
 	}
 
 

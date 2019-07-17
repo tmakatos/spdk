@@ -353,6 +353,17 @@ struct spdk_nvme_registers {
 	} doorbell[1];
 };
 
+#define CC \
+	offsetof(struct spdk_nvme_registers, cc)
+
+#define SQ0TBDL \
+	offsetof(struct spdk_nvme_registers, doorbell[0].sq_tdbl)
+
+#define CQ0HDBL \
+	offsetof(struct spdk_nvme_registers, doorbell[0].cq_hdbl)
+
+
+
 /* NVMe controller register space offsets */
 SPDK_STATIC_ASSERT(0x00 == offsetof(struct spdk_nvme_registers, cap),
 		   "Incorrect register offset");
