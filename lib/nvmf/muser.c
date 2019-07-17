@@ -347,8 +347,10 @@ static ssize_t
 acq_write(uint64_t * const acq, uint8_t const * const buf,
           const loff_t pos, const size_t count)
 {
-	return asq_or_acq_write(buf, pos, count, acq,
-	                        offsetof(struct spdk_nvme_registers, acq));
+	int ret = asq_or_acq_write(buf, pos, count, acq,
+	                           offsetof(struct spdk_nvme_registers, acq));
+	SPDK_NOTICELOG("ACQ=0x%lx\n", *acq);
+	return ret;
 }
 
 #define REGISTER_RANGE(name, size) \
