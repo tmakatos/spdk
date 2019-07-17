@@ -109,6 +109,18 @@ struct muser_poll_group {
 	TAILQ_HEAD(, muser_qpair)		qps;
 };
 
+/*
+ * An I/O queue.
+ */
+struct io_q {
+	void *addr;
+	uint32_t size;
+	uint16_t qid;
+
+	/* For submission queues. */
+	uint16_t cqid;
+};
+
 struct muser_dev {
 	struct spdk_nvme_transport_id		trid;
 	struct muser_qpair			admin_qp;
@@ -119,11 +131,17 @@ struct muser_dev {
 	lm_pci_config_space_t			*pci_config_space;
 
 	struct spdk_nvme_registers		regs;
+
+	/* admin queues */
 	void					*asq_addr;
 	void					*acq_addr;
 	uint16_t				admin_sq_head;
 	uint32_t				old_admin_sq_tail;
 	uint32_t				admin_cq_tail;
+
+	/* I/O queues */
+	struct io_q				cq;
+	struct io_q				sq;
 
 	TAILQ_ENTRY(muser_dev)			link;
 };
@@ -516,30 +534,220 @@ handle_identify_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const c
 	return 0;
 }
 
+/*
+ * TODO move into nvme_spec.h and change nvme_pcie_ctrlr_cmd_create_io_cq to
+ * use it, also check for other functions
+ */
+union __attribute__((packed)) spdk_nvme_create_io_q_cdw10 {
+	uint32_t raw;
+	struct __attribute__((packed)) {
+		uint32_t qid	: 16;
+		uint32_t qsize	: 16;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_q_cdw10) == 4, "Incorrect size");
+
+union __attribute__((packed)) spdk_nvme_create_io_cq_cdw11 {
+	uint32_t raw;
+	struct __attribute__((packed)) {
+		uint32_t pc		: 1;
+		uint32_t ien		: 1;
+		uint32_t reserved	: 14;
+		uint32_t iv		: 16;
+
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_cq_cdw11) == 4, "Incorrect size");
+
+union __attribute__((packed)) spdk_nvme_create_io_sq_cdw11 {
+	uint32_t raw;
+	struct __attribute__((packed)) {
+		uint32_t pc		: 1;
+		uint32_t qprio		: 2;
+		uint32_t reserved	: 13;
+		uint32_t cqid		: 16;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_sq_cdw11) == 4, "Incorrect size");
+
+static inline uint16_t
+acq_next(struct muser_dev * const dev)
+{
+	return (dev->admin_cq_tail + 1) % acq_entries(dev);
+}
+
+static bool
+cq0_is_full(struct muser_dev * const dev)
+{
+	return acq_next(dev) == dev->regs.doorbell[0].cq_hdbl;
+}
+
+static inline void
+acq_tail_advance(struct muser_dev * const dev)
+{
+	dev->admin_cq_tail = acq_next(dev);
+}
+
 static int
-consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
+do_admin_queue_complete(struct muser_dev * const dev,
+                        struct spdk_nvme_cmd * const cmd)
+{
+	struct spdk_nvme_cpl *cpl;
+
+	assert(dev);
+	assert(cmd);
+
+	if (cq0_is_full(dev)) {
+		SPDK_ERRLOG("CQ0 full (tail=%d, head=%d)\n",
+		            dev->admin_cq_tail, dev->regs.doorbell[0].cq_hdbl);
+		return -1;
+	}
+
+	cpl = ((struct spdk_nvme_cpl*)dev->acq_addr) + dev->admin_cq_tail;
+	cpl->sqhd = dev->admin_sq_head;
+	cpl->cid = cmd->cid;
+	cpl->status.dnr = 0x0;
+	cpl->status.m = 0x0;
+	cpl->status.sct = 0x0;
+	cpl->status.p = ~cpl->status.p; /* FIXME */
+	cpl->status.sc = 0x0;
+
+	acq_tail_advance(dev);
+
+	return 0;
+}
+
+
+
+static int
+admin_queue_complete(struct muser_dev * const dev,
+                     struct spdk_nvme_cmd * const cmd)
 {
 	assert(dev);
 	assert(cmd);
 
+	if (!dev->acq_addr) {
+		int ret = acq_map(dev);
+		if (ret) {
+			SPDK_ERRLOG("failed to map CQ0: %d\n", ret);
+			return -1;
+		}
+	}
+	do_admin_queue_complete(dev, cmd);
+	return 0;
+}
+
+static struct io_q*
+lookup_io_cq(struct muser_dev * const dev, const uint16_t qid)
+{
+	assert(dev);
+
+	/* FIXME implement */
+	if (dev->cq.qid == qid)
+		return &dev->cq;
+
+	return NULL;
+}
+
+/*
+ * Creates a completion or sumbission I/O queue.
+ */
+static int
+handle_create_io_q(struct muser_dev * const dev,
+                   struct spdk_nvme_cmd * const cmd, struct io_q * const io_q,
+                   const bool is_cq)
+{
+	union spdk_nvme_create_io_q_cdw10 * cdw10;
+	union spdk_nvme_create_io_cq_cdw11 * cdw11_cq = NULL;
+	union spdk_nvme_create_io_sq_cdw11 * cdw11_sq = NULL;
+	size_t entry_size;
+
+	assert(dev);
+	assert(cmd);
+	assert(io_q);
+	assert(!io_q->addr);
+
+	cdw10 = (union spdk_nvme_create_io_q_cdw10*)&cmd->cdw10;
+
+	SPDK_NOTICELOG("create I/O %cQ: QID=0x%x, QSIZE=0x%x\n",
+	               is_cq ? 'C' : 'S', cdw10->bits.qid, cdw10->bits.qsize);
+
+	if (is_cq) {
+		cdw11_cq = (union spdk_nvme_create_io_cq_cdw11*)&cmd->cdw11;
+		entry_size = sizeof(struct spdk_nvme_cpl);
+		/* FIXME implement */
+		assert(cdw11_cq->bits.pc == 0x1);
+		assert(cdw11_cq->bits.ien == 0x1);
+		assert(cdw11_cq->bits.iv == 0x0);
+	} else {
+		cdw11_sq = (union spdk_nvme_create_io_sq_cdw11*)&cmd->cdw11;
+		entry_size = sizeof(struct spdk_nvme_cmd);
+		/* FIXME implement */
+		assert(cdw11_sq->bits.pc == 0x1);
+
+		if (!lookup_io_cq(dev, cdw11_sq->bits.cqid)) {
+			SPDK_ERRLOG("no I/O completion queue with ID 0x%x\n",
+			            cdw11_sq->bits.cqid);
+			return -ESRCH;
+		}
+		io_q->cqid = cdw11_sq->bits.cqid;
+	}
+
+	io_q->qid = cdw10->bits.qid; 
+	io_q->size = cdw10->bits.qsize + 1;
+	io_q->addr = map_one(dev->lm_ctx, cmd->dptr.prp.prp1,
+	                     io_q->size * entry_size);
+	if (!io_q->addr) {
+		SPDK_ERRLOG("failed to map I/O queue\n");
+		return -1;
+	}
+
+	SPDK_NOTICELOG("create I/O queue at 0x%p\n", io_q->addr);
+
+	return admin_queue_complete(dev, cmd);
+}
+
+/*
+ * Returns 1 if a request has been forwarded to NVMf and need to wait for
+ * the response, 0 if no need for a response, and -1 on error.
+ */
+static int
+consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
+{
+	int err;
+
+	assert(dev);
+	assert(cmd);
+
 	switch(cmd->opc) {
+		/* TODO put all cases in order */
 		case SPDK_NVME_OPC_IDENTIFY:
 		case SPDK_NVME_OPC_SET_FEATURES:
 		case SPDK_NVME_OPC_GET_LOG_PAGE:
-			return handle_identify_req(dev, cmd);
+			err = handle_identify_req(dev, cmd);
+			if (!err)
+				return 1;
+			return err;
 		case SPDK_NVME_OPC_CREATE_IO_CQ:
-			break;
+			return handle_create_io_q(dev, cmd, &dev->cq, true);
+		case SPDK_NVME_OPC_CREATE_IO_SQ:
+			return handle_create_io_q(dev, cmd, &dev->sq, false);
 		default:
 			SPDK_ERRLOG("unsupported command 0x%x\n", cmd->opc);
 			return -1;
 	}
-	return 0;
+	return -1;
 }
 
+/*
+ * Returns how many requests have been forwarded to NVMf and need to wait for
+ * the response.
+ */
 static int
 consume_admin_reqs(struct muser_dev * dev, const uint32_t new_asq_tail)
 {
 	struct spdk_nvme_cmd *admin_queue;
+	int count = 0;
 
 	assert(dev);
 
@@ -552,14 +760,15 @@ consume_admin_reqs(struct muser_dev * dev, const uint32_t new_asq_tail)
 	 */
 	while (asq_tail(dev) != new_asq_tail) {
 		int ret = consume_admin_req(dev, &admin_queue[asq_tail(dev)]);
-		if (ret) {
+		if (ret < 0) {
 			/* FIXME how should we proceed now? */
 			SPDK_ERRLOG("failed to process request\n");
 			assert(0);
 		}
+		count += ret;
 		asq_tail_advance(dev);
 	}
-	return 0;
+	return count;
 }
 
 static ssize_t
@@ -628,72 +837,6 @@ handle_cq0hdbl_write(struct muser_dev * const dev, char const * const buf,
 	return do_cq0hdbl_write(dev, *(uint32_t*)buf);
 }
 
-
-static inline uint16_t
-acq_next(struct muser_dev * const dev)
-{
-	return (dev->admin_cq_tail + 1) % acq_entries(dev);
-}
-
-static bool
-cq0_is_full(struct muser_dev * const dev)
-{
-	return acq_next(dev) == dev->regs.doorbell[0].cq_hdbl;
-}
-
-static inline void
-acq_tail_advance(struct muser_dev * const dev)
-{
-	dev->admin_cq_tail = acq_next(dev);
-}
-
-static int
-do_admin_queue_complete(struct muser_dev * const dev,
-                        struct spdk_nvme_cmd * const cmd)
-{
-	struct spdk_nvme_cpl *cpl;
-
-	assert(dev);
-	assert(cmd);
-
-	if (cq0_is_full(dev)) {
-		SPDK_ERRLOG("CQ0 full (tail=%d, head=%d)\n",
-		            dev->admin_cq_tail, dev->regs.doorbell[0].cq_hdbl);
-		return -1;
-	}
-
-	cpl = ((struct spdk_nvme_cpl*)dev->acq_addr) + dev->admin_cq_tail;
-	cpl->sqhd = dev->admin_sq_head;
-	cpl->cid = cmd->cid;
-	cpl->status.dnr = 0x0;
-	cpl->status.m = 0x0;
-	cpl->status.sct = 0x0;
-	cpl->status.p = ~cpl->status.p; /* FIXME */
-	cpl->status.sc = 0x0;
-
-	acq_tail_advance(dev);
-
-	return 0;
-}
-
-static int
-admin_queue_complete(struct muser_dev * const dev,
-                     struct spdk_nvme_cmd * const cmd)
-{
-	assert(dev);
-	assert(cmd);
-
-	if (!dev->acq_addr) {
-		int ret = acq_map(dev);
-		if (ret) {
-			SPDK_ERRLOG("failed to map CQ0: %d\n", ret);
-			return -1;
-		}
-	}
-	do_admin_queue_complete(dev, cmd);
-	return 0;
-}
-
 static ssize_t
 write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 {
@@ -709,10 +852,12 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 			return admin_queue_write(muser_dev, buf, count, pos);
 		case SQ0TBDL:
 			err = handle_sq0tbdl_write(muser_dev, buf, count, pos);
-			if (err) {
+			if (err < 0) {
 				SPDK_ERRLOG("failed to handle write to submission queue 0 doorbell: %d\n", err);
 				return err;
 			}
+			if (!err)
+				return 0;
 			break;
 		case CQ0HDBL:
 			err = handle_cq0hdbl_write(muser_dev, buf, count, pos);
@@ -729,10 +874,9 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 			muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
 			break;
 		default:
-			SPDK_ERRLOG("write to 0x%x not implemented\n", pos);
+			SPDK_ERRLOG("write to 0x%lx not implemented\n", pos);
 			return -ENOTSUP;
 	}
-
 
 	do {
 		err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
