@@ -111,14 +111,34 @@ struct muser_poll_group {
 
 /*
  * An I/O queue.
+ *
+ * TODO we use the same struct both for submission and for completion I/O
+ * queues because that simplifies queue creation. However we're wasting memory
+ * for submission queues, maybe rethink this approach.
  */
 struct io_q {
+	/*
+	 * XXX we can trivially figure out the QID based on the offset of a
+	 * queue within the sq/cq array, however it's just faster to store it.
+	 */
+	uint16_t id;
+
 	void *addr;
 	uint32_t size;
-	uint16_t qid;
 
-	/* For submission queues. */
-	uint16_t cqid;
+	union {
+		struct {
+			uint32_t tdbl;
+			uint16_t head;
+			uint32_t old_tail;
+			/* multiple SQs can be mapped to the same CQ */
+			uint16_t cqid;
+		} sq;
+		struct {
+			uint32_t hdbl;
+			uint32_t tail;
+		} cq;
+	};
 };
 
 struct muser_dev {
@@ -130,18 +150,12 @@ struct muser_dev {
 	bool					setup;
 	lm_pci_config_space_t			*pci_config_space;
 
+	/* NB the doorbell member is not used for the admin SQ/CQ */
 	struct spdk_nvme_registers		regs;
 
-	/* admin queues */
-	void					*asq_addr;
-	void					*acq_addr;
-	uint16_t				admin_sq_head;
-	uint32_t				old_admin_sq_tail;
-	uint32_t				admin_cq_tail;
-
 	/* I/O queues */
-	struct io_q				cq;
-	struct io_q				sq;
+	struct io_q				cq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
+	struct io_q				sq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
 
 	TAILQ_ENTRY(muser_dev)			link;
 };
@@ -284,12 +298,28 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	return muser_dev->admin_qp.prop_req.ret;
 }
 
+static uint16_t
+max_queue_size(struct muser_dev const * const dev)
+{
+	return dev->admin_qp.qpair.ctrlr->vcprop.cap.bits.mqes + 1;
+}
+
 static ssize_t
-aqa_write(union spdk_nvme_aqa_register * const to,
+aqa_write(struct muser_dev * const dev,
           union spdk_nvme_aqa_register const * const from)
 {
-	to->raw = from->raw;
-	SPDK_NOTICELOG("write to AQA %x\n", to->raw);
+	assert(dev);
+	assert(from);
+
+	if (from->bits.asqs + 1 > max_queue_size(dev) ||
+	    from->bits.acqs + 1 > max_queue_size(dev)) {
+		SPDK_ERRLOG("admin queue(s) too big, ASQS=%d, ACQS=%d, max=%d\n",
+		            from->bits.asqs + 1, from->bits.acqs + 1,
+		            max_queue_size(dev));
+		return -EINVAL;
+	}
+	dev->regs.aqa.raw = from->raw;
+	SPDK_NOTICELOG("write to AQA %x\n", dev->regs.aqa.raw);
 	return 0;
 }
 
@@ -391,7 +421,7 @@ admin_queue_write(struct muser_dev * const dev, uint8_t const * const buf,
 {
 	switch (pos) {
 		case offsetof(struct spdk_nvme_registers, aqa):
-			return aqa_write(&dev->regs.aqa,
+			return aqa_write(dev,
 			                 (union spdk_nvme_aqa_register*)buf);
 		case ASQ:
 			return asq_write(&dev->regs.asq, buf, pos, count);
@@ -427,68 +457,119 @@ map_one(lm_ctx_t * const ctx, const uint64_t addr, const size_t len)
 	return iov.iov_base;
 }
 
-static inline uint32_t
-asq_entries(struct muser_dev const * const dev)
+static bool
+is_sq(struct muser_dev const * const dev, struct io_q const * const q)
 {
-	return dev->regs.aqa.bits.asqs + 1;
+	return q >= &dev->sq[0] && q <= &dev->sq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR-1];
 }
 
-static inline uint32_t
-asq_tail(struct muser_dev const * const dev)
+static bool
+is_cq(struct muser_dev const * const dev, struct io_q const * const q)
 {
-	return dev->old_admin_sq_tail % asq_entries(dev);
+	return q >= &dev->cq[0] && q <= &dev->cq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR-1];
 }
 
-static inline void
-asq_tail_advance(struct muser_dev * const dev)
+
+static uint32_t
+sq_tail(struct muser_dev const * const d, struct io_q const * const q)
 {
-	dev->old_admin_sq_tail = (asq_tail(dev) + 1) % asq_entries(dev);
+	assert(q);
+	assert(is_sq(d, q));
+	return q->sq.old_tail % q->size;
 }
 
-/*
- * Returns size, in bytes, of the admin submission queue.
- */
-static int
-asq_size(struct muser_dev const * const dev)
+static void
+sq_tail_advance(struct muser_dev const * const d, struct io_q * const q)
 {
-	return asq_entries(dev) * sizeof(struct spdk_nvme_cmd);
+	assert(q);
+	assert(d);
+	assert(is_sq(d, q));
+	q->sq.old_tail = (sq_tail(d, q) + 1) % q->size;
 }
 
-static int
-asq_map(struct muser_dev * const dev)
+static void
+insert_queue(struct muser_dev * const dev, struct io_q const * const q,
+             const bool is_cq)
 {
+	struct io_q *queue;
+
 	assert(dev);
-	assert(!dev->asq_addr);
+	assert(q);
+
+	if (is_cq)
+		queue = dev->cq;
+	else
+		queue = dev->sq;
+	queue[q->id] = *q;
+}
+
+static int
+asq_map(struct muser_dev * const d)
+{
+	struct io_q q;
+
+	assert(d);
+	assert(!d->sq[0].addr);
 	/* XXX dev->regs.asq == 0 is a valid memory address */
 
-	dev->asq_addr = map_one(dev->lm_ctx, dev->regs.asq, asq_size(dev));
-	return dev->asq_addr ? 0 : -1;
+	q.size = d->regs.aqa.bits.asqs + 1;
+	q.id = 0;
+	q.sq.old_tail = 0;
+	q.sq.head = q.sq.tdbl = 0;
+	q.sq.cqid = 0;
+	q.addr = map_one(d->lm_ctx, d->regs.asq,
+	                 q.size * sizeof(struct spdk_nvme_cmd));
+	if (!q.addr)
+		return -1;
+	insert_queue(d, &q, false);
+	return 0;
 }
 
-static inline uint32_t
-acq_entries(struct muser_dev const * const dev)
+static uint16_t
+cq_next(struct muser_dev * const d, struct io_q * const q)
 {
-	return dev->regs.aqa.bits.acqs + 1;
+	assert(d);
+	assert(q);
+	assert(is_cq(d, q));
+	return (q->cq.tail + 1) % q->size;
 }
 
-/*
- * Returns size, in bytes, of the admin completion queue.
- */
+static bool
+cq_is_full(struct muser_dev * const d, struct io_q * const q)
+{
+	assert(d);
+	assert(q);
+	assert(is_cq(d, q));
+	return cq_next(d, q) == q->cq.hdbl;
+}
+
+static void
+cq_tail_advance(struct muser_dev * const d, struct io_q * const q)
+{
+	assert(d);
+	assert(q);
+	assert(is_cq(d, q));
+	q->cq.tail = cq_next(d, q);
+}
+
 static int
-acq_size(struct muser_dev const * const dev)
+acq_map(struct muser_dev * const d)
 {
-	return acq_entries(dev) * sizeof(struct spdk_nvme_cmd);
-}
+	struct io_q q;
 
-static int
-acq_map(struct muser_dev * const dev)
-{
-	assert(dev);
-	assert(!dev->acq_addr);
-	assert(dev->regs.acq);
+	assert(d);
+	assert(!d->cq[0].addr);
+	assert(d->regs.acq);
 
-	dev->acq_addr = map_one(dev->lm_ctx, dev->regs.acq, acq_size(dev));
-	return dev->acq_addr ? 0 : -1;
+	q.size = d->regs.aqa.bits.acqs + 1;
+	q.id = 0;
+	q.cq.tail = 0;
+	q.addr = map_one(d->lm_ctx, d->regs.acq,
+	                 q.size * sizeof(struct spdk_nvme_cpl));
+	if (!q.addr)
+		return -1;
+	insert_queue(d, &q, true);
+	return 0;
 }
 
 static int
@@ -570,41 +651,29 @@ union __attribute__((packed)) spdk_nvme_create_io_sq_cdw11 {
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_sq_cdw11) == 4, "Incorrect size");
 
-static inline uint16_t
-acq_next(struct muser_dev * const dev)
-{
-	return (dev->admin_cq_tail + 1) % acq_entries(dev);
-}
-
-static bool
-cq0_is_full(struct muser_dev * const dev)
-{
-	return acq_next(dev) == dev->regs.doorbell[0].cq_hdbl;
-}
-
-static inline void
-acq_tail_advance(struct muser_dev * const dev)
-{
-	dev->admin_cq_tail = acq_next(dev);
-}
-
+/*
+ * Completes a admin request.
+ */
 static int
-do_admin_queue_complete(struct muser_dev * const dev,
+do_admin_queue_complete(struct muser_dev * const d,
                         struct spdk_nvme_cmd * const cmd)
 {
 	struct spdk_nvme_cpl *cpl;
+	struct io_q *cq0;
 
-	assert(dev);
+	assert(d);
 	assert(cmd);
 
-	if (cq0_is_full(dev)) {
+	cq0 = &d->cq[0];
+
+	if (cq_is_full(d, cq0)) {
 		SPDK_ERRLOG("CQ0 full (tail=%d, head=%d)\n",
-		            dev->admin_cq_tail, dev->regs.doorbell[0].cq_hdbl);
+		            cq0->cq.tail, cq0->cq.hdbl);
 		return -1;
 	}
 
-	cpl = ((struct spdk_nvme_cpl*)dev->acq_addr) + dev->admin_cq_tail;
-	cpl->sqhd = dev->admin_sq_head;
+	cpl = ((struct spdk_nvme_cpl*)cq0->addr) + cq0->cq.tail;
+	cpl->sqhd = d->sq[0].sq.head;
 	cpl->cid = cmd->cid;
 	cpl->status.dnr = 0x0;
 	cpl->status.m = 0x0;
@@ -612,13 +681,15 @@ do_admin_queue_complete(struct muser_dev * const dev,
 	cpl->status.p = ~cpl->status.p; /* FIXME */
 	cpl->status.sc = 0x0;
 
-	acq_tail_advance(dev);
+	cq_tail_advance(d, cq0);
 
 	return 0;
 }
 
-
-
+/*
+ * Completes a admin request, mapping the completion queue if not already done
+ * so.
+ */
 static int
 admin_queue_complete(struct muser_dev * const dev,
                      struct spdk_nvme_cmd * const cmd)
@@ -626,7 +697,7 @@ admin_queue_complete(struct muser_dev * const dev,
 	assert(dev);
 	assert(cmd);
 
-	if (!dev->acq_addr) {
+	if (!dev->cq[0].addr) {
 		int ret = acq_map(dev);
 		if (ret) {
 			SPDK_ERRLOG("failed to map CQ0: %d\n", ret);
@@ -638,15 +709,33 @@ admin_queue_complete(struct muser_dev * const dev,
 }
 
 static struct io_q*
+lookup_io_q(const uint16_t qid, struct io_q * const q)
+{
+	assert(q);
+
+	if (qid > MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR)
+		return NULL;
+
+	/*
+	 * XXX ASQ and ACQ are lazily mapped, see relevant comment in
+	 * handle_sq0tdbl_write
+	 */
+	if (!q[qid].addr && qid)
+		return NULL;
+
+	return &q[qid];
+}
+
+static struct io_q*
 lookup_io_cq(struct muser_dev * const dev, const uint16_t qid)
 {
-	assert(dev);
+	return lookup_io_q(qid, dev->cq);
+}
 
-	/* FIXME implement */
-	if (dev->cq.qid == qid)
-		return &dev->cq;
-
-	return NULL;
+static struct io_q*
+lookup_io_sq(struct muser_dev * const dev, const uint16_t qid)
+{
+	return lookup_io_q(qid, dev->sq);
 }
 
 /*
@@ -654,25 +743,34 @@ lookup_io_cq(struct muser_dev * const dev, const uint16_t qid)
  */
 static int
 handle_create_io_q(struct muser_dev * const dev,
-                   struct spdk_nvme_cmd * const cmd, struct io_q * const io_q,
-                   const bool is_cq)
+                   struct spdk_nvme_cmd * const cmd, const bool is_cq)
 {
 	union spdk_nvme_create_io_q_cdw10 * cdw10;
 	union spdk_nvme_create_io_cq_cdw11 * cdw11_cq = NULL;
 	union spdk_nvme_create_io_sq_cdw11 * cdw11_sq = NULL;
 	size_t entry_size;
+	struct io_q io_q = { 0 };
 
 	assert(dev);
 	assert(cmd);
-	assert(io_q);
-	assert(!io_q->addr);
 
 	cdw10 = (union spdk_nvme_create_io_q_cdw10*)&cmd->cdw10;
 
 	SPDK_NOTICELOG("create I/O %cQ: QID=0x%x, QSIZE=0x%x\n",
 	               is_cq ? 'C' : 'S', cdw10->bits.qid, cdw10->bits.qsize);
 
+	if (cdw10->bits.qid >= MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
+		SPDK_ERRLOG("invalid QID=%d, max=%d\n", cdw10->bits.qid,
+		            MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR);
+		return -EINVAL;
+	}
+
+	/* TODO break rest of this function into smaller functions */
 	if (is_cq) {
+		if (lookup_io_cq(dev, cdw10->bits.qid)) {
+			SPDK_ERRLOG("CQ%d already exists\n", cdw10->bits.qid);
+			return -EEXIST;
+		}
 		cdw11_cq = (union spdk_nvme_create_io_cq_cdw11*)&cmd->cdw11;
 		entry_size = sizeof(struct spdk_nvme_cpl);
 		/* FIXME implement */
@@ -680,29 +778,39 @@ handle_create_io_q(struct muser_dev * const dev,
 		assert(cdw11_cq->bits.ien == 0x1);
 		assert(cdw11_cq->bits.iv == 0x0);
 	} else {
+		if (lookup_io_sq(dev, cdw10->bits.qid)) {
+			SPDK_ERRLOG("SQ%d already exists\n", cdw10->bits.qid);
+			return -EEXIST;
+		}
 		cdw11_sq = (union spdk_nvme_create_io_sq_cdw11*)&cmd->cdw11;
+		if (!lookup_io_cq(dev, cdw11_sq->bits.cqid)) {
+			SPDK_ERRLOG("CQ%d does not exist\n", cdw11_sq->bits.cqid);
+			return -ENOENT;
+		}
 		entry_size = sizeof(struct spdk_nvme_cmd);
 		/* FIXME implement */
 		assert(cdw11_sq->bits.pc == 0x1);
 
-		if (!lookup_io_cq(dev, cdw11_sq->bits.cqid)) {
-			SPDK_ERRLOG("no I/O completion queue with ID 0x%x\n",
-			            cdw11_sq->bits.cqid);
-			return -ESRCH;
-		}
-		io_q->cqid = cdw11_sq->bits.cqid;
+		io_q.sq.cqid = cdw11_sq->bits.cqid;
 	}
 
-	io_q->qid = cdw10->bits.qid; 
-	io_q->size = cdw10->bits.qsize + 1;
-	io_q->addr = map_one(dev->lm_ctx, cmd->dptr.prp.prp1,
-	                     io_q->size * entry_size);
-	if (!io_q->addr) {
+	io_q.id = cdw10->bits.qid;
+	io_q.size = cdw10->bits.qsize + 1;
+	if (io_q.size > max_queue_size(dev)) {
+		SPDK_ERRLOG("queue too big, want=%d, max=%d\n", io_q.size,
+		            max_queue_size(dev));
+		return -E2BIG;
+	}
+	io_q.addr = map_one(dev->lm_ctx, cmd->dptr.prp.prp1,
+	                    io_q.size * entry_size);
+	if (!io_q.addr) {
 		SPDK_ERRLOG("failed to map I/O queue\n");
 		return -1;
 	}
 
-	SPDK_NOTICELOG("create I/O queue at 0x%p\n", io_q->addr);
+	SPDK_NOTICELOG("create I/O queue at 0x%p\n", io_q.addr);
+
+	insert_queue(dev, &io_q, is_cq);
 
 	return admin_queue_complete(dev, cmd);
 }
@@ -727,6 +835,7 @@ consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd
 		case SPDK_NVME_OPC_SET_FEATURES:
 		case SPDK_NVME_OPC_GET_LOG_PAGE:
 		case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
+		case SPDK_NVME_OPC_NS_MANAGEMENT:
 			err = handle_identify_req(dev, cmd);
 			if (!err) {
 
@@ -740,9 +849,9 @@ consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd
 			}
 			return err;
 		case SPDK_NVME_OPC_CREATE_IO_CQ:
-			return handle_create_io_q(dev, cmd, &dev->cq, true);
+			return handle_create_io_q(dev, cmd, true);
 		case SPDK_NVME_OPC_CREATE_IO_SQ:
-			return handle_create_io_q(dev, cmd, &dev->sq, false);
+			return handle_create_io_q(dev, cmd, false);
 		default:
 			SPDK_ERRLOG("unsupported command 0x%x\n", cmd->opc);
 			return -1;
@@ -750,102 +859,240 @@ consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd
 	return -1;
 }
 
+static int
+handle_io_read(struct spdk_nvme_cmd * const cmd)
+{
+	uint64_t slba;
+	uint16_t nlb;
+
+	assert(cmd);
+
+	slba = (((uint64_t)cmd->cdw11) << 32) + (uint64_t)cmd->cdw10;
+
+	nlb = 0x0000ffff & cmd->cdw12;
+
+	SPDK_NOTICELOG("read MPTR=0x%lx, PRP1=0x%lx, PRP2=0x%lx, SLBA=0x%lx, NLB=0x%x\n",
+	               cmd->mptr, cmd->dptr.prp.prp1, cmd->dptr.prp.prp2, slba, nlb);
+
+	assert(0);
+
+	return 0;
+}
+
+static int
+consume_io_req(struct muser_dev * const d, struct io_q * const q,
+               struct spdk_nvme_cmd * const cmd)
+{
+	SPDK_NOTICELOG("XXX opc=0x%x\n", cmd->opc);
+	switch (cmd->opc) {
+		case SPDK_NVME_OPC_READ:
+			return handle_io_read(cmd);
+		default:
+			SPDK_ERRLOG("bad I/O command 0x%x\n", cmd->opc);
+			return -1;
+	}
+	return 0;
+}
+
+static int
+consume_req(struct muser_dev * const d, struct io_q * const q,
+            struct spdk_nvme_cmd * const cmd)
+{
+	if (q->id == 0)
+		return consume_admin_req(d, cmd);
+	return consume_io_req(d, q, cmd);
+}
+
 /*
  * Returns how many requests have been forwarded to NVMf and need to wait for
  * the response.
  */
 static int
-consume_admin_reqs(struct muser_dev * dev, const uint32_t new_asq_tail)
+consume_reqs(struct muser_dev * const d, const uint32_t new_tail,
+             struct io_q * const q)
 {
-	struct spdk_nvme_cmd *admin_queue;
 	int count = 0;
+	struct spdk_nvme_cmd * queue;
 
-	assert(dev);
-
-	admin_queue = (struct spdk_nvme_cmd*)dev->asq_addr;
-	assert(admin_queue);
+	assert(d);
+	assert(q);
 
 	/* FIXME need to validate new_sq_tail */
 	/*
 	 * FIXME can queue size change arbitrarily? Shall we operate on a copy ?
+	 *
+	 * FIXME operating on an SQ is pretty much the same for admin and I/O
+	 * queues. All we need is a callback to replace consume_req,
+	 * depending on the type of the queue.
 	 */
-	while (asq_tail(dev) != new_asq_tail) {
-		int ret = consume_admin_req(dev, &admin_queue[asq_tail(dev)]);
+	queue = q->addr;
+	while (sq_tail(d, q) != new_tail) {
+		struct spdk_nvme_cmd * const cmd = &queue[sq_tail(d, q)];	
+		int ret = consume_req(d, q, cmd);
 		if (ret < 0) {
 			/* FIXME how should we proceed now? */
 			SPDK_ERRLOG("failed to process request\n");
 			assert(0);
 		}
 		count += ret;
-		asq_tail_advance(dev);
+		sq_tail_advance(d, q);
 	}
 	return count;
 }
 
+/*
+ * Callback that gets triggered when the driver writes to a submission
+ * queue doorbell.
+ *
+ * Returns how many requests have been forwarded to NVMf and need to wait for
+ * the response.
+ */
 static ssize_t
-do_sq0tdbl_write(struct muser_dev * const dev, const uint32_t new_tail)
+handle_sq_tdbl_write(struct muser_dev * const d, const uint32_t new_tail,
+                     struct io_q * const q)
 {
-	assert(dev);
+	assert(d);
+	assert(q);
 
-	SPDK_NOTICELOG("write to SQ0 tail=0x%x\n", new_tail);
+	SPDK_NOTICELOG("write to SQ%d tail=0x%x\n", q->id, new_tail);
 
 	/*
 	 * TODO we should be mapping the queue when ASQ gets written, however
 	 * the NVMe driver writes it in two steps and this complicates things,
 	 * e.g. is it guaranteed to write both upper and lower portions?
 	 */
-	if (!dev->asq_addr) {
-		int ret = asq_map(dev);
+	if (q->id == 0 && !d->sq[0].addr) {
+		int ret = asq_map(d);
 		if (ret) {
 			SPDK_ERRLOG("failed to map SQ0: %d\n", ret);
 			return -1;
 		}
 	}
 
-	return consume_admin_reqs(dev, new_tail);
-}
-/*
- * Callback that gets triggered when the driver writes to the admin submission
- * queue doorbell.
- */
-static ssize_t
-handle_sq0tbdl_write(struct muser_dev * const dev, char const * const buf,
-         const size_t count, const loff_t pos)
-{
-	assert(dev);
-	if (count != sizeof(uint32_t)) {
-		SPDK_ERRLOG("bad write SQ0 size %zu\n", count);
-		return -EINVAL;
-	}
-	assert(buf);
-	return do_sq0tdbl_write(dev, *(uint32_t*)buf);
+	return consume_reqs(d, new_tail, q);
 }
 
 static ssize_t
-do_cq0hdbl_write(struct muser_dev * const dev, const uint32_t new_head)
+handle_cq_hdbl_write(struct muser_dev * const d, const uint32_t new_head,
+                     struct io_q * const q)
 {
-	assert(dev);
+	assert(d);
+	assert(q);
+
 	/*
 	 * FIXME is there anything we need to do with the new CQ0 head?
 	 * Incrementing the head means the host consumed completions, right?
 	 */
-	SPDK_NOTICELOG("write to CQ0 head=0x%x\n", new_head);
-	dev->regs.doorbell[0].cq_hdbl = new_head;
+	SPDK_NOTICELOG("write to CQ%d head=0x%x\n", q->id, new_head);
+	/* FIXME */
+	q->cq.hdbl = new_head;
 	return 0;
 }
 
-
-static ssize_t
-handle_cq0hdbl_write(struct muser_dev * const dev, char const * const buf,
-         const size_t count, const loff_t pos)
+/*
+ * SQ equation:
+ *	2*y   = (ADDR - 0x1000) / (4 << CAP.DSTRD)
+ * CQ equation:
+ *	2*y+1 = (ADDR - 0x1000) / (4 << CAP.DSTRD)
+ *
+ * So if the result of the right hand side expression is an even number then
+ * it's a submission queue, otherwise it's a completion queue.
+ */
+static inline int
+get_qid_and_kind(struct muser_dev const * const dev, const loff_t pos,
+                 bool * const is_sq)
 {
+	int i, n;
+
 	assert(dev);
-	if (count != sizeof(uint32_t)) {
-		SPDK_ERRLOG("bad write CQ0 size %zu\n", count);
+	assert(is_sq);
+
+	n = 4 << dev->admin_qp.qpair.ctrlr->vcprop.cap.bits.dstrd;
+	i = pos - DOORBELLS;
+
+	if (i % n) {
+		SPDK_ERRLOG("invalid doorbell offset 0x%lx\n", pos);
 		return -EINVAL;
 	}
+
+	i /= n;
+
+	/*
+	 * Adjusting 'i' is intentionally done in a verbose way for improved
+	 * readability.
+	 */
+	if (i % 2) { /* CQ */
+		*is_sq =  false;
+		i = (i - 1) / 2;
+	} else { /* SQ */
+		*is_sq = true;
+		i = i / 2;
+	}
+	return i;
+}
+
+static int
+handle_io_sq_tdbl_write(struct muser_dev * const dev)
+{
+	assert(0);
+}
+
+static int
+handle_io_cq_hbdl_write(struct muser_dev * const dev)
+{
+	assert(0);
+}
+
+static bool
+is_admin_q(struct io_q const * const queues, struct io_q const * const q)
+{
+	return q == &queues[0];
+}
+
+/*
+ * Handles a write at offset 0x1000 or more.
+ */
+static int
+handle_dbl_write(struct muser_dev * const dev, uint8_t const * const buf,
+                 const size_t count, const loff_t pos)
+{
+	int err;
+	uint16_t qid;
+	bool is_sq;
+	uint32_t v;
+	struct io_q * queues;
+	struct io_q * q;
+
+	assert(dev);
 	assert(buf);
-	return do_cq0hdbl_write(dev, *(uint32_t*)buf);
+
+	if (count != sizeof(uint32_t)) {
+		SPDK_ERRLOG("bad doorbell buffer size %ld\n", count);
+		return -EINVAL;
+	}
+
+	err = get_qid_and_kind(dev, pos, &is_sq);
+	if (err < 0) {
+		SPDK_ERRLOG("bad doorbell 0x%lx\n", pos);
+		return err;
+	}
+	qid = err;
+	v = *(int*)buf;
+
+	if (is_sq)
+		queues = dev->sq;
+	else
+		queues = dev->cq;
+
+	q = lookup_io_q(qid, queues);
+	if (!q) {
+		SPDK_ERRLOG("%cQ%d doesn't exist\n", 'S' ? is_sq : 'C', qid);
+		return -ENOENT;
+	}
+
+	if (is_sq)
+		return handle_sq_tdbl_write(dev, v, q);
+	return handle_cq_hdbl_write(dev, v, q);
 }
 
 static ssize_t
@@ -859,34 +1106,28 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	spdk_log_dump(stdout, "muser_write", buf, count);
 
 	switch (pos) {
+		/* TODO sort cases */
 		case ADMIN_QUEUES:
 			return admin_queue_write(muser_dev, buf, count, pos);
-		case SQ0TBDL:
-			err = handle_sq0tbdl_write(muser_dev, buf, count, pos);
-			if (err < 0) {
-				SPDK_ERRLOG("failed to handle write to submission queue 0 doorbell: %d\n", err);
-				return err;
-			}
-			if (!err)
-				return 0;
-			break;
-		case CQ0HDBL:
-			err = handle_cq0hdbl_write(muser_dev, buf, count, pos);
-			if (err) {
-				SPDK_ERRLOG("failed to handle write to completion queue 0 head: %d\n", err);
-				return err;
-			}
-			return 0;
 		case CC:
 			muser_dev->admin_qp.prop_req.buf = buf;
 			muser_dev->admin_qp.prop_req.count = count;
 			muser_dev->admin_qp.prop_req.pos = pos;
 			spdk_wmb();
 			muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
-			break;
+			break;		
 		default:
-			SPDK_ERRLOG("write to 0x%lx not implemented\n", pos);
-			return -ENOTSUP;
+			if (pos >= DOORBELLS) {
+				err = handle_dbl_write(muser_dev, buf, count,
+				                       pos);
+				if (err <= 0)
+					return err;
+			} else {
+				SPDK_ERRLOG("write to 0x%lx not implemented\n",
+				            pos);
+				return -ENOTSUP;	
+			}
+			break;
 	}
 
 	do {
@@ -1168,13 +1409,6 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 	muser_dev->pci_config_space = lm_get_pci_config_space(muser_dev->lm_ctx);
 	init_pci_config_space((struct nvme_config_space*)muser_dev->pci_config_space);
-
-	/* initialise head for admin queue */
-	/* FIXME does the NVMe driver initialize admin SQ0 doorbell? If so then
-	* we need to initialize head when that happens */
-	muser_dev->old_admin_sq_tail = 0;
-	muser_dev->admin_sq_head = muser_dev->regs.doorbell[0].sq_tdbl;
-	muser_dev->admin_cq_tail = 0;
 
 	err = pthread_create(&muser_dev->lm_thr, NULL,
 			     drive, muser_dev->lm_ctx);

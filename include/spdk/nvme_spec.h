@@ -362,7 +362,7 @@ struct spdk_nvme_registers {
 #define CQ0HDBL \
 	offsetof(struct spdk_nvme_registers, doorbell[0].cq_hdbl)
 
-
+#define DOORBELLS 0x1000
 
 /* NVMe controller register space offsets */
 SPDK_STATIC_ASSERT(0x00 == offsetof(struct spdk_nvme_registers, cap),
@@ -388,6 +388,9 @@ SPDK_STATIC_ASSERT(0x44 == offsetof(struct spdk_nvme_registers, bprsel),
 		   "Incorrect register offset");
 SPDK_STATIC_ASSERT(0x48 == offsetof(struct spdk_nvme_registers, bpmbl),
 		   "Incorrect register offset");
+
+SPDK_STATIC_ASSERT(DOORBELLS == offsetof(struct spdk_nvme_registers, doorbell[0].sq_tdbl),
+                   "Incorrect register offset");
 
 enum spdk_nvme_sgl_descriptor_type {
 	SPDK_NVME_SGL_TYPE_DATA_BLOCK		= 0x0,
