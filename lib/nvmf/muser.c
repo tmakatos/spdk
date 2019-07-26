@@ -153,6 +153,8 @@ struct muser_dev {
 	/* NB the doorbell member is not used for the admin SQ/CQ */
 	struct spdk_nvme_registers		regs;
 
+	uint16_t				cntlid;
+
 	/* I/O queues */
 	struct io_q				cq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
 	struct io_q				sq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
@@ -673,6 +675,20 @@ do_admin_queue_complete(struct muser_dev * const d,
 	}
 
 	cpl = ((struct spdk_nvme_cpl*)cq0->addr) + cq0->cq.tail;
+
+	/*
+	 * FIXME intercept controller ID, we'll need it for converting a create
+	 * I/O queue command to a fabric connect command. We assume that the
+	 * will have issued the identify command first before attempting to
+	 * create the I/O queues, so we'll have a chance to intercept it. This
+	 * is a hack, and racy. Fix.
+	 */
+	if (cmd->opc == SPDK_NVME_OPC_IDENTIFY) {
+		struct spdk_nvme_ctrlr_data *p = (struct spdk_nvme_ctrlr_data*)cmd->dptr.prp.prp1;
+		if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR && !d->cntlid)
+			d->cntlid = p->cntlid;
+	}
+
 	cpl->sqhd = d->sq[0].sq.head;
 	cpl->cid = cmd->cid;
 	cpl->status.dnr = 0x0;
