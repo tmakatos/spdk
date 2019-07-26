@@ -599,6 +599,7 @@ dptr_remap(struct muser_dev const * const dev, union spdk_nvme_dptr * const dptr
 	return 0;
 }
 
+/* FIXME rename function, it handles more opcodes other than identify */
 static int
 handle_identify_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
 {
@@ -938,6 +939,11 @@ handle_create_io_q(struct muser_dev * const dev,
 
 	insert_queue(dev, &io_q, is_cq);
 
+	/*
+	 * FIXME we need to complete the admin request when we hear back from
+	 * NVMf (muser_req_complete), not here.
+	 */
+
 	return admin_queue_complete(dev, cmd);
 }
 
@@ -1050,6 +1056,9 @@ consume_reqs(struct muser_dev * const d, const uint32_t new_tail,
 	 * FIXME operating on an SQ is pretty much the same for admin and I/O
 	 * queues. All we need is a callback to replace consume_req,
 	 * depending on the type of the queue.
+	 *
+	 * FIXME no need to track old_tail, simply consume anything from head to
+	 * tail.
 	 */
 	queue = q->addr;
 	while (sq_tail(d, q) != new_tail) {
@@ -1088,6 +1097,7 @@ handle_sq_tdbl_write(struct muser_dev * const d, const uint32_t new_tail,
 	 * e.g. is it guaranteed to write both upper and lower portions?
 	 */
 	if (q->id == 0 && !d->sq[0].addr) {
+		/* FIXME do this when EN is set to one */
 		int ret = asq_map(d);
 		if (ret) {
 			SPDK_ERRLOG("failed to map SQ0: %d\n", ret);
@@ -1737,6 +1747,14 @@ handle_req(struct muser_qpair * const muser_qpair)
 	return sem_post(&muser_qpair->prop_req.wait);
 }
 
+/*
+ * Called unconditionally, periodically, very frequently from SPDK to ask
+ * whether there's work to be done.  This functions consumes requests generated
+ * from read/write_bar0 by setting muser_qpair->prop_req.dir. The
+ * read/write_bar0 functions synchronously wait. This function will also
+ * consume requests by looking at the queue pair which will be have an
+ * associated guest SQ/CQ.
+ */
 static int
 muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
@@ -1748,6 +1766,7 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 	TAILQ_FOREACH(muser_qpair, &muser_group->qps, link) {
 		spdk_rmb();
+		/* FIXME this is a queue of size 1, needs to change */
 		if (muser_qpair->prop_req.dir != MUSER_NVMF_INVALID) {
 			err = handle_req(muser_qpair);
 			assert(err == 0);
