@@ -1503,7 +1503,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	struct muser_dev *muser_dev;
 
 	muser_group = (struct muser_poll_group *)group;
-	muser_qpair = (struct muser_qpair *)qpair;
+	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	muser_dev = muser_qpair->dev;
 
 	/* Admin QP */
