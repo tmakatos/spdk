@@ -100,6 +100,7 @@ struct muser_qpair {
 	struct muser_req			*reqs_internal;
 	union nvmf_h2c_msg			*cmds_internal;
 	union nvmf_c2h_msg			*rsps_internal;
+	uint16_t				qsize;
 	TAILQ_HEAD(, muser_req)			reqs;
 	TAILQ_ENTRY(muser_qpair)		link;
 };
@@ -158,6 +159,11 @@ struct muser_dev {
 	/* I/O queues */
 	struct io_q				cq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
 	struct io_q				sq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
+
+	struct muser_qpair			*pending_qp;
+	/* FIXME might have to move it in struct io_q */
+	/* FIXME admin_qp should not be a separate member, it's the 1st element in below array */
+	struct muser_qpair 			qp[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
 
 	TAILQ_ENTRY(muser_dev)			link;
 };
@@ -754,6 +760,108 @@ lookup_io_sq(struct muser_dev * const dev, const uint16_t qid)
 	return lookup_io_q(qid, dev->sq);
 }
 
+static void
+destroy_qp(struct muser_qpair * const qp)
+{
+	if (!qp)
+		return;
+	free(qp->reqs_internal);
+	qp->reqs_internal = NULL;
+	free(qp->cmds_internal);
+	qp->cmds_internal = NULL;
+	free(qp->rsps_internal);
+	qp->rsps_internal = NULL;
+}
+
+static int
+init_qp(struct muser_dev * const dev, struct muser_qpair * const qp,
+        struct spdk_nvmf_transport * const trnsprt, const uint16_t qsize,
+	const uint16_t id)
+{
+	int err = 0, i;
+
+	assert(dev);
+	assert(qp);
+	assert(trnsprt);
+
+	qp->qpair.qid = id;
+	qp->qpair.transport = trnsprt;
+	qp->dev = dev;
+	qp->qsize = qsize;
+
+	TAILQ_INIT(&qp->reqs);
+
+	/* FIXME is this needed for I/O queues? */
+	err = sem_init(&qp->prop_req.wait, 0, 0);
+	if (err)
+		return err;
+
+	qp->rsps_internal = calloc(qsize, sizeof(union nvmf_c2h_msg));
+	if (qp->rsps_internal == NULL) {
+		SPDK_ERRLOG("Error allocating rsps: %m\n");
+		err = -ENOMEM;
+		goto out;
+	}
+
+	qp->cmds_internal = calloc(qsize, sizeof(union nvmf_h2c_msg));
+	if (qp->cmds_internal == NULL) {
+		SPDK_ERRLOG("Error allocating cmds: %m\n");
+		err = -ENOMEM;
+		goto out;
+	}
+
+	qp->reqs_internal = calloc(qsize, sizeof(struct muser_req));
+	if (qp->reqs_internal == NULL) {
+		SPDK_ERRLOG("Error allocating reqs: %m\n");
+		err = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < qsize; i++) {
+		qp->reqs_internal[i].req.qpair = &qp->qpair;
+		qp->reqs_internal[i].req.rsp = &qp->rsps_internal[i];
+		qp->reqs_internal[i].req.cmd = &qp->cmds_internal[i];
+		TAILQ_INSERT_TAIL(&qp->reqs, &qp->reqs_internal[i], link);
+	}
+out:
+	if (err)
+		destroy_qp(qp);
+	return err;
+}
+
+static int
+prep_io_qp(struct muser_dev * const d, struct muser_qpair * const qp,
+           const uint16_t id, const uint16_t qsize)
+{
+	int err;
+
+	assert(d);
+	assert(qp);
+
+	/* FIXME need to specify qid */
+	/* qp->qid = id; */
+
+	/*
+	 * FIXME don't use d->admin_qp.qpair.transport, pass transport as a
+	 * parameter instead
+	 */
+	err = init_qp(d, qp, d->admin_qp.qpair.transport, qsize, id);
+	if (err)
+		return err;
+	spdk_wmb();
+	d->pending_qp = qp;
+
+	SPDK_NOTICELOG("waiting for NVMf to connect\n");
+	do {
+		err = sem_wait(&qp->prop_req.wait);
+	} while (err != 0 && errno != EINTR);
+	SPDK_NOTICELOG("NVMf to connected\n");
+
+	/* FIXME now we need to get the response from NVMf and pass it back */
+
+	return 0;
+}
+
 /*
  * Creates a completion or sumbission I/O queue.
  */
@@ -825,6 +933,8 @@ handle_create_io_q(struct muser_dev * const dev,
 	}
 
 	SPDK_NOTICELOG("create I/O queue at 0x%p\n", io_q.addr);
+	prep_io_qp(dev, &dev->qp[cdw10->bits.qid], cdw10->bits.qid,
+	           MUSER_DEFAULT_MAX_QUEUE_DEPTH);
 
 	insert_queue(dev, &io_q, is_cq);
 
@@ -1353,7 +1463,6 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	struct muser_transport *muser_transport;
 	struct muser_dev *muser_dev;
 	lm_dev_info_t dev_info = { 0 };
-	int i;
 	int err;
 
 	muser_transport = (struct muser_transport *)transport;
@@ -1372,46 +1481,10 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	memcpy(&muser_dev->trid, trid, sizeof(muser_dev->trid));
 
 	/* Admin QP setup */
-	muser_dev->admin_qp.qpair.transport = transport;
-	muser_dev->admin_qp.dev = muser_dev;
-
-	TAILQ_INIT(&muser_dev->admin_qp.reqs);
-
-	err = sem_init(&muser_dev->admin_qp.prop_req.wait, 0, 0);
-	assert(err == 0);
-
-	muser_dev->admin_qp.rsps_internal = calloc(MUSER_DEFAULT_AQ_DEPTH,
-						   sizeof(union nvmf_c2h_msg));
-	if (muser_dev->admin_qp.rsps_internal == NULL) {
-		SPDK_ERRLOG("Error allocating rsps: %m\n");
+	err = init_qp(muser_dev, &muser_dev->admin_qp, transport,
+	              MUSER_DEFAULT_AQ_DEPTH, 0);
+	if (err)
 		goto err_free_dev;
-	}
-
-	muser_dev->admin_qp.cmds_internal = calloc(MUSER_DEFAULT_AQ_DEPTH,
-						   sizeof(union nvmf_h2c_msg));
-	if (muser_dev->admin_qp.cmds_internal == NULL) {
-		SPDK_ERRLOG("Error allocating cmds: %m\n");
-		goto err_free_rsps;
-	}
-
-	muser_dev->admin_qp.reqs_internal = calloc(MUSER_DEFAULT_AQ_DEPTH,
-						   sizeof(struct muser_req));
-	if (muser_dev->admin_qp.reqs_internal == NULL) {
-		SPDK_ERRLOG("Error allocating reqs: %m\n");
-		goto err_free_cmds;
-	}
-
-	for (i = 0; i < MUSER_DEFAULT_AQ_DEPTH; i++) {
-		muser_dev->admin_qp.reqs_internal[i].req.qpair =
-				&muser_dev->admin_qp.qpair;
-		muser_dev->admin_qp.reqs_internal[i].req.rsp =
-				&muser_dev->admin_qp.rsps_internal[i];
-		muser_dev->admin_qp.reqs_internal[i].req.cmd =
-				&muser_dev->admin_qp.cmds_internal[i];
-		TAILQ_INSERT_TAIL(&muser_dev->admin_qp.reqs,
-				  &muser_dev->admin_qp.reqs_internal[i],
-				  link);
-	}
 
 	/* LM setup */
 	nvme_dev_info_fill(&dev_info, NULL, muser_dev);
@@ -1419,7 +1492,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	if (muser_dev->lm_ctx == NULL) {
 		/* TODO: lm_create doesn't set errno */
 		SPDK_ERRLOG("Error creating libmuser ctx: %m\n");
-		goto err_free_reqs;
+		goto err_destroy_qp;
 	}
 
 
@@ -1440,12 +1513,8 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 err_destroy:
 	lm_ctx_destroy(muser_dev->lm_ctx);
-err_free_reqs:
-	free(muser_dev->admin_qp.reqs_internal);
-err_free_cmds:
-	free(muser_dev->admin_qp.cmds_internal);
-err_free_rsps:
-	free(muser_dev->admin_qp.rsps_internal);
+err_destroy_qp:
+	destroy_qp(&muser_dev->admin_qp);
 err_free_dev:
 	free(muser_dev);
 err:
@@ -1473,6 +1542,10 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn)
 		if (muser_dev->setup == false) {
 			cb_fn(&muser_dev->admin_qp.qpair);
 			muser_dev->setup = true;
+		}
+		if (muser_dev->pending_qp) {
+			cb_fn(&muser_dev->pending_qp->qpair);
+			muser_dev->pending_qp = NULL;
 		}
 	}
 }
@@ -1517,41 +1590,43 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	struct muser_qpair *muser_qpair;
 	struct muser_req *muser_req;
 	struct muser_dev *muser_dev;
+	struct spdk_nvmf_request *req;
+	struct spdk_nvmf_fabric_connect_data *data;
+
 
 	muser_group = (struct muser_poll_group *)group;
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	muser_dev = muser_qpair->dev;
 
-	/* Admin QP */
-	if (qpair->qid == 0) {
-		struct spdk_nvmf_request *req;
-		struct spdk_nvmf_fabric_connect_data *data;
+	muser_req = TAILQ_FIRST(&muser_qpair->reqs);
+	TAILQ_REMOVE(&muser_qpair->reqs, muser_req, link);
 
-		muser_req = TAILQ_FIRST(&muser_qpair->reqs);
-		TAILQ_REMOVE(&muser_qpair->reqs, muser_req, link);
+	req = &muser_req->req;
+	req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
+	req->cmd->connect_cmd.cid = 0; /* FIXME */
+	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
+	req->cmd->connect_cmd.recfmt = 0;
+	req->cmd->connect_cmd.sqsize = muser_qpair->qsize - 1;
+	req->cmd->connect_cmd.qid = qpair->qid;
 
-		req = &muser_req->req;
-		req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
-		req->cmd->connect_cmd.cid = 0;
-		req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
-		req->cmd->connect_cmd.recfmt = 0;
-		req->cmd->connect_cmd.sqsize = MUSER_DEFAULT_AQ_DEPTH - 1;
-		req->cmd->connect_cmd.qid = 0;
+	req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
+	req->data = calloc(1, req->length);
+	assert(req->data != NULL);
+	/* TODO: Pre-allocate memory */
 
-		req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
-		req->data = calloc(1, req->length);
-		assert(req->data != NULL);
-		/* TODO: Pre-allocate memory */
+	data = (struct spdk_nvmf_fabric_connect_data *)req->data;
+	/* data->hostid = { 0 } */
 
-		data = (struct spdk_nvmf_fabric_connect_data *)req->data;
-		/* data->hostid = { 0 } */
-		data->cntlid = 0xffff;
-		snprintf(data->subnqn, sizeof(data->subnqn),
-			 "nqn.2019-07.io.spdk.muser:%s", muser_dev->uuid);
-		/* data->hostnqn = { 0 } */
+	data->cntlid = qpair->qid ? muser_dev->cntlid : 0xffff;
+	assert(data->cntlid);
+	snprintf(data->subnqn, sizeof(data->subnqn),
+		 "nqn.2019-07.io.spdk.muser:%s", muser_dev->uuid);
+	/* data->hostnqn = { 0 } */
 
-		spdk_nvmf_request_exec(req);
-	}
+	SPDK_NOTICELOG("sending connect fabrics command for QID=0x%x\n",
+	               qpair->qid);
+
+	spdk_nvmf_request_exec(req);
 
 	TAILQ_INSERT_TAIL(&muser_group->qps, muser_qpair, link);
 
