@@ -50,6 +50,8 @@
 
 #include "muser-nvme_pci.h"
 
+struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true}; 
+
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 128
 #define MUSER_DEFAULT_AQ_DEPTH 32
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
@@ -856,7 +858,7 @@ prep_io_qp(struct muser_dev * const d, struct muser_qpair * const qp,
 	do {
 		err = sem_wait(&qp->prop_req.wait);
 	} while (err != 0 && errno != EINTR);
-	SPDK_NOTICELOG("NVMf to connected\n");
+	SPDK_NOTICELOG("NVMf connected\n");
 
 	/* FIXME now we need to get the response from NVMf and pass it back */
 
@@ -1664,6 +1666,16 @@ muser_req_done(struct spdk_nvmf_request *req)
 
 	if (req->cmd->connect_cmd.opcode == SPDK_NVME_OPC_FABRIC &&
 	    req->cmd->connect_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_CONNECT) {
+
+		if (req->cmd->connect_cmd.qid) {
+			int err;
+			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+			              "fabric connect command completed\n");
+			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "sem_post %p\n", &muser_qpair->prop_req.wait);
+			err = sem_post(&muser_qpair->prop_req.wait);
+			if (err)
+				SPDK_ERRLOG("failed to sem_post: %m\n");
+		}
 		free(req->data);
 		req->data = NULL;
 	}
