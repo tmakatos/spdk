@@ -934,8 +934,11 @@ handle_create_io_q(struct muser_dev * const dev,
 	}
 
 	SPDK_NOTICELOG("create I/O queue at 0x%p\n", io_q.addr);
-	prep_io_qp(dev, &dev->qp[cdw10->bits.qid], cdw10->bits.qid,
-	           MUSER_DEFAULT_MAX_QUEUE_DEPTH);
+
+	if (is_cq) {
+		prep_io_qp(dev, &dev->qp[cdw10->bits.qid], cdw10->bits.qid,
+		           MUSER_DEFAULT_MAX_QUEUE_DEPTH);
+	}
 
 	insert_queue(dev, &io_q, is_cq);
 
