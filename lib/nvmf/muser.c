@@ -997,8 +997,9 @@ consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd
 }
 
 static int
-handle_io_read(struct spdk_nvme_cmd * const cmd)
+handle_io_read(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
 {
+	int err;
 	uint64_t slba;
 	uint16_t nlb;
 
@@ -1011,7 +1012,14 @@ handle_io_read(struct spdk_nvme_cmd * const cmd)
 	SPDK_NOTICELOG("read MPTR=0x%lx, PRP1=0x%lx, PRP2=0x%lx, SLBA=0x%lx, NLB=0x%x\n",
 	               cmd->mptr, cmd->dptr.prp.prp1, cmd->dptr.prp.prp2, slba, nlb);
 
-	assert(0);
+	err = dptr_remap(dev, &cmd->dptr);
+	if (err)
+		return err;
+
+	/* FIXME we must use the I/O QP, not the admin one */
+	dev->admin_qp.cmd = cmd;
+	spdk_wmb();
+	dev->admin_qp.prop_req.dir = MUSER_NVMF_READ;
 
 	return 0;
 }
@@ -1023,7 +1031,7 @@ consume_io_req(struct muser_dev * const d, struct io_q * const q,
 	SPDK_NOTICELOG("XXX opc=0x%x\n", cmd->opc);
 	switch (cmd->opc) {
 		case SPDK_NVME_OPC_READ:
-			return handle_io_read(cmd);
+			return handle_io_read(d, cmd);
 		default:
 			SPDK_ERRLOG("bad I/O command 0x%x\n", cmd->opc);
 			return -1;
