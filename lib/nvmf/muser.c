@@ -179,7 +179,8 @@ muser_destroy(struct spdk_nvmf_transport *transport)
 {
 	struct muser_transport *muser_transport;
 
-	muser_transport = (struct muser_transport *)transport;
+	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
+	                                   transport);
 
 	(void)pthread_mutex_destroy(&muser_transport->lock);
 
@@ -1486,7 +1487,8 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	lm_dev_info_t dev_info = { 0 };
 	int err;
 
-	muser_transport = (struct muser_transport *)transport;
+	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
+	                                   transport);
 
 	err = mdev_create(trid->traddr);
 	if (err == -1) {
@@ -1557,7 +1559,8 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn)
 	struct muser_transport *muser_transport;
 	struct muser_dev *muser_dev;
 
-	muser_transport = (struct muser_transport *)transport;
+	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
+	                                   transport);
 
 	TAILQ_FOREACH(muser_dev, &muser_transport->devs, link) {
 		if (muser_dev->setup == false) {
@@ -1581,26 +1584,29 @@ static struct spdk_nvmf_transport_poll_group *
 muser_poll_group_create(struct spdk_nvmf_transport *transport)
 {
 	struct muser_poll_group *muser_group;
+	struct muser_transport *muser_transport;
 
 	muser_group = calloc(1, sizeof(*muser_group));
 	if (muser_group == NULL) {
 		SPDK_ERRLOG("Error allocating poll group: %m");
 		return NULL;
 	}
+	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
+	                                   transport);
 
 	TAILQ_INIT(&muser_group->qps);
 
-	return (struct spdk_nvmf_transport_poll_group *)muser_group;
+	return &muser_group->group;
 }
 
 static void
 muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 {
-    struct muser_poll_group *poll_group;
+	struct muser_poll_group *muser_group;
 
-    poll_group = (struct muser_poll_group *)group;
+	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 
-    free(poll_group);
+	free(muser_group);
 }
 
 static int
@@ -1615,7 +1621,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	struct spdk_nvmf_fabric_connect_data *data;
 
 
-	muser_group = (struct muser_poll_group *)group;
+	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	muser_dev = muser_qpair->dev;
 
@@ -1783,7 +1789,7 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	struct muser_qpair *muser_qpair;
 	int err;
 
-	muser_group = (struct muser_poll_group *)group;
+	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 
 	TAILQ_FOREACH(muser_qpair, &muser_group->qps, link) {
 		spdk_rmb();
@@ -1805,7 +1811,7 @@ muser_qpair_get_local_trid(struct spdk_nvmf_qpair *qpair,
 	struct muser_qpair *muser_qpair;
 	struct muser_dev *muser_dev;
 
-	muser_qpair = (struct muser_qpair *)qpair;
+	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	muser_dev = muser_qpair->dev;
 
 	memcpy(trid, &muser_dev->trid, sizeof(*trid));
@@ -1826,7 +1832,7 @@ muser_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 	struct muser_qpair *muser_qpair;
 	struct muser_dev *muser_dev;
 
-	muser_qpair = (struct muser_qpair *)qpair;
+	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	muser_dev = muser_qpair->dev;
 
 	memcpy(trid, &muser_dev->trid, sizeof(*trid));
