@@ -146,8 +146,7 @@ struct io_q {
 
 struct muser_dev {
 	struct spdk_nvme_transport_id		trid;
-	struct muser_qpair			admin_qp;
-	char					uuid[37];
+	char					uuid[37]; /* TODO 37 is already defined somewhere */
 	pthread_t				lm_thr;
 	lm_ctx_t				*lm_ctx;
 	bool					setup;
@@ -164,7 +163,6 @@ struct muser_dev {
 
 	struct muser_qpair			*pending_qp;
 	/* FIXME might have to move it in struct io_q */
-	/* FIXME admin_qp should not be a separate member, it's the 1st element in below array */
 	struct muser_qpair 			qp[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
 
 	TAILQ_ENTRY(muser_dev)			link;
@@ -264,7 +262,7 @@ read_cap(struct muser_dev const * const dev, char * const buf,
 	 * TODO this line is far too long
 	 */
 	assert(dev);
-	memcpy(buf, ((uint8_t*)&dev->admin_qp.qpair.ctrlr->vcprop.cap.raw) + pos - offsetof(struct spdk_nvme_registers, cap), count);
+	memcpy(buf, ((uint8_t*)&dev->qp[0].qpair.ctrlr->vcprop.cap.raw) + pos - offsetof(struct spdk_nvme_registers, cap), count);
 	return 0;
 }
 
@@ -294,24 +292,24 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	if (is_cap(pos))
 		return read_cap(muser_dev, buf, count, pos);
 
-	muser_dev->admin_qp.prop_req.buf = buf;
+	muser_dev->qp[0].prop_req.buf = buf;
 	/* TODO: count must never be more than 8, otherwise we need to split it */
-	muser_dev->admin_qp.prop_req.count = count;
-	muser_dev->admin_qp.prop_req.pos = pos;
+	muser_dev->qp[0].prop_req.count = count;
+	muser_dev->qp[0].prop_req.pos = pos;
 	spdk_wmb();
-	muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_READ;
+	muser_dev->qp[0].prop_req.dir = MUSER_NVMF_READ;
 
 	do {
-		err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
+		err = sem_wait(&muser_dev->qp[0].prop_req.wait);
 	} while (err != 0 && errno != EINTR);
 
-	return muser_dev->admin_qp.prop_req.ret;
+	return muser_dev->qp[0].prop_req.ret;
 }
 
 static uint16_t
 max_queue_size(struct muser_dev const * const dev)
 {
-	return dev->admin_qp.qpair.ctrlr->vcprop.cap.bits.mqes + 1;
+	return dev->qp[0].qpair.ctrlr->vcprop.cap.bits.mqes + 1;
 }
 
 static ssize_t
@@ -619,9 +617,9 @@ handle_identify_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const c
 		return -1;
 	}
 
-	dev->admin_qp.cmd = cmd;
+	dev->qp[0].cmd = cmd;
 	spdk_wmb();
-	dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
+	dev->qp[0].prop_req.dir = MUSER_NVMF_WRITE;
 
 	return 0;
 }
@@ -845,10 +843,10 @@ prep_io_qp(struct muser_dev * const d, struct muser_qpair * const qp,
 	/* qp->qid = id; */
 
 	/*
-	 * FIXME don't use d->admin_qp.qpair.transport, pass transport as a
+	 * FIXME don't use d->qp[0].qpair.transport, pass transport as a
 	 * parameter instead
 	 */
-	err = init_qp(d, qp, d->admin_qp.qpair.transport, qsize, id);
+	err = init_qp(d, qp, d->qp[0].qpair.transport, qsize, id);
 	if (err)
 		return err;
 	spdk_wmb();
@@ -1017,9 +1015,9 @@ handle_io_read(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
 		return err;
 
 	/* FIXME we must use the I/O QP, not the admin one */
-	dev->admin_qp.cmd = cmd;
+	dev->qp[0].cmd = cmd;
 	spdk_wmb();
-	dev->admin_qp.prop_req.dir = MUSER_NVMF_READ;
+	dev->qp[0].prop_req.dir = MUSER_NVMF_READ;
 
 	return 0;
 }
@@ -1156,7 +1154,7 @@ get_qid_and_kind(struct muser_dev const * const dev, const loff_t pos,
 	assert(dev);
 	assert(is_sq);
 
-	n = 4 << dev->admin_qp.qpair.ctrlr->vcprop.cap.bits.dstrd;
+	n = 4 << dev->qp[0].qpair.ctrlr->vcprop.cap.bits.dstrd;
 	i = pos - DOORBELLS;
 
 	if (i % n) {
@@ -1259,11 +1257,11 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		case ADMIN_QUEUES:
 			return admin_queue_write(muser_dev, buf, count, pos);
 		case CC:
-			muser_dev->admin_qp.prop_req.buf = buf;
-			muser_dev->admin_qp.prop_req.count = count;
-			muser_dev->admin_qp.prop_req.pos = pos;
+			muser_dev->qp[0].prop_req.buf = buf;
+			muser_dev->qp[0].prop_req.count = count;
+			muser_dev->qp[0].prop_req.pos = pos;
 			spdk_wmb();
-			muser_dev->admin_qp.prop_req.dir = MUSER_NVMF_WRITE;
+			muser_dev->qp[0].prop_req.dir = MUSER_NVMF_WRITE;
 			break;		
 		default:
 			if (pos >= DOORBELLS) {
@@ -1280,14 +1278,14 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	}
 
 	do {
-		err = sem_wait(&muser_dev->admin_qp.prop_req.wait);
+		err = sem_wait(&muser_dev->qp[0].prop_req.wait);
 	} while (err != 0 && errno != EINTR);
 
 	if (pos == SQ0TBDL) {
-		admin_queue_complete(muser_dev, muser_dev->admin_qp.cmd);
+		admin_queue_complete(muser_dev, muser_dev->qp[0].cmd);
 	}
 
-	return muser_dev->admin_qp.prop_req.ret;
+	return muser_dev->qp[0].prop_req.ret;
 }
 
 static ssize_t
@@ -1504,7 +1502,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	memcpy(&muser_dev->trid, trid, sizeof(muser_dev->trid));
 
 	/* Admin QP setup */
-	err = init_qp(muser_dev, &muser_dev->admin_qp, transport,
+	err = init_qp(muser_dev, &muser_dev->qp[0], transport,
 	              MUSER_DEFAULT_AQ_DEPTH, 0);
 	if (err)
 		goto err_free_dev;
@@ -1537,7 +1535,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 err_destroy:
 	lm_ctx_destroy(muser_dev->lm_ctx);
 err_destroy_qp:
-	destroy_qp(&muser_dev->admin_qp);
+	destroy_qp(&muser_dev->qp[0]);
 err_free_dev:
 	free(muser_dev);
 err:
@@ -1563,7 +1561,7 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn)
 
 	TAILQ_FOREACH(muser_dev, &muser_transport->devs, link) {
 		if (muser_dev->setup == false) {
-			cb_fn(&muser_dev->admin_qp.qpair);
+			cb_fn(&muser_dev->qp[0].qpair);
 			muser_dev->setup = true;
 		}
 		if (muser_dev->pending_qp) {
