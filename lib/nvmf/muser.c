@@ -777,17 +777,17 @@ destroy_qp(struct muser_qpair * const qp)
 
 static int
 init_qp(struct muser_dev * const dev, struct muser_qpair * const qp,
-        struct spdk_nvmf_transport * const trnsprt, const uint16_t qsize,
+        struct spdk_nvmf_transport * const transport, const uint16_t qsize,
 	const uint16_t id)
 {
 	int err = 0, i;
 
 	assert(dev);
 	assert(qp);
-	assert(trnsprt);
+	assert(transport);
 
 	qp->qpair.qid = id;
-	qp->qpair.transport = trnsprt;
+	qp->qpair.transport = transport;
 	qp->dev = dev;
 	qp->qsize = qsize;
 
