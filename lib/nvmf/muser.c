@@ -1179,6 +1179,7 @@ get_qid_and_kind(struct muser_dev const * const dev, const loff_t pos,
 	return i;
 }
 
+#if 0
 static int
 handle_io_sq_tdbl_write(struct muser_dev * const dev)
 {
@@ -1190,12 +1191,15 @@ handle_io_cq_hbdl_write(struct muser_dev * const dev)
 {
 	assert(0);
 }
+#endif
 
+#if 0
 static bool
 is_admin_q(struct io_q const * const queues, struct io_q const * const q)
 {
 	return q == &queues[0];
 }
+#endif
 
 /*
  * Handles a write at offset 0x1000 or more.
