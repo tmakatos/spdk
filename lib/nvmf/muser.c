@@ -93,27 +93,6 @@ struct muser_nvmf_prop_req {
 	ssize_t					ret;
 };
 
-struct muser_qpair {
-	struct spdk_nvmf_qpair			qpair;
-	struct spdk_nvmf_muser_poll_group	*group;
-	struct muser_dev			*dev;
-	struct muser_nvmf_prop_req		prop_req;
-	struct spdk_nvme_cmd			*cmd;
-	struct muser_req			*reqs_internal;
-	union nvmf_h2c_msg			*cmds_internal;
-	union nvmf_c2h_msg			*rsps_internal;
-	uint16_t				qsize;
-	TAILQ_HEAD(, muser_req)			reqs;
-	TAILQ_ENTRY(muser_qpair)		link;
-};
-
-struct muser_poll_group {
-	struct spdk_nvmf_transport_poll_group	group;
-	TAILQ_HEAD(, muser_qpair)		qps;
-	TAILQ_HEAD(, muser_qpair)		new_qps;
-	pthread_mutex_t				lock;
-};
-
 /*
  * An I/O queue.
  *
@@ -125,10 +104,17 @@ struct io_q {
 	/*
 	 * XXX we can trivially figure out the QID based on the offset of a
 	 * queue within the sq/cq array, however it's just faster to store it.
+	 *
+	 * FIXME move to parent struct muser_qpair?
 	 */
 	uint16_t id;
 
 	void *addr;
+
+	/*
+	 * FIXME move to parent struct muser_qpair? There's already qsize there,
+	 * duplicate?
+	 */
 	uint32_t size;
 
 	union {
@@ -146,6 +132,29 @@ struct io_q {
 	};
 };
 
+struct muser_qpair {
+	struct spdk_nvmf_qpair			qpair;
+	struct spdk_nvmf_muser_poll_group	*group;
+	struct muser_dev			*dev;
+	struct muser_nvmf_prop_req		prop_req;
+	struct spdk_nvme_cmd			*cmd;
+	struct muser_req			*reqs_internal;
+	union nvmf_h2c_msg			*cmds_internal;
+	union nvmf_c2h_msg			*rsps_internal;
+	uint16_t				qsize;
+	struct io_q				cq;
+	struct io_q				sq;
+	TAILQ_HEAD(, muser_req)			reqs;
+	TAILQ_ENTRY(muser_qpair)		link;
+};
+
+struct muser_poll_group {
+	struct spdk_nvmf_transport_poll_group	group;
+	TAILQ_HEAD(, muser_qpair)		qps;
+	TAILQ_HEAD(, muser_qpair)		new_qps;
+	pthread_mutex_t				lock;
+};
+
 struct muser_dev {
 	struct spdk_nvme_transport_id		trid;
 	char					uuid[37]; /* TODO 37 is already defined somewhere */
@@ -158,11 +167,6 @@ struct muser_dev {
 
 	uint16_t				cntlid;
 
-	/* I/O queues */
-	struct io_q				cq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
-	struct io_q				sq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
-
-	/* FIXME might have to move it in struct io_q */
 	struct muser_qpair 			qp[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
 
 	TAILQ_ENTRY(muser_dev)			link;
@@ -467,24 +471,10 @@ map_one(lm_ctx_t * const ctx, const uint64_t addr, const size_t len)
 	return iov.iov_base;
 }
 
-static bool
-is_sq(struct muser_dev const * const dev, struct io_q const * const q)
-{
-	return q >= &dev->sq[0] && q <= &dev->sq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR-1];
-}
-
-static bool
-is_cq(struct muser_dev const * const dev, struct io_q const * const q)
-{
-	return q >= &dev->cq[0] && q <= &dev->cq[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR-1];
-}
-
-
 static uint32_t
 sq_tail(struct muser_dev const * const d, struct io_q const * const q)
 {
 	assert(q);
-	assert(is_sq(d, q));
 	return q->sq.old_tail % q->size;
 }
 
@@ -493,7 +483,6 @@ sq_tail_advance(struct muser_dev const * const d, struct io_q * const q)
 {
 	assert(q);
 	assert(d);
-	assert(is_sq(d, q));
 	q->sq.old_tail = (sq_tail(d, q) + 1) % q->size;
 }
 
@@ -501,16 +490,14 @@ static void
 insert_queue(struct muser_dev * const dev, struct io_q const * const q,
              const bool is_cq)
 {
-	struct io_q *queue;
 
 	assert(dev);
 	assert(q);
 
 	if (is_cq)
-		queue = dev->cq;
+		dev->qp[q->id].cq = *q;
 	else
-		queue = dev->sq;
-	queue[q->id] = *q;
+		dev->qp[q->id].sq = *q;
 }
 
 static int
@@ -519,7 +506,7 @@ asq_map(struct muser_dev * const d)
 	struct io_q q;
 
 	assert(d);
-	assert(!d->sq[0].addr);
+	assert(!d->qp[0].sq.addr);
 	/* XXX dev->regs.asq == 0 is a valid memory address */
 
 	q.size = d->regs.aqa.bits.asqs + 1;
@@ -540,7 +527,6 @@ cq_next(struct muser_dev * const d, struct io_q * const q)
 {
 	assert(d);
 	assert(q);
-	assert(is_cq(d, q));
 	return (q->cq.tail + 1) % q->size;
 }
 
@@ -549,7 +535,6 @@ cq_is_full(struct muser_dev * const d, struct io_q * const q)
 {
 	assert(d);
 	assert(q);
-	assert(is_cq(d, q));
 	return cq_next(d, q) == q->cq.hdbl;
 }
 
@@ -558,7 +543,6 @@ cq_tail_advance(struct muser_dev * const d, struct io_q * const q)
 {
 	assert(d);
 	assert(q);
-	assert(is_cq(d, q));
 	q->cq.tail = cq_next(d, q);
 }
 
@@ -568,7 +552,7 @@ acq_map(struct muser_dev * const d)
 	struct io_q q;
 
 	assert(d);
-	assert(!d->cq[0].addr);
+	assert(!d->qp[0].cq.addr);
 	assert(d->regs.acq);
 
 	q.size = d->regs.aqa.bits.acqs + 1;
@@ -675,7 +659,7 @@ do_admin_queue_complete(struct muser_dev * const d,
 	assert(d);
 	assert(cmd);
 
-	cq0 = &d->cq[0];
+	cq0 = &d->qp[0].cq;
 
 	if (cq_is_full(d, cq0)) {
 		SPDK_ERRLOG("CQ0 full (tail=%d, head=%d)\n",
@@ -698,7 +682,7 @@ do_admin_queue_complete(struct muser_dev * const d,
 			d->cntlid = p->cntlid;
 	}
 
-	cpl->sqhd = d->sq[0].sq.head;
+	cpl->sqhd = d->qp[0].sq.sq.head;
 	cpl->cid = cmd->cid;
 	cpl->status.dnr = 0x0;
 	cpl->status.m = 0x0;
@@ -722,7 +706,7 @@ admin_queue_complete(struct muser_dev * const dev,
 	assert(dev);
 	assert(cmd);
 
-	if (!dev->cq[0].addr) {
+	if (!dev->qp[0].cq.addr) {
 		int ret = acq_map(dev);
 		if (ret) {
 			SPDK_ERRLOG("failed to map CQ0: %d\n", ret);
@@ -734,33 +718,28 @@ admin_queue_complete(struct muser_dev * const dev,
 }
 
 static struct io_q*
-lookup_io_q(const uint16_t qid, struct io_q * const q)
+lookup_io_q(struct muser_dev * const dev, const uint16_t qid, const bool is_cq)
 {
-	assert(q);
+	struct io_q *q;
+
+	assert(dev);
 
 	if (qid > MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR)
 		return NULL;
+
+	if (is_cq)
+		q = &dev->qp[qid].cq;
+	else
+		q = &dev->qp[qid].sq;
 
 	/*
 	 * XXX ASQ and ACQ are lazily mapped, see relevant comment in
 	 * handle_sq0tdbl_write
 	 */
-	if (!q[qid].addr && qid)
+	if (!q->addr && qid)
 		return NULL;
 
-	return &q[qid];
-}
-
-static struct io_q*
-lookup_io_cq(struct muser_dev * const dev, const uint16_t qid)
-{
-	return lookup_io_q(qid, dev->cq);
-}
-
-static struct io_q*
-lookup_io_sq(struct muser_dev * const dev, const uint16_t qid)
-{
-	return lookup_io_q(qid, dev->sq);
+	return q;
 }
 
 static void
@@ -924,12 +903,14 @@ handle_create_io_q(struct muser_dev * const dev,
 		return -EINVAL;
 	}
 
+	if (lookup_io_q(dev, cdw10->bits.qid, is_cq)) {
+		SPDK_ERRLOG("%cQ%d already exists\n", is_cq ? 'C' : 'S',
+		            cdw10->bits.qid);
+		return -EEXIST;
+	}
+
 	/* TODO break rest of this function into smaller functions */
 	if (is_cq) {
-		if (lookup_io_cq(dev, cdw10->bits.qid)) {
-			SPDK_ERRLOG("CQ%d already exists\n", cdw10->bits.qid);
-			return -EEXIST;
-		}
 		cdw11_cq = (union spdk_nvme_create_io_cq_cdw11*)&cmd->cdw11;
 		entry_size = sizeof(struct spdk_nvme_cpl);
 		/* FIXME implement */
@@ -937,12 +918,8 @@ handle_create_io_q(struct muser_dev * const dev,
 		assert(cdw11_cq->bits.ien == 0x1);
 		assert(cdw11_cq->bits.iv == 0x0);
 	} else {
-		if (lookup_io_sq(dev, cdw10->bits.qid)) {
-			SPDK_ERRLOG("SQ%d already exists\n", cdw10->bits.qid);
-			return -EEXIST;
-		}
 		cdw11_sq = (union spdk_nvme_create_io_sq_cdw11*)&cmd->cdw11;
-		if (!lookup_io_cq(dev, cdw11_sq->bits.cqid)) {
+		if (!lookup_io_q(dev, cdw11_sq->bits.cqid, true)) {
 			SPDK_ERRLOG("CQ%d does not exist\n", cdw11_sq->bits.cqid);
 			return -ENOENT;
 		}
@@ -1141,7 +1118,7 @@ handle_sq_tdbl_write(struct muser_dev * const d, const uint32_t new_tail,
 	 * the NVMe driver writes it in two steps and this complicates things,
 	 * e.g. is it guaranteed to write both upper and lower portions?
 	 */
-	if (q->id == 0 && !d->sq[0].addr) {
+	if (q->id == 0 && !d->qp[0].sq.addr) {
 		/* FIXME do this when EN is set to one */
 		int ret = asq_map(d);
 		if (ret) {
@@ -1181,12 +1158,12 @@ handle_cq_hdbl_write(struct muser_dev * const d, const uint32_t new_head,
  */
 static inline int
 get_qid_and_kind(struct muser_dev const * const dev, const loff_t pos,
-                 bool * const is_sq)
+                 bool * const is_cq)
 {
 	int i, n;
 
 	assert(dev);
-	assert(is_sq);
+	assert(is_cq);
 
 	n = 4 << dev->qp[0].qpair.ctrlr->vcprop.cap.bits.dstrd;
 	i = pos - DOORBELLS;
@@ -1203,10 +1180,10 @@ get_qid_and_kind(struct muser_dev const * const dev, const loff_t pos,
 	 * readability.
 	 */
 	if (i % 2) { /* CQ */
-		*is_sq =  false;
+		*is_cq =  true;
 		i = (i - 1) / 2;
 	} else { /* SQ */
-		*is_sq = true;
+		*is_cq = false;
 		i = i / 2;
 	}
 	return i;
@@ -1243,9 +1220,8 @@ handle_dbl_write(struct muser_dev * const dev, uint8_t const * const buf,
 {
 	int err;
 	uint16_t qid;
-	bool is_sq;
+	bool is_cq;
 	uint32_t v;
-	struct io_q * queues;
 	struct io_q * q;
 
 	assert(dev);
@@ -1256,28 +1232,23 @@ handle_dbl_write(struct muser_dev * const dev, uint8_t const * const buf,
 		return -EINVAL;
 	}
 
-	err = get_qid_and_kind(dev, pos, &is_sq);
+	err = get_qid_and_kind(dev, pos, &is_cq);
 	if (err < 0) {
 		SPDK_ERRLOG("bad doorbell 0x%lx\n", pos);
 		return err;
 	}
 	qid = err;
-	v = *(int*)buf;
 
-	if (is_sq)
-		queues = dev->sq;
-	else
-		queues = dev->cq;
-
-	q = lookup_io_q(qid, queues);
+	q = lookup_io_q(dev, qid, is_cq);
 	if (!q) {
-		SPDK_ERRLOG("%cQ%d doesn't exist\n", 'S' ? is_sq : 'C', qid);
+		SPDK_ERRLOG("%cQ%d doesn't exist\n", is_cq ? 'C' : 'S', qid);
 		return -ENOENT;
 	}
 
-	if (is_sq)
-		return handle_sq_tdbl_write(dev, v, q);
-	return handle_cq_hdbl_write(dev, v, q);
+	v = *(int*)buf;
+	if (is_cq)
+		return handle_cq_hdbl_write(dev, v, q);
+	return handle_sq_tdbl_write(dev, v, q);
 }
 
 static ssize_t
