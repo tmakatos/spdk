@@ -1410,17 +1410,17 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
 	if (fops)
 		dev_info->fops = *fops;
 
-	dev_info->irq_count[LM_DEV_INTX_IRQ_IDX] = NVME_IRQ_INTX_NUM;
-	dev_info->irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
+	dev_info->pci_info.irq_count[LM_DEV_INTX_IRQ_IDX] = NVME_IRQ_INTX_NUM;
+	dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
 
 	dev_info->nr_dma_regions = 0x10;
 
-	dev_info->bar_fn = &access_bar_fn;
-	dev_info->pci_config_fn = &access_pci_config;
+	dev_info->pci_info.bar_fn = &access_bar_fn;
+	dev_info->pci_info.pci_config_fn = &access_pci_config;
 
 	dev_info->extended = true;
 
-	nvme_reg_info_fill(dev_info->reg_info);
+	nvme_reg_info_fill(dev_info->pci_info.reg_info);
 
 	dev_info->log = nvme_log;
 	dev_info->log_lvl = LM_DBG;
