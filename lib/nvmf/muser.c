@@ -31,6 +31,8 @@
  */
 
 #include <muser/muser.h>
+#include <muser/pmcap.h>
+#include <muser/pxcap.h>
 
 #include "spdk/barrier.h"
 #include "spdk/stdinc.h"
@@ -48,9 +50,30 @@
 
 #include "spdk_internal/log.h"
 
-#include "muser-nvme_pci.h"
+struct nvme_pcie_mlbar {
+	uint32_t rte :	1;
+	uint32_t tp :	2;
+	uint32_t pf :	1;
+	uint32_t res1 :	10;
+	uint32_t ba :	16;
+};
+SPDK_STATIC_ASSERT(sizeof(struct nvme_pcie_mlbar) == sizeof(uint32_t), "Invalid size");
 
-struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true}; 
+struct nvme_pcie_bar2 {
+	uint32_t rte :	1;
+	uint32_t res1 :	2;
+	uint32_t ba :	29;
+};
+SPDK_STATIC_ASSERT(sizeof(struct nvme_pcie_bar2) == sizeof(uint32_t), "Bad NVMe BAR2 size");
+
+__attribute__((packed)) __attribute__ ((aligned(8))) struct nvme_config_space {
+	lm_pci_hdr_t hdr;
+	struct pmcap pmcap;
+	struct PCI_Express_Capability pci_expr_cap;
+};
+//SPDK_STATIC_ASSERT(sizeof(struct nvme_config_space) == sizeof(lm_pci_hdr_t) + sizeof(struct pmcap) + sizeof(struct PCI_Express_Capability), "Invalid size");
+
+struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 128
 #define MUSER_DEFAULT_AQ_DEPTH 32
@@ -112,7 +135,7 @@ struct io_q {
 	void *addr;
 
 	/*
-	 * FIXME move to parent struct muser_qpair? There's already qsize there,
+	 * FIXME move to parent struct muser_qpair? There's already qsize therenvme_config_space,
 	 * duplicate?
 	 */
 	uint32_t size;
@@ -1084,7 +1107,7 @@ consume_reqs(struct muser_dev * const d, const uint32_t new_tail,
 	 */
 	queue = q->addr;
 	while (sq_tail(d, q) != new_tail) {
-		struct spdk_nvme_cmd * const cmd = &queue[sq_tail(d, q)];	
+		struct spdk_nvme_cmd * const cmd = &queue[sq_tail(d, q)];
 		int ret = consume_req(d, q, cmd);
 		if (ret < 0) {
 			/* FIXME how should we proceed now? */
@@ -1271,7 +1294,7 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 			muser_dev->qp[0].prop_req.pos = pos;
 			spdk_wmb();
 			muser_dev->qp[0].prop_req.dir = MUSER_NVMF_WRITE;
-			break;		
+			break;
 		default:
 			if (pos >= DOORBELLS) {
 				err = handle_dbl_write(muser_dev, buf, count,
@@ -1281,7 +1304,7 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 			} else {
 				SPDK_ERRLOG("write to 0x%lx not implemented\n",
 				            pos);
-				return -ENOTSUP;	
+				return -ENOTSUP;
 			}
 			break;
 	}
@@ -1307,7 +1330,7 @@ access_bar_fn(void *pvt, const int region_index, char * const buf, size_t count,
 		SPDK_WARNLOG("unsupported access to BAR%d, dev: %p, count=%zu, pos=%"PRIX64"\n",
 		       region_index, pvt, count, offset);
 		return -1;
-	}	
+	}
 
 	if (is_write)
 		ret = write_bar0(pvt, buf, count, offset);
@@ -1322,8 +1345,8 @@ access_bar_fn(void *pvt, const int region_index, char * const buf, size_t count,
 	return count;
 }
 
-/* 
- * NVMe driver reads 4096 bytes, which is the extended PCI configuration space 
+/*
+ * NVMe driver reads 4096 bytes, which is the extended PCI configuration space
  * available on PCI-X 2.0 and PCI Express buses
  */
 static ssize_t
@@ -1338,7 +1361,7 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 		if (count != sizeof (union pxdc)) {
 			SPDK_WARNLOG("bad write size to PXDC %zu\n", count);
 			return -EINVAL;
-		} 
+		}
                 SPDK_NOTICELOG("writing to PXDC 0x%hx\n",
 		               ((union pxdc*)buf)->raw);
                 return count;
@@ -1439,12 +1462,12 @@ drive(void *arg)
 static void
 init_pci_config_space(struct nvme_config_space * const p)
 {
-    mlbar_t *mlbar;
-    nvme_bar2_t *nvme_bar2;
+    struct nvme_pcie_mlbar *mlbar;
+    struct nvme_pcie_bar2 *nvme_bar2;
 
     /* MLBAR */
-    mlbar = (mlbar_t*)&p->hdr.bars[0].raw;
-    mlbar->raw = 0x0; /* initialize register to 0 */
+    mlbar = (struct nvme_pcie_mlbar*)&p->hdr.bars[0];
+    memset(mlbar, 0, sizeof(*mlbar));
 
     /* MUBAR */
     p->hdr.bars[1].raw = 0x0;
@@ -1452,8 +1475,8 @@ init_pci_config_space(struct nvme_config_space * const p)
     /*
      * BAR2, index/data pair register base address or vendor specific (optional)
      */
-    nvme_bar2 = (nvme_bar2_t*)&p->hdr.bars[2].raw;
-    nvme_bar2->raw = 0x0;
+    nvme_bar2 = (struct nvme_pcie_bar2*)&p->hdr.bars[2].raw;
+    memset(nvme_bar2, 0, sizeof(*nvme_bar2));
     nvme_bar2->rte = 0x1;
 
     /* vendor specific, let's set them to zero for now */
@@ -1470,9 +1493,9 @@ init_pci_config_space(struct nvme_config_space * const p)
      * TODO add function that adds a capability (takes care of updating the
      * next pointers etc.)
      */
-   
-    p->hdr.cap = offsetof(struct nvme_config_space, pmcap); 
-    assert(p->hdr.cap = 0x40);
+
+    p->hdr.cap = offsetof(struct nvme_config_space, pmcap);
+    assert(p->hdr.cap == 0x40);
     /* initialize PMCAP */
     p->pmcap.pid.cid = 0x1; /* PCI power management capability */
     p->pmcap.pmcs.nsfrst = 0x1;
