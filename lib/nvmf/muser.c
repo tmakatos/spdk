@@ -176,8 +176,6 @@ struct muser_qpair {
 struct muser_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
 	TAILQ_HEAD(, muser_qpair)		qps;
-	TAILQ_HEAD(, muser_qpair)		new_qps;
-	pthread_mutex_t				lock;
 };
 
 struct muser_ctrlr {
@@ -197,7 +195,7 @@ struct muser_ctrlr {
 
 	struct muser_qpair			qp[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
 
-	TAILQ_ENTRY(muser_ctrlr)			link;
+	TAILQ_ENTRY(muser_ctrlr)		link;
 };
 
 struct muser_transport {
@@ -205,6 +203,8 @@ struct muser_transport {
 	pthread_mutex_t				lock;
 	struct muser_poll_group			*group;
 	TAILQ_HEAD(, muser_ctrlr)		ctrlrs;
+
+	TAILQ_HEAD(, muser_qpair)		new_qps;
 };
 
 static int
@@ -241,6 +241,7 @@ muser_create(struct spdk_nvmf_transport_opts *opts)
 	}
 
 	TAILQ_INIT(&muser_transport->ctrlrs);
+	TAILQ_INIT(&muser_transport->new_qps);
 
 	return &muser_transport->transport;
 
@@ -812,12 +813,6 @@ init_qp(struct muser_ctrlr *ctrlr, struct muser_qpair *qp,
 
 	TAILQ_INIT(&qp->reqs);
 
-	/* FIXME is this needed for I/O queues? */
-	err = sem_init(&ctrlr->prop_req.wait, 0, 0);
-	if (err) {
-		return err;
-	}
-
 	qp->rsps_internal = calloc(qsize, sizeof(union nvmf_c2h_msg));
 	if (qp->rsps_internal == NULL) {
 		SPDK_ERRLOG("Error allocating rsps: %m\n");
@@ -859,7 +854,6 @@ add_qp(struct muser_ctrlr *ctrlr, struct muser_qpair *qp,
 {
 	int err;
 	struct muser_transport *muser_transport;
-	struct muser_poll_group *muser_group;
 
 	err = init_qp(ctrlr, qp, transport, qsize, id);
 	if (err) {
@@ -868,17 +862,17 @@ add_qp(struct muser_ctrlr *ctrlr, struct muser_qpair *qp,
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
-	muser_group = muser_transport->group;
 
-	err = pthread_mutex_lock(&muser_group->lock);
+	/* TODO: Instead of a lock, send a message */
+	err = pthread_mutex_lock(&muser_transport->lock);
 	if (err) {
 		SPDK_ERRLOG("failed to lock poll group lock: %m\n");
 		return err;
 	}
 
-	TAILQ_INSERT_TAIL(&muser_group->new_qps, qp, link);
+	TAILQ_INSERT_TAIL(&muser_transport->new_qps, qp, link);
 
-	err = pthread_mutex_unlock(&muser_group->lock);
+	err = pthread_mutex_unlock(&muser_transport->lock);
 	if (err) {
 		SPDK_ERRLOG("failed to unlock poll group lock: %m\n");
 		return err;
@@ -1562,6 +1556,11 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	memcpy(muser_ctrlr->uuid, trid->traddr, sizeof(muser_ctrlr->uuid));
 	memcpy(&muser_ctrlr->trid, trid, sizeof(muser_ctrlr->trid));
 
+	err = sem_init(&muser_ctrlr->prop_req.wait, 0, 0);
+	if (err) {
+		goto err_free_dev;
+	}
+
 	/* Admin QP setup */
 	err = add_qp(muser_ctrlr, &muser_ctrlr->qp[0], transport,
 		     MUSER_DEFAULT_AQ_DEPTH, 0);
@@ -1618,25 +1617,23 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn)
 {
 	int err;
 	struct muser_transport *muser_transport;
-	struct muser_poll_group *muser_group;
 	struct muser_qpair *qp, *tmp;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
-	muser_group = muser_transport->group;
 
-	err = pthread_mutex_lock(&muser_group->lock);
+	err = pthread_mutex_lock(&muser_transport->lock);
 	if (err) {
 		SPDK_ERRLOG("failed to lock poll group lock: %m\n");
 		return;
 	}
 
-	TAILQ_FOREACH_SAFE(qp, &muser_group->new_qps, link, tmp) {
-		TAILQ_REMOVE(&muser_group->new_qps, qp, link);
+	TAILQ_FOREACH_SAFE(qp, &muser_transport->new_qps, link, tmp) {
+		TAILQ_REMOVE(&muser_transport->new_qps, qp, link);
 		cb_fn(&qp->qpair);
 	}
 
-	err = pthread_mutex_unlock(&muser_group->lock);
+	err = pthread_mutex_unlock(&muser_transport->lock);
 	if (err) {
 		SPDK_ERRLOG("failed to lock poll group lock: %m\n");
 		return;
@@ -1653,26 +1650,14 @@ static struct spdk_nvmf_transport_poll_group *
 muser_poll_group_create(struct spdk_nvmf_transport *transport)
 {
 	struct muser_poll_group *muser_group;
-	struct muser_transport *muser_transport;
-	int err;
 
 	muser_group = calloc(1, sizeof(*muser_group));
 	if (muser_group == NULL) {
 		SPDK_ERRLOG("Error allocating poll group: %m");
 		return NULL;
 	}
-	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
-					   transport);
-	muser_transport->group = muser_group;
 
 	TAILQ_INIT(&muser_group->qps);
-	TAILQ_INIT(&muser_group->new_qps);
-
-	err = pthread_mutex_init(&muser_group->lock, NULL);
-	if (err) {
-		free(muser_group);
-		return NULL;
-	}
 
 	return &muser_group->group;
 }
@@ -1681,13 +1666,8 @@ static void
 muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct muser_poll_group *muser_group;
-	int err;
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
-	err = pthread_mutex_destroy(&muser_group->lock);
-	if (err) {
-		SPDK_ERRLOG("faied to destroy poll group mutex: %m\n");
-	}
 
 	free(muser_group);
 }
