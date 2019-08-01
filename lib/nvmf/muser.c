@@ -286,7 +286,7 @@ mdev_create(const char *uuid)
 }
 
 static ssize_t
-read_cap(struct muser_ctrlr const *const ctrlr, char *const buf,
+read_cap(struct muser_ctrlr const *ctrlr, char *buf,
 	 const size_t count, loff_t pos)
 {
 	/*
@@ -343,14 +343,14 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 }
 
 static uint16_t
-max_queue_size(struct muser_ctrlr const *const ctrlr)
+max_queue_size(struct muser_ctrlr const *ctrlr)
 {
 	return ctrlr->qp[0].qpair.ctrlr->vcprop.cap.bits.mqes + 1;
 }
 
 static ssize_t
-aqa_write(struct muser_ctrlr *const ctrlr,
-	  union spdk_nvme_aqa_register const *const from)
+aqa_write(struct muser_ctrlr *ctrlr,
+	  union spdk_nvme_aqa_register const *from)
 {
 	assert(ctrlr);
 	assert(from);
@@ -368,8 +368,8 @@ aqa_write(struct muser_ctrlr *const ctrlr,
 }
 
 static void
-write_partial(uint8_t const *const buf, const loff_t pos, const size_t count,
-	      const size_t reg_off, uint64_t *const reg)
+write_partial(uint8_t const *buf, const loff_t pos, const size_t count,
+	      const size_t reg_off, uint64_t *reg)
 {
 	memcpy(reg + pos - reg_off, buf, count);
 }
@@ -407,8 +407,8 @@ is_valid_asq_or_acq_write(const size_t p, const size_t c, const size_t o)
 }
 
 static ssize_t
-asq_or_acq_write(uint8_t const *const buf, const loff_t pos,
-		 const size_t count, uint64_t *const reg, const size_t reg_off)
+asq_or_acq_write(uint8_t const *buf, const loff_t pos,
+		 const size_t count, uint64_t *reg, const size_t reg_off)
 {
 	/*
 	 * The NVMe driver seems to write those only in 4 upper/lower bytes, but
@@ -426,7 +426,7 @@ asq_or_acq_write(uint8_t const *const buf, const loff_t pos,
 }
 
 static ssize_t
-asq_write(uint64_t *const asq, uint8_t const *const buf,
+asq_write(uint64_t *asq, uint8_t const *buf,
 	  const loff_t pos, const size_t count)
 {
 	int ret = asq_or_acq_write(buf, pos, count, asq,
@@ -436,7 +436,7 @@ asq_write(uint64_t *const asq, uint8_t const *const buf,
 }
 
 static ssize_t
-acq_write(uint64_t *const acq, uint8_t const *const buf,
+acq_write(uint64_t *acq, uint8_t const *buf,
 	  const loff_t pos, const size_t count)
 {
 	int ret = asq_or_acq_write(buf, pos, count, acq,
@@ -460,7 +460,7 @@ acq_write(uint64_t *const acq, uint8_t const *const buf,
 		offsetof(struct spdk_nvme_registers, acq) + sizeof(uint64_t) - 1
 
 static ssize_t
-admin_queue_write(struct muser_ctrlr *const ctrlr, uint8_t const *const buf,
+admin_queue_write(struct muser_ctrlr *ctrlr, uint8_t const *buf,
 		  const size_t count, const loff_t pos)
 {
 	switch (pos) {
@@ -480,7 +480,7 @@ admin_queue_write(struct muser_ctrlr *const ctrlr, uint8_t const *const buf,
 
 /* TODO this should be a libmuser public function */
 static void *
-map_one(lm_ctx_t *const ctx, const uint64_t addr, const size_t len)
+map_one(lm_ctx_t *ctx, const uint64_t addr, const size_t len)
 {
 	dma_scattergather_t sg[1];
 	struct iovec iov;
@@ -502,14 +502,14 @@ map_one(lm_ctx_t *const ctx, const uint64_t addr, const size_t len)
 }
 
 static uint32_t
-sq_tail(struct muser_ctrlr const *const d, struct io_q const *const q)
+sq_tail(struct muser_ctrlr const *d, struct io_q const *q)
 {
 	assert(q);
 	return q->sq.old_tail % q->size;
 }
 
 static void
-sq_tail_advance(struct muser_ctrlr const *const d, struct io_q *const q)
+sq_tail_advance(struct muser_ctrlr const *d, struct io_q *q)
 {
 	assert(q);
 	assert(d);
@@ -517,7 +517,7 @@ sq_tail_advance(struct muser_ctrlr const *const d, struct io_q *const q)
 }
 
 static void
-insert_queue(struct muser_ctrlr *const ctrlr, struct io_q const *const q,
+insert_queue(struct muser_ctrlr *ctrlr, struct io_q const *q,
 	     const bool is_cq)
 {
 
@@ -532,7 +532,7 @@ insert_queue(struct muser_ctrlr *const ctrlr, struct io_q const *const q,
 }
 
 static int
-asq_map(struct muser_ctrlr *const d)
+asq_map(struct muser_ctrlr *d)
 {
 	struct io_q q;
 
@@ -555,7 +555,7 @@ asq_map(struct muser_ctrlr *const d)
 }
 
 static uint16_t
-cq_next(struct muser_ctrlr *const d, struct io_q *const q)
+cq_next(struct muser_ctrlr *d, struct io_q *q)
 {
 	assert(d);
 	assert(q);
@@ -563,7 +563,7 @@ cq_next(struct muser_ctrlr *const d, struct io_q *const q)
 }
 
 static bool
-cq_is_full(struct muser_ctrlr *const d, struct io_q *const q)
+cq_is_full(struct muser_ctrlr *d, struct io_q *q)
 {
 	assert(d);
 	assert(q);
@@ -571,7 +571,7 @@ cq_is_full(struct muser_ctrlr *const d, struct io_q *const q)
 }
 
 static void
-cq_tail_advance(struct muser_ctrlr *const d, struct io_q *const q)
+cq_tail_advance(struct muser_ctrlr *d, struct io_q *q)
 {
 	assert(d);
 	assert(q);
@@ -579,7 +579,7 @@ cq_tail_advance(struct muser_ctrlr *const d, struct io_q *const q)
 }
 
 static int
-acq_map(struct muser_ctrlr *const d)
+acq_map(struct muser_ctrlr *d)
 {
 	struct io_q q;
 
@@ -600,7 +600,7 @@ acq_map(struct muser_ctrlr *const d)
 }
 
 static int
-dptr_remap(struct muser_ctrlr const *const ctrlr, union spdk_nvme_dptr *const dptr)
+dptr_remap(struct muser_ctrlr const *ctrlr, union spdk_nvme_dptr *dptr)
 {
 	void *p;
 
@@ -621,7 +621,7 @@ dptr_remap(struct muser_ctrlr const *const ctrlr, union spdk_nvme_dptr *const dp
 
 /* FIXME rename function, it handles more opcodes other than identify */
 static int
-handle_identify_req(struct muser_ctrlr *const ctrlr, struct spdk_nvme_cmd *const cmd)
+handle_identify_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 {
 	int err;
 
@@ -684,8 +684,8 @@ SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_sq_cdw11) == 4, "Incorrect s
  * Completes a admin request.
  */
 static int
-do_admin_queue_complete(struct muser_ctrlr *const d,
-			struct spdk_nvme_cmd *const cmd)
+do_admin_queue_complete(struct muser_ctrlr *d,
+			struct spdk_nvme_cmd *cmd)
 {
 	struct spdk_nvme_cpl *cpl;
 	struct io_q *cq0;
@@ -735,8 +735,8 @@ do_admin_queue_complete(struct muser_ctrlr *const d,
  * so.
  */
 static int
-admin_queue_complete(struct muser_ctrlr *const ctrlr,
-		     struct spdk_nvme_cmd *const cmd)
+admin_queue_complete(struct muser_ctrlr *ctrlr,
+		     struct spdk_nvme_cmd *cmd)
 {
 	assert(ctrlr);
 	assert(cmd);
@@ -753,7 +753,7 @@ admin_queue_complete(struct muser_ctrlr *const ctrlr,
 }
 
 static struct io_q *
-lookup_io_q(struct muser_ctrlr *const ctrlr, const uint16_t qid, const bool is_cq)
+lookup_io_q(struct muser_ctrlr *ctrlr, const uint16_t qid, const bool is_cq)
 {
 	struct io_q *q;
 
@@ -781,7 +781,7 @@ lookup_io_q(struct muser_ctrlr *const ctrlr, const uint16_t qid, const bool is_c
 }
 
 static void
-destroy_qp(struct muser_qpair *const qp)
+destroy_qp(struct muser_qpair *qp)
 {
 	if (!qp) {
 		return;
@@ -795,8 +795,8 @@ destroy_qp(struct muser_qpair *const qp)
 }
 
 static int
-init_qp(struct muser_ctrlr *const ctrlr, struct muser_qpair *const qp,
-	struct spdk_nvmf_transport *const transport, const uint16_t qsize,
+init_qp(struct muser_ctrlr *ctrlr, struct muser_qpair *qp,
+	struct spdk_nvmf_transport *transport, const uint16_t qsize,
 	const uint16_t id)
 {
 	int err = 0, i;
@@ -853,8 +853,8 @@ out:
 }
 
 static int
-add_qp(struct muser_ctrlr *const ctrlr, struct muser_qpair *const qp,
-       struct spdk_nvmf_transport *const transport, const uint16_t qsize,
+add_qp(struct muser_ctrlr *ctrlr, struct muser_qpair *qp,
+       struct spdk_nvmf_transport *transport, const uint16_t qsize,
        const uint16_t id)
 {
 	int err;
@@ -888,7 +888,7 @@ add_qp(struct muser_ctrlr *const ctrlr, struct muser_qpair *const qp,
 }
 
 static int
-prep_io_qp(struct muser_ctrlr *const d, struct muser_qpair *const qp,
+prep_io_qp(struct muser_ctrlr *d, struct muser_qpair *qp,
 	   const uint16_t id, const uint16_t qsize)
 {
 	int err;
@@ -923,8 +923,8 @@ prep_io_qp(struct muser_ctrlr *const d, struct muser_qpair *const qp,
  * Creates a completion or sumbission I/O queue.
  */
 static int
-handle_create_io_q(struct muser_ctrlr *const ctrlr,
-		   struct spdk_nvme_cmd *const cmd, const bool is_cq)
+handle_create_io_q(struct muser_ctrlr *ctrlr,
+		   struct spdk_nvme_cmd *cmd, const bool is_cq)
 {
 	union spdk_nvme_create_io_q_cdw10 *cdw10;
 	union spdk_nvme_create_io_cq_cdw11 *cdw11_cq = NULL;
@@ -1009,7 +1009,7 @@ handle_create_io_q(struct muser_ctrlr *const ctrlr,
  * the response, 0 if no need for a response, and -1 on error.
  */
 static int
-consume_admin_req(struct muser_ctrlr *const ctrlr, struct spdk_nvme_cmd *const cmd)
+consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 {
 	int err;
 
@@ -1050,7 +1050,7 @@ consume_admin_req(struct muser_ctrlr *const ctrlr, struct spdk_nvme_cmd *const c
 }
 
 static int
-handle_io_read(struct muser_ctrlr *const ctrlr, struct spdk_nvme_cmd *const cmd)
+handle_io_read(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 {
 	int err;
 	uint64_t slba;
@@ -1079,8 +1079,8 @@ handle_io_read(struct muser_ctrlr *const ctrlr, struct spdk_nvme_cmd *const cmd)
 }
 
 static int
-consume_io_req(struct muser_ctrlr *const d, struct io_q *const q,
-	       struct spdk_nvme_cmd *const cmd)
+consume_io_req(struct muser_ctrlr *d, struct io_q *q,
+	       struct spdk_nvme_cmd *cmd)
 {
 	SPDK_NOTICELOG("XXX opc=0x%x\n", cmd->opc);
 	switch (cmd->opc) {
@@ -1094,8 +1094,8 @@ consume_io_req(struct muser_ctrlr *const d, struct io_q *const q,
 }
 
 static int
-consume_req(struct muser_ctrlr *const d, struct io_q *const q,
-	    struct spdk_nvme_cmd *const cmd)
+consume_req(struct muser_ctrlr *d, struct io_q *q,
+	    struct spdk_nvme_cmd *cmd)
 {
 	if (q->id == 0) {
 		return consume_admin_req(d, cmd);
@@ -1108,8 +1108,8 @@ consume_req(struct muser_ctrlr *const d, struct io_q *const q,
  * the response.
  */
 static int
-consume_reqs(struct muser_ctrlr *const d, const uint32_t new_tail,
-	     struct io_q *const q)
+consume_reqs(struct muser_ctrlr *d, const uint32_t new_tail,
+	     struct io_q *q)
 {
 	int count = 0;
 	struct spdk_nvme_cmd *queue;
@@ -1130,7 +1130,7 @@ consume_reqs(struct muser_ctrlr *const d, const uint32_t new_tail,
 	 */
 	queue = q->addr;
 	while (sq_tail(d, q) != new_tail) {
-		struct spdk_nvme_cmd *const cmd = &queue[sq_tail(d, q)];
+		struct spdk_nvme_cmd *cmd = &queue[sq_tail(d, q)];
 		int ret = consume_req(d, q, cmd);
 		if (ret < 0) {
 			/* FIXME how should we proceed now? */
@@ -1151,8 +1151,8 @@ consume_reqs(struct muser_ctrlr *const d, const uint32_t new_tail,
  * the response.
  */
 static ssize_t
-handle_sq_tdbl_write(struct muser_ctrlr *const d, const uint32_t new_tail,
-		     struct io_q *const q)
+handle_sq_tdbl_write(struct muser_ctrlr *d, const uint32_t new_tail,
+		     struct io_q *q)
 {
 	assert(d);
 	assert(q);
@@ -1177,8 +1177,8 @@ handle_sq_tdbl_write(struct muser_ctrlr *const d, const uint32_t new_tail,
 }
 
 static ssize_t
-handle_cq_hdbl_write(struct muser_ctrlr *const d, const uint32_t new_head,
-		     struct io_q *const q)
+handle_cq_hdbl_write(struct muser_ctrlr *d, const uint32_t new_head,
+		     struct io_q *q)
 {
 	assert(d);
 	assert(q);
@@ -1203,8 +1203,8 @@ handle_cq_hdbl_write(struct muser_ctrlr *const d, const uint32_t new_head,
  * it's a submission queue, otherwise it's a completion queue.
  */
 static inline int
-get_qid_and_kind(struct muser_ctrlr const *const ctrlr, const loff_t pos,
-		 bool *const is_cq)
+get_qid_and_kind(struct muser_ctrlr const *ctrlr, const loff_t pos,
+		 bool *is_cq)
 {
 	int i, n;
 
@@ -1237,13 +1237,13 @@ get_qid_and_kind(struct muser_ctrlr const *const ctrlr, const loff_t pos,
 
 #if 0
 static int
-handle_io_sq_tdbl_write(struct muser_ctrlr *const ctrlr)
+handle_io_sq_tdbl_write(struct muser_ctrlr *ctrlr)
 {
 	assert(0);
 }
 
 static int
-handle_io_cq_hbdl_write(struct muser_ctrlr *const ctrlr)
+handle_io_cq_hbdl_write(struct muser_ctrlr *ctrlr)
 {
 	assert(0);
 }
@@ -1251,7 +1251,7 @@ handle_io_cq_hbdl_write(struct muser_ctrlr *const ctrlr)
 
 #if 0
 static bool
-is_admin_q(struct io_q const *const queues, struct io_q const *const q)
+is_admin_q(struct io_q const *queues, struct io_q const *q)
 {
 	return q == &queues[0];
 }
@@ -1261,7 +1261,7 @@ is_admin_q(struct io_q const *const queues, struct io_q const *const q)
  * Handles a write at offset 0x1000 or more.
  */
 static int
-handle_dbl_write(struct muser_ctrlr *const ctrlr, uint8_t const *const buf,
+handle_dbl_write(struct muser_ctrlr *ctrlr, uint8_t const *buf,
 		 const size_t count, const loff_t pos)
 {
 	int err;
@@ -1301,7 +1301,7 @@ handle_dbl_write(struct muser_ctrlr *const ctrlr, uint8_t const *const buf,
 static ssize_t
 write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 {
-	struct muser_ctrlr *const ctrlr = pvt;
+	struct muser_ctrlr *ctrlr = pvt;
 	int err;
 
 	SPDK_NOTICELOG("ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
@@ -1346,7 +1346,7 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 }
 
 static ssize_t
-access_bar_fn(void *pvt, const int region_index, char *const buf, size_t count,
+access_bar_fn(void *pvt, const int region_index, char *buf, size_t count,
 	      loff_t offset, const bool is_write)
 {
 	ssize_t ret;
@@ -1379,7 +1379,7 @@ static ssize_t
 access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 		  const bool is_write)
 {
-	struct muser_ctrlr *const ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
 
 	if (is_write) {
 		switch (offset) {
@@ -1429,7 +1429,7 @@ nvme_reg_info_fill(lm_reg_info_t *reg_info)
 }
 
 static void
-nvme_log(void *pvt, char const *const msg)
+nvme_log(void *pvt, char const *msg)
 {
 	fprintf(stderr, "%s", msg);
 }
@@ -1488,7 +1488,7 @@ drive(void *arg)
 }
 
 static void
-init_pci_config_space(struct nvme_config_space *const p)
+init_pci_config_space(struct nvme_config_space *p)
 {
 	struct nvme_pcie_mlbar *mlbar;
 	struct nvme_pcie_bar2 *nvme_bar2;
@@ -1804,7 +1804,7 @@ muser_close_qpair(struct spdk_nvmf_qpair *qpair)
 { }
 
 static int
-handle_req(struct muser_qpair *const muser_qpair)
+handle_req(struct muser_qpair *muser_qpair)
 {
 	struct spdk_nvmf_request *req;
 	struct muser_req *muser_req;
