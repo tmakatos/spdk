@@ -31,8 +31,8 @@
  */
 
 #include <muser/muser.h>
-#include <muser/pmcap.h>
-#include <muser/pxcap.h>
+#include <muser/caps/pm.h>
+#include <muser/caps/px.h>
 
 #include "spdk/barrier.h"
 #include "spdk/stdinc.h"
@@ -65,16 +65,6 @@ struct nvme_pcie_bar2 {
 	uint32_t ba :	29;
 };
 SPDK_STATIC_ASSERT(sizeof(struct nvme_pcie_bar2) == sizeof(uint32_t), "Bad NVMe BAR2 size");
-
-__attribute__((packed)) __attribute__((aligned(8))) struct nvme_config_space {
-	lm_pci_hdr_t hdr;
-	struct pmcap pmcap;
-	struct PCI_Express_Capability pci_expr_cap;
-};
-/*
-SPDK_STATIC_ASSERT(sizeof(struct nvme_config_space) ==
-	sizeof(lm_pci_hdr_t) + sizeof(struct pmcap) + sizeof(struct PCI_Express_Capability),
-	"Invalid size"); */
 
 struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 
@@ -187,6 +177,10 @@ struct muser_ctrlr {
 
 	/* NB the doorbell member is not used for the admin SQ/CQ */
 	struct spdk_nvme_registers		regs;
+
+	/* PCI capabilities */
+	struct pmcap				pmcap;
+	struct PCI_Express_Capability		pci_expr_cap;
 
 	/* Internal command for spoofing register reads/writes. */
 	struct muser_nvmf_prop_req		prop_req;
@@ -1376,24 +1370,13 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
 
 	if (is_write) {
-		switch (offset) {
-		case offsetof(struct nvme_config_space, pci_expr_cap.pxdc):
-			if (count != sizeof(union pxdc)) {
-				SPDK_WARNLOG("bad write size to PXDC %zu\n", count);
-				return -EINVAL;
-			}
-			SPDK_NOTICELOG("writing to PXDC 0x%hx\n",
-				       ((union pxdc *)buf)->raw);
-			return count;
-		}
-
 		fprintf(stderr, "writes non supported\n");
 		return -EINVAL;
 	}
 
-	if (offset + count > PCI_EXTENDED_CONFIG_SPACE_SIZEOF) {
+	if (offset + count > PCI_CFG_SPACE_EXP_SIZE) {
 		fprintf(stderr, "access past end of extended PCI configuration space, want=%ld+%ld, max=%d\n",
-			offset, count, PCI_EXTENDED_CONFIG_SPACE_SIZEOF);
+			offset, count, PCI_CFG_SPACE_EXP_SIZE);
 		return -ERANGE;
 	}
 
@@ -1401,6 +1384,36 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 
 	return count;
 }
+
+static ssize_t
+pmcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
+             loff_t offset, const bool is_write)
+{
+	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+
+	if (is_write)
+		assert(false); /* TODO */
+
+	memcpy(buf, ((char*)&ctrlr->pmcap) + offset, count);
+
+	return count;
+}
+
+static ssize_t
+pci_expr_cap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
+                    loff_t offset, const bool is_write)
+{
+	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+
+	if (is_write)
+		assert(false); /* TODO */
+
+	memcpy(buf, ((char*)&ctrlr->pci_expr_cap) + offset, count);
+
+	return count;
+}
+
+
 
 static void
 nvme_reg_info_fill(lm_reg_info_t *reg_info)
@@ -1432,6 +1445,9 @@ static void
 nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
 		   struct muser_ctrlr *muser_ctrlr)
 {
+	lm_cap_t pm = {.id = PCI_CAP_ID_PM, .size = sizeof(struct pmcap), .fn = pmcap_access};
+	lm_cap_t px = {.id = PCI_CAP_ID_EXP, .size = sizeof(struct PCI_Express_Capability), .fn = pci_expr_cap_access};
+
 	assert(dev_info != NULL);
 	assert(muser_ctrlr != NULL);
 
@@ -1469,6 +1485,10 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
 
 	dev_info->log = nvme_log;
 	dev_info->log_lvl = LM_DBG;
+
+	dev_info->caps[0] = pm;
+	dev_info->caps[1] = px;
+	dev_info->nr_caps = 2;
 }
 
 static void *
@@ -1482,7 +1502,7 @@ drive(void *arg)
 }
 
 static void
-init_pci_config_space(struct nvme_config_space *p)
+init_pci_config_space(lm_pci_config_space_t *p)
 {
 	struct nvme_pcie_mlbar *mlbar;
 	struct nvme_pcie_bar2 *nvme_bar2;
@@ -1507,28 +1527,6 @@ init_pci_config_space(struct nvme_config_space *p)
 	p->hdr.bars[5].raw = 0x0;
 
 	p->hdr.intr.ipin = 0x1;
-
-	/* enables capabilities */
-	p->hdr.sts.cl = 0x1;
-
-	/*
-	 * TODO add function that adds a capability (takes care of updating the
-	 * next pointers etc.)
-	 */
-
-	p->hdr.cap = offsetof(struct nvme_config_space, pmcap);
-	assert(p->hdr.cap == 0x40);
-	/* initialize PMCAP */
-	p->pmcap.pid.cid = 0x1; /* PCI power management capability */
-	p->pmcap.pmcs.nsfrst = 0x1;
-
-	p->pmcap.pid.next = offsetof(struct nvme_config_space, pci_expr_cap);
-	/* initialize PXCAP */
-	p->pci_expr_cap.pxid.cid = 0x10; /* PCI Express capability */
-	p->pci_expr_cap.pxcap.ver = 0x2;
-	p->pci_expr_cap.pxdcap.per = 0x1;
-	p->pci_expr_cap.pxdcap.flrc = 0x1;
-	p->pci_expr_cap.pxdcap2.ctds = 0x1;
 }
 
 static int
@@ -1570,6 +1568,17 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 	/* LM setup */
 	nvme_dev_info_fill(&dev_info, NULL, muser_ctrlr);
+
+	/* PM */
+	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
+
+	/* EXP */
+	muser_ctrlr->pci_expr_cap.pxcap.ver = 0x2;
+	muser_ctrlr->pci_expr_cap.pxdcap.per = 0x1;
+	muser_ctrlr->pci_expr_cap.pxdcap.flrc = 0x1;
+	muser_ctrlr->pci_expr_cap.pxdcap2.ctds = 0x1;
+
+
 	muser_ctrlr->lm_ctx = lm_ctx_create(&dev_info);
 	if (muser_ctrlr->lm_ctx == NULL) {
 		/* TODO: lm_create doesn't set errno */
@@ -1579,7 +1588,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 
 	muser_ctrlr->pci_config_space = lm_get_pci_config_space(muser_ctrlr->lm_ctx);
-	init_pci_config_space((struct nvme_config_space *)muser_ctrlr->pci_config_space);
+	init_pci_config_space(muser_ctrlr->pci_config_space);
 
 	err = pthread_create(&muser_ctrlr->lm_thr, NULL,
 			     drive, muser_ctrlr->lm_ctx);
