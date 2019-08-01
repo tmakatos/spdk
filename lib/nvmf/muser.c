@@ -162,7 +162,6 @@ struct muser_qpair {
 	struct spdk_nvmf_qpair			qpair;
 	struct spdk_nvmf_muser_poll_group	*group;
 	struct muser_dev			*dev;
-	struct muser_nvmf_prop_req		prop_req;
 	struct spdk_nvme_cmd			*cmd;
 	struct muser_req			*reqs_internal;
 	union nvmf_h2c_msg			*cmds_internal;
@@ -190,6 +189,9 @@ struct muser_dev {
 
 	/* NB the doorbell member is not used for the admin SQ/CQ */
 	struct spdk_nvme_registers		regs;
+
+	/* Internal command for spoofing register reads/writes. */
+	struct muser_nvmf_prop_req		prop_req;
 
 	uint16_t				cntlid;
 
@@ -326,18 +328,18 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		return read_cap(muser_dev, buf, count, pos);
 	}
 
-	muser_dev->qp[0].prop_req.buf = buf;
+	muser_dev->prop_req.buf = buf;
 	/* TODO: count must never be more than 8, otherwise we need to split it */
-	muser_dev->qp[0].prop_req.count = count;
-	muser_dev->qp[0].prop_req.pos = pos;
+	muser_dev->prop_req.count = count;
+	muser_dev->prop_req.pos = pos;
 	spdk_wmb();
-	muser_dev->qp[0].prop_req.dir = MUSER_NVMF_READ;
+	muser_dev->prop_req.dir = MUSER_NVMF_READ;
 
 	do {
-		err = sem_wait(&muser_dev->qp[0].prop_req.wait);
+		err = sem_wait(&muser_dev->prop_req.wait);
 	} while (err != 0 && errno != EINTR);
 
-	return muser_dev->qp[0].prop_req.ret;
+	return muser_dev->prop_req.ret;
 }
 
 static uint16_t
@@ -637,7 +639,7 @@ handle_identify_req(struct muser_dev *const dev, struct spdk_nvme_cmd *const cmd
 
 	dev->qp[0].cmd = cmd;
 	spdk_wmb();
-	dev->qp[0].prop_req.dir = MUSER_NVMF_WRITE;
+	dev->prop_req.dir = MUSER_NVMF_WRITE;
 
 	return 0;
 }
@@ -811,7 +813,7 @@ init_qp(struct muser_dev *const dev, struct muser_qpair *const qp,
 	TAILQ_INIT(&qp->reqs);
 
 	/* FIXME is this needed for I/O queues? */
-	err = sem_init(&qp->prop_req.wait, 0, 0);
+	err = sem_init(&dev->prop_req.wait, 0, 0);
 	if (err) {
 		return err;
 	}
@@ -908,7 +910,7 @@ prep_io_qp(struct muser_dev *const d, struct muser_qpair *const qp,
 
 	SPDK_NOTICELOG("waiting for NVMf to connect\n");
 	do {
-		err = sem_wait(&qp->prop_req.wait);
+		err = sem_wait(&d->prop_req.wait);
 	} while (err != 0 && errno != EINTR);
 	SPDK_NOTICELOG("NVMf connected\n");
 
@@ -1071,7 +1073,7 @@ handle_io_read(struct muser_dev *const dev, struct spdk_nvme_cmd *const cmd)
 	/* FIXME we must use the I/O QP, not the admin one */
 	dev->qp[0].cmd = cmd;
 	spdk_wmb();
-	dev->qp[0].prop_req.dir = MUSER_NVMF_READ;
+	dev->prop_req.dir = MUSER_NVMF_READ;
 
 	return 0;
 }
@@ -1311,11 +1313,11 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	case ADMIN_QUEUES:
 		return admin_queue_write(muser_dev, buf, count, pos);
 	case CC:
-		muser_dev->qp[0].prop_req.buf = buf;
-		muser_dev->qp[0].prop_req.count = count;
-		muser_dev->qp[0].prop_req.pos = pos;
+		muser_dev->prop_req.buf = buf;
+		muser_dev->prop_req.count = count;
+		muser_dev->prop_req.pos = pos;
 		spdk_wmb();
-		muser_dev->qp[0].prop_req.dir = MUSER_NVMF_WRITE;
+		muser_dev->prop_req.dir = MUSER_NVMF_WRITE;
 		break;
 	default:
 		if (pos >= DOORBELLS) {
@@ -1333,14 +1335,14 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	}
 
 	do {
-		err = sem_wait(&muser_dev->qp[0].prop_req.wait);
+		err = sem_wait(&muser_dev->prop_req.wait);
 	} while (err != 0 && errno != EINTR);
 
 	if (pos == SQ0TBDL) {
 		admin_queue_complete(muser_dev, muser_dev->qp[0].cmd);
 	}
 
-	return muser_dev->qp[0].prop_req.ret;
+	return muser_dev->prop_req.ret;
 }
 
 static ssize_t
@@ -1764,8 +1766,8 @@ muser_req_done(struct spdk_nvmf_request *req)
 			int err;
 			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
 				      "fabric connect command completed\n");
-			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "sem_post %p\n", &muser_qpair->prop_req.wait);
-			err = sem_post(&muser_qpair->prop_req.wait);
+			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "sem_post %p\n", &muser_qpair->dev->prop_req.wait);
+			err = sem_post(&muser_qpair->dev->prop_req.wait);
 			if (err) {
 				SPDK_ERRLOG("failed to sem_post: %m\n");
 			}
@@ -1823,15 +1825,15 @@ handle_req(struct muser_qpair *const muser_qpair)
 	} else {
 		req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 		req->cmd->prop_set_cmd.cid = 0;
-		if (muser_qpair->prop_req.dir == MUSER_NVMF_WRITE) {
+		if (muser_qpair->dev->prop_req.dir == MUSER_NVMF_WRITE) {
 			req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
 			req->cmd->prop_set_cmd.value.u32.high = 0;
-			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)muser_qpair->prop_req.buf;
+			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)muser_qpair->dev->prop_req.buf;
 		} else {
 			req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
 		}
-		req->cmd->prop_set_cmd.attrib.size = (muser_qpair->prop_req.count / 4) - 1;
-		req->cmd->prop_set_cmd.ofst = muser_qpair->prop_req.pos;
+		req->cmd->prop_set_cmd.attrib.size = (muser_qpair->dev->prop_req.count / 4) - 1;
+		req->cmd->prop_set_cmd.ofst = muser_qpair->dev->prop_req.pos;
 		req->length = 0;
 		req->data = NULL;
 	}
@@ -1846,20 +1848,20 @@ handle_req(struct muser_qpair *const muser_qpair)
 	if (muser_qpair->cmd) {
 		/* FIXME we must now queue the response, either here or in write_bar0 */
 		;
-	} else if (muser_qpair->prop_req.dir == MUSER_NVMF_READ) {
-		memcpy(muser_qpair->prop_req.buf,
+	} else if (muser_qpair->dev->prop_req.dir == MUSER_NVMF_READ) {
+		memcpy(muser_qpair->dev->prop_req.buf,
 		       &req->rsp->prop_get_rsp.value.u64,
-		       muser_qpair->prop_req.count);
+		       muser_qpair->dev->prop_req.count);
 	}
 
-	muser_qpair->prop_req.dir = MUSER_NVMF_INVALID;
-	return sem_post(&muser_qpair->prop_req.wait);
+	muser_qpair->dev->prop_req.dir = MUSER_NVMF_INVALID;
+	return sem_post(&muser_qpair->dev->prop_req.wait);
 }
 
 /*
  * Called unconditionally, periodically, very frequently from SPDK to ask
  * whether there's work to be done.  This functions consumes requests generated
- * from read/write_bar0 by setting muser_qpair->prop_req.dir. The
+ * from read/write_bar0 by setting muser_qpair->dev->prop_req.dir. The
  * read/write_bar0 functions synchronously wait. This function will also
  * consume requests by looking at the queue pair which will be have an
  * associated guest SQ/CQ.
@@ -1876,7 +1878,7 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	TAILQ_FOREACH(muser_qpair, &muser_group->qps, link) {
 		spdk_rmb();
 		/* FIXME this is a queue of size 1, needs to change */
-		if (muser_qpair->prop_req.dir != MUSER_NVMF_INVALID) {
+		if (muser_qpair->dev->prop_req.dir != MUSER_NVMF_INVALID) {
 			err = handle_req(muser_qpair);
 			assert(err == 0);
 			(void)err;
