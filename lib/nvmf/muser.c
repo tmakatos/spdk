@@ -66,12 +66,15 @@ struct nvme_pcie_bar2 {
 };
 SPDK_STATIC_ASSERT(sizeof(struct nvme_pcie_bar2) == sizeof(uint32_t), "Bad NVMe BAR2 size");
 
-__attribute__((packed)) __attribute__ ((aligned(8))) struct nvme_config_space {
+__attribute__((packed)) __attribute__((aligned(8))) struct nvme_config_space {
 	lm_pci_hdr_t hdr;
 	struct pmcap pmcap;
 	struct PCI_Express_Capability pci_expr_cap;
 };
-//SPDK_STATIC_ASSERT(sizeof(struct nvme_config_space) == sizeof(lm_pci_hdr_t) + sizeof(struct pmcap) + sizeof(struct PCI_Express_Capability), "Invalid size");
+/*
+SPDK_STATIC_ASSERT(sizeof(struct nvme_config_space) ==
+	sizeof(lm_pci_hdr_t) + sizeof(struct pmcap) + sizeof(struct PCI_Express_Capability),
+	"Invalid size"); */
 
 struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 
@@ -190,7 +193,7 @@ struct muser_dev {
 
 	uint16_t				cntlid;
 
-	struct muser_qpair 			qp[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
+	struct muser_qpair			qp[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
 
 	TAILQ_ENTRY(muser_dev)			link;
 };
@@ -208,7 +211,7 @@ muser_destroy(struct spdk_nvmf_transport *transport)
 	struct muser_transport *muser_transport;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
-	                                   transport);
+					   transport);
 
 	(void)pthread_mutex_destroy(&muser_transport->lock);
 
@@ -281,8 +284,8 @@ mdev_create(const char *uuid)
 }
 
 static ssize_t
-read_cap(struct muser_dev const * const dev, char * const buf,
-         const size_t count, loff_t pos)
+read_cap(struct muser_dev const *const dev, char *const buf,
+	 const size_t count, loff_t pos)
 {
 	/*
 	 * FIXME need to validate count and pos
@@ -291,7 +294,8 @@ read_cap(struct muser_dev const * const dev, char * const buf,
 	 * TODO this line is far too long
 	 */
 	assert(dev);
-	memcpy(buf, ((uint8_t*)&dev->qp[0].qpair.ctrlr->vcprop.cap.raw) + pos - offsetof(struct spdk_nvme_registers, cap), count);
+	memcpy(buf, ((uint8_t *)&dev->qp[0].qpair.ctrlr->vcprop.cap.raw) + pos - offsetof(
+		       struct spdk_nvme_registers, cap), count);
 	return 0;
 }
 
@@ -318,8 +322,9 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	 * CAP is 8 bytes long however the driver reads it 4 bytes at a time.
 	 * NVMf doesn't like this.
 	 */
-	if (is_cap(pos))
+	if (is_cap(pos)) {
 		return read_cap(muser_dev, buf, count, pos);
+	}
 
 	muser_dev->qp[0].prop_req.buf = buf;
 	/* TODO: count must never be more than 8, otherwise we need to split it */
@@ -336,14 +341,14 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 }
 
 static uint16_t
-max_queue_size(struct muser_dev const * const dev)
+max_queue_size(struct muser_dev const *const dev)
 {
 	return dev->qp[0].qpair.ctrlr->vcprop.cap.bits.mqes + 1;
 }
 
 static ssize_t
-aqa_write(struct muser_dev * const dev,
-          union spdk_nvme_aqa_register const * const from)
+aqa_write(struct muser_dev *const dev,
+	  union spdk_nvme_aqa_register const *const from)
 {
 	assert(dev);
 	assert(from);
@@ -351,8 +356,8 @@ aqa_write(struct muser_dev * const dev,
 	if (from->bits.asqs + 1 > max_queue_size(dev) ||
 	    from->bits.acqs + 1 > max_queue_size(dev)) {
 		SPDK_ERRLOG("admin queue(s) too big, ASQS=%d, ACQS=%d, max=%d\n",
-		            from->bits.asqs + 1, from->bits.acqs + 1,
-		            max_queue_size(dev));
+			    from->bits.asqs + 1, from->bits.acqs + 1,
+			    max_queue_size(dev));
 		return -EINVAL;
 	}
 	dev->regs.aqa.raw = from->raw;
@@ -361,8 +366,8 @@ aqa_write(struct muser_dev * const dev,
 }
 
 static void
-write_partial(uint8_t const * const buf, const loff_t pos, const size_t count,
-              const size_t reg_off, uint64_t * const reg)
+write_partial(uint8_t const *const buf, const loff_t pos, const size_t count,
+	      const size_t reg_off, uint64_t *const reg)
 {
 	memcpy(reg + pos - reg_off, buf, count);
 }
@@ -400,8 +405,8 @@ is_valid_asq_or_acq_write(const size_t p, const size_t c, const size_t o)
 }
 
 static ssize_t
-asq_or_acq_write(uint8_t const * const buf, const loff_t pos,
-                 const size_t count, uint64_t * const reg, const size_t reg_off)
+asq_or_acq_write(uint8_t const *const buf, const loff_t pos,
+		 const size_t count, uint64_t *const reg, const size_t reg_off)
 {
 	/*
 	 * The NVMe driver seems to write those only in 4 upper/lower bytes, but
@@ -409,7 +414,7 @@ asq_or_acq_write(uint8_t const * const buf, const loff_t pos,
 	 */
 	if (!is_valid_asq_or_acq_write((size_t)pos, count, reg_off)) {
 		SPDK_ERRLOG("bad write count %zu and/or offset 0x%lx\n",
-		            count, reg_off);
+			    count, reg_off);
 		return -EINVAL;
 	}
 
@@ -419,21 +424,21 @@ asq_or_acq_write(uint8_t const * const buf, const loff_t pos,
 }
 
 static ssize_t
-asq_write(uint64_t * const asq, uint8_t const * const buf,
-          const loff_t pos, const size_t count)
+asq_write(uint64_t *const asq, uint8_t const *const buf,
+	  const loff_t pos, const size_t count)
 {
 	int ret = asq_or_acq_write(buf, pos, count, asq,
-	                           offsetof(struct spdk_nvme_registers, asq));
+				   offsetof(struct spdk_nvme_registers, asq));
 	SPDK_NOTICELOG("ASQ=0x%lx\n", *asq);
 	return ret;
 }
 
 static ssize_t
-acq_write(uint64_t * const acq, uint8_t const * const buf,
-          const loff_t pos, const size_t count)
+acq_write(uint64_t *const acq, uint8_t const *const buf,
+	  const loff_t pos, const size_t count)
 {
 	int ret = asq_or_acq_write(buf, pos, count, acq,
-	                           offsetof(struct spdk_nvme_registers, acq));
+				   offsetof(struct spdk_nvme_registers, acq));
 	SPDK_NOTICELOG("ACQ=0x%lx\n", *acq);
 	return ret;
 }
@@ -453,27 +458,27 @@ acq_write(uint64_t * const acq, uint8_t const * const buf,
 		offsetof(struct spdk_nvme_registers, acq) + sizeof(uint64_t) - 1
 
 static ssize_t
-admin_queue_write(struct muser_dev * const dev, uint8_t const * const buf,
-                  const size_t count, const loff_t pos)
+admin_queue_write(struct muser_dev *const dev, uint8_t const *const buf,
+		  const size_t count, const loff_t pos)
 {
 	switch (pos) {
-		case offsetof(struct spdk_nvme_registers, aqa):
-			return aqa_write(dev,
-			                 (union spdk_nvme_aqa_register*)buf);
-		case ASQ:
-			return asq_write(&dev->regs.asq, buf, pos, count);
-		case ACQ:
-			return acq_write(&dev->regs.acq, buf, pos, count);
-		default:
-			break;
+	case offsetof(struct spdk_nvme_registers, aqa):
+		return aqa_write(dev,
+				 (union spdk_nvme_aqa_register *)buf);
+	case ASQ:
+		return asq_write(&dev->regs.asq, buf, pos, count);
+	case ACQ:
+		return acq_write(&dev->regs.acq, buf, pos, count);
+	default:
+		break;
 	}
 	SPDK_ERRLOG("bad admin queue write offset 0x%lx\n", pos);
 	return -EINVAL;
 }
 
 /* TODO this should be a libmuser public function */
-static void*
-map_one(lm_ctx_t * const ctx, const uint64_t addr, const size_t len)
+static void *
+map_one(lm_ctx_t *const ctx, const uint64_t addr, const size_t len)
 {
 	dma_scattergather_t sg[1];
 	struct iovec iov;
@@ -495,14 +500,14 @@ map_one(lm_ctx_t * const ctx, const uint64_t addr, const size_t len)
 }
 
 static uint32_t
-sq_tail(struct muser_dev const * const d, struct io_q const * const q)
+sq_tail(struct muser_dev const *const d, struct io_q const *const q)
 {
 	assert(q);
 	return q->sq.old_tail % q->size;
 }
 
 static void
-sq_tail_advance(struct muser_dev const * const d, struct io_q * const q)
+sq_tail_advance(struct muser_dev const *const d, struct io_q *const q)
 {
 	assert(q);
 	assert(d);
@@ -510,21 +515,22 @@ sq_tail_advance(struct muser_dev const * const d, struct io_q * const q)
 }
 
 static void
-insert_queue(struct muser_dev * const dev, struct io_q const * const q,
-             const bool is_cq)
+insert_queue(struct muser_dev *const dev, struct io_q const *const q,
+	     const bool is_cq)
 {
 
 	assert(dev);
 	assert(q);
 
-	if (is_cq)
+	if (is_cq) {
 		dev->qp[q->id].cq = *q;
-	else
+	} else {
 		dev->qp[q->id].sq = *q;
+	}
 }
 
 static int
-asq_map(struct muser_dev * const d)
+asq_map(struct muser_dev *const d)
 {
 	struct io_q q;
 
@@ -538,15 +544,16 @@ asq_map(struct muser_dev * const d)
 	q.sq.head = q.sq.tdbl = 0;
 	q.sq.cqid = 0;
 	q.addr = map_one(d->lm_ctx, d->regs.asq,
-	                 q.size * sizeof(struct spdk_nvme_cmd));
-	if (!q.addr)
+			 q.size * sizeof(struct spdk_nvme_cmd));
+	if (!q.addr) {
 		return -1;
+	}
 	insert_queue(d, &q, false);
 	return 0;
 }
 
 static uint16_t
-cq_next(struct muser_dev * const d, struct io_q * const q)
+cq_next(struct muser_dev *const d, struct io_q *const q)
 {
 	assert(d);
 	assert(q);
@@ -554,7 +561,7 @@ cq_next(struct muser_dev * const d, struct io_q * const q)
 }
 
 static bool
-cq_is_full(struct muser_dev * const d, struct io_q * const q)
+cq_is_full(struct muser_dev *const d, struct io_q *const q)
 {
 	assert(d);
 	assert(q);
@@ -562,7 +569,7 @@ cq_is_full(struct muser_dev * const d, struct io_q * const q)
 }
 
 static void
-cq_tail_advance(struct muser_dev * const d, struct io_q * const q)
+cq_tail_advance(struct muser_dev *const d, struct io_q *const q)
 {
 	assert(d);
 	assert(q);
@@ -570,7 +577,7 @@ cq_tail_advance(struct muser_dev * const d, struct io_q * const q)
 }
 
 static int
-acq_map(struct muser_dev * const d)
+acq_map(struct muser_dev *const d)
 {
 	struct io_q q;
 
@@ -582,15 +589,16 @@ acq_map(struct muser_dev * const d)
 	q.id = 0;
 	q.cq.tail = 0;
 	q.addr = map_one(d->lm_ctx, d->regs.acq,
-	                 q.size * sizeof(struct spdk_nvme_cpl));
-	if (!q.addr)
+			 q.size * sizeof(struct spdk_nvme_cpl));
+	if (!q.addr) {
 		return -1;
+	}
 	insert_queue(d, &q, true);
 	return 0;
 }
 
 static int
-dptr_remap(struct muser_dev const * const dev, union spdk_nvme_dptr * const dptr)
+dptr_remap(struct muser_dev const *const dev, union spdk_nvme_dptr *const dptr)
 {
 	void *p;
 
@@ -601,16 +609,17 @@ dptr_remap(struct muser_dev const * const dev, union spdk_nvme_dptr * const dptr
 	assert(!dptr->prp.prp2);
 
 	p = map_one(dev->lm_ctx, dptr->prp.prp1 << dev->regs.cc.bits.mps,
-	            sizeof(struct spdk_nvme_cmd));
-	if (!p)
+		    sizeof(struct spdk_nvme_cmd));
+	if (!p) {
 		return -1;
+	}
 	dptr->prp.prp1 = (uint64_t)p >> dev->regs.cc.bits.mps;
 	return 0;
 }
 
 /* FIXME rename function, it handles more opcodes other than identify */
 static int
-handle_identify_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
+handle_identify_req(struct muser_dev *const dev, struct spdk_nvme_cmd *const cmd)
 {
 	int err;
 
@@ -673,8 +682,8 @@ SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_sq_cdw11) == 4, "Incorrect s
  * Completes a admin request.
  */
 static int
-do_admin_queue_complete(struct muser_dev * const d,
-                        struct spdk_nvme_cmd * const cmd)
+do_admin_queue_complete(struct muser_dev *const d,
+			struct spdk_nvme_cmd *const cmd)
 {
 	struct spdk_nvme_cpl *cpl;
 	struct io_q *cq0;
@@ -686,11 +695,11 @@ do_admin_queue_complete(struct muser_dev * const d,
 
 	if (cq_is_full(d, cq0)) {
 		SPDK_ERRLOG("CQ0 full (tail=%d, head=%d)\n",
-		            cq0->cq.tail, cq0->cq.hdbl);
+			    cq0->cq.tail, cq0->cq.hdbl);
 		return -1;
 	}
 
-	cpl = ((struct spdk_nvme_cpl*)cq0->addr) + cq0->cq.tail;
+	cpl = ((struct spdk_nvme_cpl *)cq0->addr) + cq0->cq.tail;
 
 	/*
 	 * FIXME intercept controller ID, we'll need it for converting a create
@@ -700,9 +709,10 @@ do_admin_queue_complete(struct muser_dev * const d,
 	 * is a hack, and racy. Fix.
 	 */
 	if (cmd->opc == SPDK_NVME_OPC_IDENTIFY) {
-		struct spdk_nvme_ctrlr_data *p = (struct spdk_nvme_ctrlr_data*)cmd->dptr.prp.prp1;
-		if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR && !d->cntlid)
+		struct spdk_nvme_ctrlr_data *p = (struct spdk_nvme_ctrlr_data *)cmd->dptr.prp.prp1;
+		if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR && !d->cntlid) {
 			d->cntlid = p->cntlid;
+		}
 	}
 
 	cpl->sqhd = d->qp[0].sq.sq.head;
@@ -723,8 +733,8 @@ do_admin_queue_complete(struct muser_dev * const d,
  * so.
  */
 static int
-admin_queue_complete(struct muser_dev * const dev,
-                     struct spdk_nvme_cmd * const cmd)
+admin_queue_complete(struct muser_dev *const dev,
+		     struct spdk_nvme_cmd *const cmd)
 {
 	assert(dev);
 	assert(cmd);
@@ -740,36 +750,40 @@ admin_queue_complete(struct muser_dev * const dev,
 	return 0;
 }
 
-static struct io_q*
-lookup_io_q(struct muser_dev * const dev, const uint16_t qid, const bool is_cq)
+static struct io_q *
+lookup_io_q(struct muser_dev *const dev, const uint16_t qid, const bool is_cq)
 {
 	struct io_q *q;
 
 	assert(dev);
 
-	if (qid > MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR)
+	if (qid > MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
 		return NULL;
+	}
 
-	if (is_cq)
+	if (is_cq) {
 		q = &dev->qp[qid].cq;
-	else
+	} else {
 		q = &dev->qp[qid].sq;
+	}
 
 	/*
 	 * XXX ASQ and ACQ are lazily mapped, see relevant comment in
 	 * handle_sq0tdbl_write
 	 */
-	if (!q->addr && qid)
+	if (!q->addr && qid) {
 		return NULL;
+	}
 
 	return q;
 }
 
 static void
-destroy_qp(struct muser_qpair * const qp)
+destroy_qp(struct muser_qpair *const qp)
 {
-	if (!qp)
+	if (!qp) {
 		return;
+	}
 	free(qp->reqs_internal);
 	qp->reqs_internal = NULL;
 	free(qp->cmds_internal);
@@ -779,8 +793,8 @@ destroy_qp(struct muser_qpair * const qp)
 }
 
 static int
-init_qp(struct muser_dev * const dev, struct muser_qpair * const qp,
-        struct spdk_nvmf_transport * const transport, const uint16_t qsize,
+init_qp(struct muser_dev *const dev, struct muser_qpair *const qp,
+	struct spdk_nvmf_transport *const transport, const uint16_t qsize,
 	const uint16_t id)
 {
 	int err = 0, i;
@@ -798,8 +812,9 @@ init_qp(struct muser_dev * const dev, struct muser_qpair * const qp,
 
 	/* FIXME is this needed for I/O queues? */
 	err = sem_init(&qp->prop_req.wait, 0, 0);
-	if (err)
+	if (err) {
 		return err;
+	}
 
 	qp->rsps_internal = calloc(qsize, sizeof(union nvmf_c2h_msg));
 	if (qp->rsps_internal == NULL) {
@@ -829,14 +844,15 @@ init_qp(struct muser_dev * const dev, struct muser_qpair * const qp,
 		TAILQ_INSERT_TAIL(&qp->reqs, &qp->reqs_internal[i], link);
 	}
 out:
-	if (err)
+	if (err) {
 		destroy_qp(qp);
+	}
 	return err;
 }
 
 static int
-add_qp(struct muser_dev * const dev, struct muser_qpair * const qp,
-       struct spdk_nvmf_transport * const transport, const uint16_t qsize,
+add_qp(struct muser_dev *const dev, struct muser_qpair *const qp,
+       struct spdk_nvmf_transport *const transport, const uint16_t qsize,
        const uint16_t id)
 {
 	int err;
@@ -844,11 +860,12 @@ add_qp(struct muser_dev * const dev, struct muser_qpair * const qp,
 	struct muser_poll_group *muser_group;
 
 	err = init_qp(dev, qp, transport, qsize, id);
-	if (err)
+	if (err) {
 		return err;
+	}
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
-	                                   transport);
+					   transport);
 	muser_group = muser_transport->group;
 
 	err = pthread_mutex_lock(&muser_group->lock);
@@ -869,8 +886,8 @@ add_qp(struct muser_dev * const dev, struct muser_qpair * const qp,
 }
 
 static int
-prep_io_qp(struct muser_dev * const d, struct muser_qpair * const qp,
-           const uint16_t id, const uint16_t qsize)
+prep_io_qp(struct muser_dev *const d, struct muser_qpair *const qp,
+	   const uint16_t id, const uint16_t qsize)
 {
 	int err;
 
@@ -885,8 +902,9 @@ prep_io_qp(struct muser_dev * const d, struct muser_qpair * const qp,
 	 * parameter instead
 	 */
 	err = add_qp(d, qp, d->qp[0].qpair.transport, qsize, id);
-	if (err)
+	if (err) {
 		return err;
+	}
 
 	SPDK_NOTICELOG("waiting for NVMf to connect\n");
 	do {
@@ -903,45 +921,45 @@ prep_io_qp(struct muser_dev * const d, struct muser_qpair * const qp,
  * Creates a completion or sumbission I/O queue.
  */
 static int
-handle_create_io_q(struct muser_dev * const dev,
-                   struct spdk_nvme_cmd * const cmd, const bool is_cq)
+handle_create_io_q(struct muser_dev *const dev,
+		   struct spdk_nvme_cmd *const cmd, const bool is_cq)
 {
-	union spdk_nvme_create_io_q_cdw10 * cdw10;
-	union spdk_nvme_create_io_cq_cdw11 * cdw11_cq = NULL;
-	union spdk_nvme_create_io_sq_cdw11 * cdw11_sq = NULL;
+	union spdk_nvme_create_io_q_cdw10 *cdw10;
+	union spdk_nvme_create_io_cq_cdw11 *cdw11_cq = NULL;
+	union spdk_nvme_create_io_sq_cdw11 *cdw11_sq = NULL;
 	size_t entry_size;
 	struct io_q io_q = { 0 };
 
 	assert(dev);
 	assert(cmd);
 
-	cdw10 = (union spdk_nvme_create_io_q_cdw10*)&cmd->cdw10;
+	cdw10 = (union spdk_nvme_create_io_q_cdw10 *)&cmd->cdw10;
 
 	SPDK_NOTICELOG("create I/O %cQ: QID=0x%x, QSIZE=0x%x\n",
-	               is_cq ? 'C' : 'S', cdw10->bits.qid, cdw10->bits.qsize);
+		       is_cq ? 'C' : 'S', cdw10->bits.qid, cdw10->bits.qsize);
 
 	if (cdw10->bits.qid >= MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
 		SPDK_ERRLOG("invalid QID=%d, max=%d\n", cdw10->bits.qid,
-		            MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR);
+			    MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR);
 		return -EINVAL;
 	}
 
 	if (lookup_io_q(dev, cdw10->bits.qid, is_cq)) {
 		SPDK_ERRLOG("%cQ%d already exists\n", is_cq ? 'C' : 'S',
-		            cdw10->bits.qid);
+			    cdw10->bits.qid);
 		return -EEXIST;
 	}
 
 	/* TODO break rest of this function into smaller functions */
 	if (is_cq) {
-		cdw11_cq = (union spdk_nvme_create_io_cq_cdw11*)&cmd->cdw11;
+		cdw11_cq = (union spdk_nvme_create_io_cq_cdw11 *)&cmd->cdw11;
 		entry_size = sizeof(struct spdk_nvme_cpl);
 		/* FIXME implement */
 		assert(cdw11_cq->bits.pc == 0x1);
 		assert(cdw11_cq->bits.ien == 0x1);
 		assert(cdw11_cq->bits.iv == 0x0);
 	} else {
-		cdw11_sq = (union spdk_nvme_create_io_sq_cdw11*)&cmd->cdw11;
+		cdw11_sq = (union spdk_nvme_create_io_sq_cdw11 *)&cmd->cdw11;
 		if (!lookup_io_q(dev, cdw11_sq->bits.cqid, true)) {
 			SPDK_ERRLOG("CQ%d does not exist\n", cdw11_sq->bits.cqid);
 			return -ENOENT;
@@ -957,11 +975,11 @@ handle_create_io_q(struct muser_dev * const dev,
 	io_q.size = cdw10->bits.qsize + 1;
 	if (io_q.size > max_queue_size(dev)) {
 		SPDK_ERRLOG("queue too big, want=%d, max=%d\n", io_q.size,
-		            max_queue_size(dev));
+			    max_queue_size(dev));
 		return -E2BIG;
 	}
 	io_q.addr = map_one(dev->lm_ctx, cmd->dptr.prp.prp1,
-	                    io_q.size * entry_size);
+			    io_q.size * entry_size);
 	if (!io_q.addr) {
 		SPDK_ERRLOG("failed to map I/O queue\n");
 		return -1;
@@ -971,7 +989,7 @@ handle_create_io_q(struct muser_dev * const dev,
 
 	if (is_cq) {
 		prep_io_qp(dev, &dev->qp[cdw10->bits.qid], cdw10->bits.qid,
-		           MUSER_DEFAULT_MAX_QUEUE_DEPTH);
+			   MUSER_DEFAULT_MAX_QUEUE_DEPTH);
 	}
 
 	insert_queue(dev, &io_q, is_cq);
@@ -989,7 +1007,7 @@ handle_create_io_q(struct muser_dev * const dev,
  * the response, 0 if no need for a response, and -1 on error.
  */
 static int
-consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
+consume_admin_req(struct muser_dev *const dev, struct spdk_nvme_cmd *const cmd)
 {
 	int err;
 
@@ -998,38 +1016,39 @@ consume_admin_req(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd
 
 	SPDK_NOTICELOG("handle admin req opc=0x%x\n", cmd->opc);
 
-	switch(cmd->opc) {
-		/* TODO put all cases in order */
-		case SPDK_NVME_OPC_IDENTIFY:
-		case SPDK_NVME_OPC_SET_FEATURES:
-		case SPDK_NVME_OPC_GET_LOG_PAGE:
-		case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
-		case SPDK_NVME_OPC_NS_MANAGEMENT:
-			err = handle_identify_req(dev, cmd);
-			if (!err) {
+	switch (cmd->opc) {
+	/* TODO put all cases in order */
+	case SPDK_NVME_OPC_IDENTIFY:
+	case SPDK_NVME_OPC_SET_FEATURES:
+	case SPDK_NVME_OPC_GET_LOG_PAGE:
+	case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
+	case SPDK_NVME_OPC_NS_MANAGEMENT:
+		err = handle_identify_req(dev, cmd);
+		if (!err) {
 
-				/*
-				 * FIXME This request is now probably lost.
-				 */
-				if (cmd->opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST)
-					return 0;
-
-				return 1;
+			/*
+			 * FIXME This request is now probably lost.
+			 */
+			if (cmd->opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST) {
+				return 0;
 			}
-			return err;
-		case SPDK_NVME_OPC_CREATE_IO_CQ:
-			return handle_create_io_q(dev, cmd, true);
-		case SPDK_NVME_OPC_CREATE_IO_SQ:
-			return handle_create_io_q(dev, cmd, false);
-		default:
-			SPDK_ERRLOG("unsupported command 0x%x\n", cmd->opc);
-			return -1;
+
+			return 1;
+		}
+		return err;
+	case SPDK_NVME_OPC_CREATE_IO_CQ:
+		return handle_create_io_q(dev, cmd, true);
+	case SPDK_NVME_OPC_CREATE_IO_SQ:
+		return handle_create_io_q(dev, cmd, false);
+	default:
+		SPDK_ERRLOG("unsupported command 0x%x\n", cmd->opc);
+		return -1;
 	}
 	return -1;
 }
 
 static int
-handle_io_read(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
+handle_io_read(struct muser_dev *const dev, struct spdk_nvme_cmd *const cmd)
 {
 	int err;
 	uint64_t slba;
@@ -1042,11 +1061,12 @@ handle_io_read(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
 	nlb = 0x0000ffff & cmd->cdw12;
 
 	SPDK_NOTICELOG("read MPTR=0x%lx, PRP1=0x%lx, PRP2=0x%lx, SLBA=0x%lx, NLB=0x%x\n",
-	               cmd->mptr, cmd->dptr.prp.prp1, cmd->dptr.prp.prp2, slba, nlb);
+		       cmd->mptr, cmd->dptr.prp.prp1, cmd->dptr.prp.prp2, slba, nlb);
 
 	err = dptr_remap(dev, &cmd->dptr);
-	if (err)
+	if (err) {
 		return err;
+	}
 
 	/* FIXME we must use the I/O QP, not the admin one */
 	dev->qp[0].cmd = cmd;
@@ -1057,26 +1077,27 @@ handle_io_read(struct muser_dev * const dev, struct spdk_nvme_cmd * const cmd)
 }
 
 static int
-consume_io_req(struct muser_dev * const d, struct io_q * const q,
-               struct spdk_nvme_cmd * const cmd)
+consume_io_req(struct muser_dev *const d, struct io_q *const q,
+	       struct spdk_nvme_cmd *const cmd)
 {
 	SPDK_NOTICELOG("XXX opc=0x%x\n", cmd->opc);
 	switch (cmd->opc) {
-		case SPDK_NVME_OPC_READ:
-			return handle_io_read(d, cmd);
-		default:
-			SPDK_ERRLOG("bad I/O command 0x%x\n", cmd->opc);
-			return -1;
+	case SPDK_NVME_OPC_READ:
+		return handle_io_read(d, cmd);
+	default:
+		SPDK_ERRLOG("bad I/O command 0x%x\n", cmd->opc);
+		return -1;
 	}
 	return 0;
 }
 
 static int
-consume_req(struct muser_dev * const d, struct io_q * const q,
-            struct spdk_nvme_cmd * const cmd)
+consume_req(struct muser_dev *const d, struct io_q *const q,
+	    struct spdk_nvme_cmd *const cmd)
 {
-	if (q->id == 0)
+	if (q->id == 0) {
 		return consume_admin_req(d, cmd);
+	}
 	return consume_io_req(d, q, cmd);
 }
 
@@ -1085,11 +1106,11 @@ consume_req(struct muser_dev * const d, struct io_q * const q,
  * the response.
  */
 static int
-consume_reqs(struct muser_dev * const d, const uint32_t new_tail,
-             struct io_q * const q)
+consume_reqs(struct muser_dev *const d, const uint32_t new_tail,
+	     struct io_q *const q)
 {
 	int count = 0;
-	struct spdk_nvme_cmd * queue;
+	struct spdk_nvme_cmd *queue;
 
 	assert(d);
 	assert(q);
@@ -1107,7 +1128,7 @@ consume_reqs(struct muser_dev * const d, const uint32_t new_tail,
 	 */
 	queue = q->addr;
 	while (sq_tail(d, q) != new_tail) {
-		struct spdk_nvme_cmd * const cmd = &queue[sq_tail(d, q)];
+		struct spdk_nvme_cmd *const cmd = &queue[sq_tail(d, q)];
 		int ret = consume_req(d, q, cmd);
 		if (ret < 0) {
 			/* FIXME how should we proceed now? */
@@ -1128,8 +1149,8 @@ consume_reqs(struct muser_dev * const d, const uint32_t new_tail,
  * the response.
  */
 static ssize_t
-handle_sq_tdbl_write(struct muser_dev * const d, const uint32_t new_tail,
-                     struct io_q * const q)
+handle_sq_tdbl_write(struct muser_dev *const d, const uint32_t new_tail,
+		     struct io_q *const q)
 {
 	assert(d);
 	assert(q);
@@ -1154,8 +1175,8 @@ handle_sq_tdbl_write(struct muser_dev * const d, const uint32_t new_tail,
 }
 
 static ssize_t
-handle_cq_hdbl_write(struct muser_dev * const d, const uint32_t new_head,
-                     struct io_q * const q)
+handle_cq_hdbl_write(struct muser_dev *const d, const uint32_t new_head,
+		     struct io_q *const q)
 {
 	assert(d);
 	assert(q);
@@ -1180,8 +1201,8 @@ handle_cq_hdbl_write(struct muser_dev * const d, const uint32_t new_head,
  * it's a submission queue, otherwise it's a completion queue.
  */
 static inline int
-get_qid_and_kind(struct muser_dev const * const dev, const loff_t pos,
-                 bool * const is_cq)
+get_qid_and_kind(struct muser_dev const *const dev, const loff_t pos,
+		 bool *const is_cq)
 {
 	int i, n;
 
@@ -1214,13 +1235,13 @@ get_qid_and_kind(struct muser_dev const * const dev, const loff_t pos,
 
 #if 0
 static int
-handle_io_sq_tdbl_write(struct muser_dev * const dev)
+handle_io_sq_tdbl_write(struct muser_dev *const dev)
 {
 	assert(0);
 }
 
 static int
-handle_io_cq_hbdl_write(struct muser_dev * const dev)
+handle_io_cq_hbdl_write(struct muser_dev *const dev)
 {
 	assert(0);
 }
@@ -1228,7 +1249,7 @@ handle_io_cq_hbdl_write(struct muser_dev * const dev)
 
 #if 0
 static bool
-is_admin_q(struct io_q const * const queues, struct io_q const * const q)
+is_admin_q(struct io_q const *const queues, struct io_q const *const q)
 {
 	return q == &queues[0];
 }
@@ -1238,14 +1259,14 @@ is_admin_q(struct io_q const * const queues, struct io_q const * const q)
  * Handles a write at offset 0x1000 or more.
  */
 static int
-handle_dbl_write(struct muser_dev * const dev, uint8_t const * const buf,
-                 const size_t count, const loff_t pos)
+handle_dbl_write(struct muser_dev *const dev, uint8_t const *const buf,
+		 const size_t count, const loff_t pos)
 {
 	int err;
 	uint16_t qid;
 	bool is_cq;
 	uint32_t v;
-	struct io_q * q;
+	struct io_q *q;
 
 	assert(dev);
 	assert(buf);
@@ -1268,16 +1289,17 @@ handle_dbl_write(struct muser_dev * const dev, uint8_t const * const buf,
 		return -ENOENT;
 	}
 
-	v = *(int*)buf;
-	if (is_cq)
+	v = *(int *)buf;
+	if (is_cq) {
 		return handle_cq_hdbl_write(dev, v, q);
+	}
 	return handle_sq_tdbl_write(dev, v, q);
 }
 
 static ssize_t
 write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 {
-	struct muser_dev * const muser_dev = pvt;
+	struct muser_dev *const muser_dev = pvt;
 	int err;
 
 	SPDK_NOTICELOG("dev: %p, count=%zu, pos=%"PRIX64"\n",
@@ -1285,28 +1307,29 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	spdk_log_dump(stdout, "muser_write", buf, count);
 
 	switch (pos) {
-		/* TODO sort cases */
-		case ADMIN_QUEUES:
-			return admin_queue_write(muser_dev, buf, count, pos);
-		case CC:
-			muser_dev->qp[0].prop_req.buf = buf;
-			muser_dev->qp[0].prop_req.count = count;
-			muser_dev->qp[0].prop_req.pos = pos;
-			spdk_wmb();
-			muser_dev->qp[0].prop_req.dir = MUSER_NVMF_WRITE;
-			break;
-		default:
-			if (pos >= DOORBELLS) {
-				err = handle_dbl_write(muser_dev, buf, count,
-				                       pos);
-				if (err <= 0)
-					return err;
-			} else {
-				SPDK_ERRLOG("write to 0x%lx not implemented\n",
-				            pos);
-				return -ENOTSUP;
+	/* TODO sort cases */
+	case ADMIN_QUEUES:
+		return admin_queue_write(muser_dev, buf, count, pos);
+	case CC:
+		muser_dev->qp[0].prop_req.buf = buf;
+		muser_dev->qp[0].prop_req.count = count;
+		muser_dev->qp[0].prop_req.pos = pos;
+		spdk_wmb();
+		muser_dev->qp[0].prop_req.dir = MUSER_NVMF_WRITE;
+		break;
+	default:
+		if (pos >= DOORBELLS) {
+			err = handle_dbl_write(muser_dev, buf, count,
+					       pos);
+			if (err <= 0) {
+				return err;
 			}
-			break;
+		} else {
+			SPDK_ERRLOG("write to 0x%lx not implemented\n",
+				    pos);
+			return -ENOTSUP;
+		}
+		break;
 	}
 
 	do {
@@ -1321,25 +1344,26 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 }
 
 static ssize_t
-access_bar_fn(void *pvt, const int region_index, char * const buf, size_t count,
-              loff_t offset, const bool is_write)
+access_bar_fn(void *pvt, const int region_index, char *const buf, size_t count,
+	      loff_t offset, const bool is_write)
 {
 	ssize_t ret;
 
 	if (region_index != LM_DEV_BAR0_REG_IDX) {
 		SPDK_WARNLOG("unsupported access to BAR%d, dev: %p, count=%zu, pos=%"PRIX64"\n",
-		       region_index, pvt, count, offset);
+			     region_index, pvt, count, offset);
 		return -1;
 	}
 
-	if (is_write)
+	if (is_write) {
 		ret = write_bar0(pvt, buf, count, offset);
-	else
+	} else {
 		ret = read_bar0(pvt, buf, count, offset);
+	}
 
 	if (ret != 0) {
 		SPDK_WARNLOG("failed to %s %lx@%lx BAR0: %zu\n",
-			       is_write ? "write" : "read", offset, count, ret);
+			     is_write ? "write" : "read", offset, count, ret);
 		return -1;
 	}
 	return count;
@@ -1351,65 +1375,66 @@ access_bar_fn(void *pvt, const int region_index, char * const buf, size_t count,
  */
 static ssize_t
 access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
-                  const bool is_write)
+		  const bool is_write)
 {
-    struct muser_dev * const muser_dev = (struct muser_dev*)pvt;
+	struct muser_dev *const muser_dev = (struct muser_dev *)pvt;
 
-    if (is_write) {
-        switch (offset) {
-            case offsetof(struct nvme_config_space, pci_expr_cap.pxdc):
-		if (count != sizeof (union pxdc)) {
-			SPDK_WARNLOG("bad write size to PXDC %zu\n", count);
-			return -EINVAL;
+	if (is_write) {
+		switch (offset) {
+		case offsetof(struct nvme_config_space, pci_expr_cap.pxdc):
+			if (count != sizeof(union pxdc)) {
+				SPDK_WARNLOG("bad write size to PXDC %zu\n", count);
+				return -EINVAL;
+			}
+			SPDK_NOTICELOG("writing to PXDC 0x%hx\n",
+				       ((union pxdc *)buf)->raw);
+			return count;
 		}
-                SPDK_NOTICELOG("writing to PXDC 0x%hx\n",
-		               ((union pxdc*)buf)->raw);
-                return count;
-        }
 
-        fprintf(stderr, "writes non supported\n");
-        return -EINVAL;
-    }
+		fprintf(stderr, "writes non supported\n");
+		return -EINVAL;
+	}
 
-    if (offset + count > PCI_EXTENDED_CONFIG_SPACE_SIZEOF) {
-        fprintf(stderr, "access past end of extended PCI configuration space, want=%ld+%ld, max=%d\n",
-                offset, count, PCI_EXTENDED_CONFIG_SPACE_SIZEOF);
-        return -ERANGE;
-    }
+	if (offset + count > PCI_EXTENDED_CONFIG_SPACE_SIZEOF) {
+		fprintf(stderr, "access past end of extended PCI configuration space, want=%ld+%ld, max=%d\n",
+			offset, count, PCI_EXTENDED_CONFIG_SPACE_SIZEOF);
+		return -ERANGE;
+	}
 
-    memcpy(buf, ((unsigned char*)muser_dev->pci_config_space) + offset, count);
+	memcpy(buf, ((unsigned char *)muser_dev->pci_config_space) + offset, count);
 
-    return count;
+	return count;
 }
 
 static void
 nvme_reg_info_fill(lm_reg_info_t *reg_info)
 {
-    int i;
+	int i;
 
-    assert(reg_info != NULL);
+	assert(reg_info != NULL);
 
-    memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
+	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
 
-    for (i = 0; i < LM_DEV_NUM_REGS; i++) {
-        reg_info[i].offset = i * NVME_REG_OFFSET;
-    }
+	for (i = 0; i < LM_DEV_NUM_REGS; i++) {
+		reg_info[i].offset = i * NVME_REG_OFFSET;
+	}
 
-    reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
-    reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
+	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
 
-    reg_info[LM_DEV_CFG_REG_IDX].flags = LM_REG_FLAG_RW;
-    reg_info[LM_DEV_CFG_REG_IDX].size  = NVME_REG_CFG_SIZE;
+	reg_info[LM_DEV_CFG_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_CFG_REG_IDX].size  = NVME_REG_CFG_SIZE;
 }
 
 static void
-nvme_log(void *pvt, char const * const msg) {
-    fprintf(stderr, "%s", msg);
+nvme_log(void *pvt, char const *const msg)
+{
+	fprintf(stderr, "%s", msg);
 }
 
 static void
 nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
-                   struct muser_dev *muser_dev)
+		   struct muser_dev *muser_dev)
 {
 	assert(dev_info != NULL);
 	assert(muser_dev != NULL);
@@ -1418,7 +1443,7 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
 
 	dev_info->uuid = muser_dev->uuid;
 
-	dev_info->id.vid = 0x4e58;     // TODO: LE ?
+	dev_info->id.vid = 0x4e58;     /* TODO: LE ? */
 	dev_info->id.did = 0x0001;
 
 	/* controller uses the NVM Express programming interface */
@@ -1430,8 +1455,9 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
 	/* mass storage controller */
 	dev_info->cc.bcc = 0x01;
 
-	if (fops)
+	if (fops) {
 		dev_info->fops = *fops;
+	}
 
 	dev_info->pci_info.irq_count[LM_DEV_INTX_IRQ_IDX] = NVME_IRQ_INTX_NUM;
 	dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
@@ -1460,53 +1486,53 @@ drive(void *arg)
 }
 
 static void
-init_pci_config_space(struct nvme_config_space * const p)
+init_pci_config_space(struct nvme_config_space *const p)
 {
-    struct nvme_pcie_mlbar *mlbar;
-    struct nvme_pcie_bar2 *nvme_bar2;
+	struct nvme_pcie_mlbar *mlbar;
+	struct nvme_pcie_bar2 *nvme_bar2;
 
-    /* MLBAR */
-    mlbar = (struct nvme_pcie_mlbar*)&p->hdr.bars[0];
-    memset(mlbar, 0, sizeof(*mlbar));
+	/* MLBAR */
+	mlbar = (struct nvme_pcie_mlbar *)&p->hdr.bars[0];
+	memset(mlbar, 0, sizeof(*mlbar));
 
-    /* MUBAR */
-    p->hdr.bars[1].raw = 0x0;
+	/* MUBAR */
+	p->hdr.bars[1].raw = 0x0;
 
-    /*
-     * BAR2, index/data pair register base address or vendor specific (optional)
-     */
-    nvme_bar2 = (struct nvme_pcie_bar2*)&p->hdr.bars[2].raw;
-    memset(nvme_bar2, 0, sizeof(*nvme_bar2));
-    nvme_bar2->rte = 0x1;
+	/*
+	 * BAR2, index/data pair register base address or vendor specific (optional)
+	 */
+	nvme_bar2 = (struct nvme_pcie_bar2 *)&p->hdr.bars[2].raw;
+	memset(nvme_bar2, 0, sizeof(*nvme_bar2));
+	nvme_bar2->rte = 0x1;
 
-    /* vendor specific, let's set them to zero for now */
-    p->hdr.bars[3].raw = 0x0;
-    p->hdr.bars[4].raw = 0x0;
-    p->hdr.bars[5].raw = 0x0;
+	/* vendor specific, let's set them to zero for now */
+	p->hdr.bars[3].raw = 0x0;
+	p->hdr.bars[4].raw = 0x0;
+	p->hdr.bars[5].raw = 0x0;
 
-    p->hdr.intr.ipin = 0x1;
+	p->hdr.intr.ipin = 0x1;
 
-    /* enables capabilities */
-    p->hdr.sts.cl = 0x1;
+	/* enables capabilities */
+	p->hdr.sts.cl = 0x1;
 
-    /*
-     * TODO add function that adds a capability (takes care of updating the
-     * next pointers etc.)
-     */
+	/*
+	 * TODO add function that adds a capability (takes care of updating the
+	 * next pointers etc.)
+	 */
 
-    p->hdr.cap = offsetof(struct nvme_config_space, pmcap);
-    assert(p->hdr.cap == 0x40);
-    /* initialize PMCAP */
-    p->pmcap.pid.cid = 0x1; /* PCI power management capability */
-    p->pmcap.pmcs.nsfrst = 0x1;
+	p->hdr.cap = offsetof(struct nvme_config_space, pmcap);
+	assert(p->hdr.cap == 0x40);
+	/* initialize PMCAP */
+	p->pmcap.pid.cid = 0x1; /* PCI power management capability */
+	p->pmcap.pmcs.nsfrst = 0x1;
 
-    p->pmcap.pid.next = offsetof(struct nvme_config_space, pci_expr_cap);
-    /* initialize PXCAP */
-    p->pci_expr_cap.pxid.cid = 0x10; /* PCI Express capability */
-    p->pci_expr_cap.pxcap.ver = 0x2;
-    p->pci_expr_cap.pxdcap.per = 0x1;
-    p->pci_expr_cap.pxdcap.flrc = 0x1;
-    p->pci_expr_cap.pxdcap2.ctds = 0x1;
+	p->pmcap.pid.next = offsetof(struct nvme_config_space, pci_expr_cap);
+	/* initialize PXCAP */
+	p->pci_expr_cap.pxid.cid = 0x10; /* PCI Express capability */
+	p->pci_expr_cap.pxcap.ver = 0x2;
+	p->pci_expr_cap.pxdcap.per = 0x1;
+	p->pci_expr_cap.pxdcap.flrc = 0x1;
+	p->pci_expr_cap.pxdcap2.ctds = 0x1;
 }
 
 static int
@@ -1519,7 +1545,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	int err;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
-	                                   transport);
+					   transport);
 
 	err = mdev_create(trid->traddr);
 	if (err == -1) {
@@ -1536,9 +1562,10 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 	/* Admin QP setup */
 	err = add_qp(muser_dev, &muser_dev->qp[0], transport,
-	             MUSER_DEFAULT_AQ_DEPTH, 0);
-	if (err)
+		     MUSER_DEFAULT_AQ_DEPTH, 0);
+	if (err) {
 		goto err_free_dev;
+	}
 
 	/* LM setup */
 	nvme_dev_info_fill(&dev_info, NULL, muser_dev);
@@ -1551,7 +1578,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 
 	muser_dev->pci_config_space = lm_get_pci_config_space(muser_dev->lm_ctx);
-	init_pci_config_space((struct nvme_config_space*)muser_dev->pci_config_space);
+	init_pci_config_space((struct nvme_config_space *)muser_dev->pci_config_space);
 
 	err = pthread_create(&muser_dev->lm_thr, NULL,
 			     drive, muser_dev->lm_ctx);
@@ -1593,7 +1620,7 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn)
 	struct muser_qpair *qp, *tmp;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
-	                                   transport);
+					   transport);
 	muser_group = muser_transport->group;
 
 	err = pthread_mutex_lock(&muser_group->lock);
@@ -1633,7 +1660,7 @@ muser_poll_group_create(struct spdk_nvmf_transport *transport)
 		return NULL;
 	}
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
-	                                   transport);
+					   transport);
 	muser_transport->group = muser_group;
 
 	TAILQ_INIT(&muser_group->qps);
@@ -1656,8 +1683,9 @@ muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 	err = pthread_mutex_destroy(&muser_group->lock);
-	if (err)
+	if (err) {
 		SPDK_ERRLOG("faied to destroy poll group mutex: %m\n");
+	}
 
 	free(muser_group);
 }
@@ -1704,7 +1732,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	/* data->hostnqn = { 0 } */
 
 	SPDK_NOTICELOG("sending connect fabrics command for QID=0x%x\n",
-	               qpair->qid);
+		       qpair->qid);
 
 	spdk_nvmf_request_exec(req);
 
@@ -1735,11 +1763,12 @@ muser_req_done(struct spdk_nvmf_request *req)
 		if (req->cmd->connect_cmd.qid) {
 			int err;
 			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-			              "fabric connect command completed\n");
+				      "fabric connect command completed\n");
 			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "sem_post %p\n", &muser_qpair->prop_req.wait);
 			err = sem_post(&muser_qpair->prop_req.wait);
-			if (err)
+			if (err) {
 				SPDK_ERRLOG("failed to sem_post: %m\n");
+			}
 		}
 		free(req->data);
 		req->data = NULL;
@@ -1773,7 +1802,7 @@ muser_close_qpair(struct spdk_nvmf_qpair *qpair)
 { }
 
 static int
-handle_req(struct muser_qpair * const muser_qpair)
+handle_req(struct muser_qpair *const muser_qpair)
 {
 	struct spdk_nvmf_request *req;
 	struct muser_req *muser_req;
@@ -1790,7 +1819,7 @@ handle_req(struct muser_qpair * const muser_qpair)
 		req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
 		req->cmd->nvme_cmd = *muser_qpair->cmd;
 		req->length = 1 << 12;
-		req->data = (void*)(req->cmd->nvme_cmd.dptr.prp.prp1 << muser_qpair->dev->regs.cc.bits.mps);
+		req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << muser_qpair->dev->regs.cc.bits.mps);
 	} else {
 		req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 		req->cmd->prop_set_cmd.cid = 0;
@@ -1801,7 +1830,7 @@ handle_req(struct muser_qpair * const muser_qpair)
 		} else {
 			req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
 		}
-		req->cmd->prop_set_cmd.attrib.size = (muser_qpair->prop_req.count/4)-1;
+		req->cmd->prop_set_cmd.attrib.size = (muser_qpair->prop_req.count / 4) - 1;
 		req->cmd->prop_set_cmd.ofst = muser_qpair->prop_req.pos;
 		req->length = 0;
 		req->data = NULL;

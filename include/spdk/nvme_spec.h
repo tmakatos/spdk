@@ -390,7 +390,7 @@ SPDK_STATIC_ASSERT(0x48 == offsetof(struct spdk_nvme_registers, bpmbl),
 		   "Incorrect register offset");
 
 SPDK_STATIC_ASSERT(DOORBELLS == offsetof(struct spdk_nvme_registers, doorbell[0].sq_tdbl),
-                   "Incorrect register offset");
+		   "Incorrect register offset");
 
 enum spdk_nvme_sgl_descriptor_type {
 	SPDK_NVME_SGL_TYPE_DATA_BLOCK		= 0x0,
