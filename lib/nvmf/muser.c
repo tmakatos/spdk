@@ -180,7 +180,7 @@ struct muser_ctrlr {
 
 	/* PCI capabilities */
 	struct pmcap				pmcap;
-	struct PCI_Express_Capability		pci_expr_cap;
+	struct pxcap				pxcap;
 
 	/* Internal command for spoofing register reads/writes. */
 	struct muser_nvmf_prop_req		prop_req;
@@ -1400,7 +1400,7 @@ pmcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
 }
 
 static ssize_t
-pci_expr_cap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
+pxcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
                     loff_t offset, const bool is_write)
 {
 	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
@@ -1408,7 +1408,7 @@ pci_expr_cap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
 	if (is_write)
 		assert(false); /* TODO */
 
-	memcpy(buf, ((char*)&ctrlr->pci_expr_cap) + offset, count);
+	memcpy(buf, ((char*)&ctrlr->pxcap) + offset, count);
 
 	return count;
 }
@@ -1446,7 +1446,7 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
 		   struct muser_ctrlr *muser_ctrlr)
 {
 	lm_cap_t pm = {.id = PCI_CAP_ID_PM, .size = sizeof(struct pmcap), .fn = pmcap_access};
-	lm_cap_t px = {.id = PCI_CAP_ID_EXP, .size = sizeof(struct PCI_Express_Capability), .fn = pci_expr_cap_access};
+	lm_cap_t px = {.id = PCI_CAP_ID_EXP, .size = sizeof(struct pxcap), .fn = pxcap_access};
 
 	assert(dev_info != NULL);
 	assert(muser_ctrlr != NULL);
@@ -1573,10 +1573,10 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
 
 	/* EXP */
-	muser_ctrlr->pci_expr_cap.pxcap.ver = 0x2;
-	muser_ctrlr->pci_expr_cap.pxdcap.per = 0x1;
-	muser_ctrlr->pci_expr_cap.pxdcap.flrc = 0x1;
-	muser_ctrlr->pci_expr_cap.pxdcap2.ctds = 0x1;
+	muser_ctrlr->pxcap.pxcaps.ver = 0x2;
+	muser_ctrlr->pxcap.pxdcap.per = 0x1;
+	muser_ctrlr->pxcap.pxdcap.flrc = 0x1;
+	muser_ctrlr->pxcap.pxdcap2.ctds = 0x1;
 
 
 	muser_ctrlr->lm_ctx = lm_ctx_create(&dev_info);
