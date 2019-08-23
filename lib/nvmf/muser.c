@@ -1334,16 +1334,10 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 }
 
 static ssize_t
-access_bar_fn(void *pvt, const int region_index, char *buf, size_t count,
-	      loff_t offset, const bool is_write)
+access_bar_fn(void *pvt, char *buf, size_t count, loff_t offset,
+              const bool is_write)
 {
 	ssize_t ret;
-
-	if (region_index != LM_DEV_BAR0_REG_IDX) {
-		SPDK_WARNLOG("unsupported access to BAR%d, ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
-			     region_index, pvt, count, offset);
-		return -1;
-	}
 
 	if (is_write) {
 		ret = write_bar0(pvt, buf, count, offset);
@@ -1430,9 +1424,11 @@ nvme_reg_info_fill(lm_reg_info_t *reg_info)
 
 	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
 	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
+	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar_fn;
 
 	reg_info[LM_DEV_CFG_REG_IDX].flags = LM_REG_FLAG_RW;
 	reg_info[LM_DEV_CFG_REG_IDX].size  = NVME_REG_CFG_SIZE;
+	reg_info[LM_DEV_CFG_REG_IDX].fn  = access_pci_config;
 }
 
 static void
@@ -1475,9 +1471,6 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
 	dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
 
 	dev_info->nr_dma_regions = 0x10;
-
-	dev_info->pci_info.bar_fn = &access_bar_fn;
-	dev_info->pci_info.pci_config_fn = &access_pci_config;
 
 	dev_info->extended = true;
 
