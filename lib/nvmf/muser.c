@@ -1455,17 +1455,17 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
 
 	dev_info->uuid = muser_ctrlr->uuid;
 
-	dev_info->id.vid = 0x4e58;     /* TODO: LE ? */
-	dev_info->id.did = 0x0001;
+	dev_info->pci_info.id.vid = 0x4e58;     /* TODO: LE ? */
+	dev_info->pci_info.id.did = 0x0001;
 
 	/* controller uses the NVM Express programming interface */
-	dev_info->cc.pi = 0x02;
+	dev_info->pci_info.cc.pi = 0x02;
 
 	/* non-volatile memory controller */
-	dev_info->cc.scc = 0x08;
+	dev_info->pci_info.cc.scc = 0x08;
 
 	/* mass storage controller */
-	dev_info->cc.bcc = 0x01;
+	dev_info->pci_info.cc.bcc = 0x01;
 
 	if (fops) {
 		dev_info->fops = *fops;
