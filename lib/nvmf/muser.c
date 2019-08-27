@@ -1438,8 +1438,7 @@ nvme_log(void *pvt, char const *msg)
 }
 
 static void
-nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
-		   struct muser_ctrlr *muser_ctrlr)
+nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 {
 	lm_cap_t pm = {.id = PCI_CAP_ID_PM, .size = sizeof(struct pmcap), .fn = pmcap_access};
 	lm_cap_t px = {.id = PCI_CAP_ID_EXP, .size = sizeof(struct pxcap), .fn = pxcap_access};
@@ -1462,10 +1461,6 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, lm_fops_t *fops,
 
 	/* mass storage controller */
 	dev_info->pci_info.cc.bcc = 0x01;
-
-	if (fops) {
-		dev_info->fops = *fops;
-	}
 
 	dev_info->pci_info.irq_count[LM_DEV_INTX_IRQ_IDX] = NVME_IRQ_INTX_NUM;
 	dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
@@ -1560,7 +1555,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	}
 
 	/* LM setup */
-	nvme_dev_info_fill(&dev_info, NULL, muser_ctrlr);
+	nvme_dev_info_fill(&dev_info, muser_ctrlr);
 
 	/* PM */
 	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
