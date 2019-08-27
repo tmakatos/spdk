@@ -1465,8 +1465,6 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 	dev_info->pci_info.irq_count[LM_DEV_INTX_IRQ_IDX] = NVME_IRQ_INTX_NUM;
 	dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
 
-	dev_info->nr_dma_regions = 0x10;
-
 	dev_info->extended = true;
 
 	nvme_reg_info_fill(dev_info->pci_info.reg_info);
