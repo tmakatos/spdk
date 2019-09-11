@@ -474,7 +474,7 @@ admin_queue_write(struct muser_ctrlr *ctrlr, uint8_t const *buf,
 static void *
 map_one(lm_ctx_t *ctx, const uint64_t addr, const size_t len)
 {
-	dma_scattergather_t sg[1];
+	dma_sg_t sg[1];
 	struct iovec iov;
 	int ret;
 
