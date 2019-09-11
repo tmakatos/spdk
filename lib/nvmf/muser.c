@@ -83,9 +83,6 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define NVME_IRQ_INTX_NUM       1
 #define NVME_IRQ_MSIX_NUM       32
 
-/* TODO 36 comes from a real NVMe device, does it have to be 36? */
-#define NVME_REG_OFFSET         (1UL << 36)
-
 enum muser_nvmf_dir {
 	MUSER_NVMF_INVALID,
 	MUSER_NVMF_READ,
@@ -1412,15 +1409,9 @@ pxcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
 static void
 nvme_reg_info_fill(lm_reg_info_t *reg_info)
 {
-	int i;
-
 	assert(reg_info != NULL);
 
 	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
-
-	for (i = 0; i < LM_DEV_NUM_REGS; i++) {
-		reg_info[i].offset = i * NVME_REG_OFFSET;
-	}
 
 	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
 	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
