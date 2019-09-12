@@ -156,6 +156,10 @@ struct muser_qpair {
 	uint16_t				qsize;
 	struct io_q				cq;
 	struct io_q				sq;
+
+	/* Internal command for spoofing register reads/writes. */
+	struct muser_nvmf_prop_req		prop_req;
+
 	TAILQ_HEAD(, muser_req)			reqs;
 	TAILQ_ENTRY(muser_qpair)		link;
 };
@@ -205,9 +209,6 @@ struct muser_ctrlr {
 	/* PCI capabilities */
 	struct pmcap				pmcap;
 	struct pxcap				pxcap;
-
-	/* Internal command for spoofing register reads/writes. */
-	struct muser_nvmf_prop_req		prop_req;
 
 	uint16_t				cntlid;
 
@@ -347,18 +348,18 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		return read_cap(muser_ctrlr, buf, count, pos);
 	}
 
-	muser_ctrlr->prop_req.buf = buf;
+	muser_ctrlr->qp[0].prop_req.buf = buf;
 	/* TODO: count must never be more than 8, otherwise we need to split it */
-	muser_ctrlr->prop_req.count = count;
-	muser_ctrlr->prop_req.pos = pos;
+	muser_ctrlr->qp[0].prop_req.count = count;
+	muser_ctrlr->qp[0].prop_req.pos = pos;
 	spdk_wmb();
-	muser_ctrlr->prop_req.dir = MUSER_NVMF_READ;
+	muser_ctrlr->qp[0].prop_req.dir = MUSER_NVMF_READ;
 
 	do {
-		err = sem_wait(&muser_ctrlr->prop_req.wait);
+		err = sem_wait(&muser_ctrlr->qp[0].prop_req.wait);
 	} while (err != 0 && errno != EINTR);
 
-	return muser_ctrlr->prop_req.ret;
+	return muser_ctrlr->qp[0].prop_req.ret;
 }
 
 static uint16_t
@@ -657,7 +658,7 @@ handle_identify_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 
 	ctrlr->qp[0].cmd = cmd;
 	spdk_wmb();
-	ctrlr->prop_req.dir = MUSER_NVMF_READ; /* FIXME shouldn't this be MUSER_NVMF_READ? */
+	ctrlr->qp[0].prop_req.dir = MUSER_NVMF_READ; /* FIXME shouldn't this be MUSER_NVMF_READ? */
 
 	return 0;
 }
@@ -921,7 +922,7 @@ prep_io_qp(struct muser_ctrlr *d, struct muser_qpair *qp,
 
 	SPDK_NOTICELOG("waiting for NVMf to connect\n");
 	do {
-		err = sem_wait(&d->prop_req.wait);
+		err = sem_wait(&d->qp[id].prop_req.wait);
 	} while (err != 0 && errno != EINTR);
 	SPDK_NOTICELOG("NVMf connected\n");
 
@@ -1066,6 +1067,7 @@ handle_io_read(struct muser_ctrlr *ctrlr, struct io_q *q,
 	int err;
 	uint64_t slba;
 	uint16_t nlb;
+	struct muser_qpair *qp;
 
 	assert(cmd);
 
@@ -1082,9 +1084,10 @@ handle_io_read(struct muser_ctrlr *ctrlr, struct io_q *q,
 	}
 
 	assert(q);
-	ctrlr->qp[io_q_id(q)].cmd = cmd;
+	qp = &ctrlr->qp[io_q_id(q)];
+	qp->cmd = cmd;
 	spdk_wmb();
-	ctrlr->prop_req.dir = MUSER_NVMF_READ;
+	qp->prop_req.dir = MUSER_NVMF_READ;
 
 	return 0;
 }
@@ -1323,11 +1326,11 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	case ADMIN_QUEUES:
 		return admin_queue_write(ctrlr, buf, count, pos);
 	case CC:
-		ctrlr->prop_req.buf = buf;
-		ctrlr->prop_req.count = count;
-		ctrlr->prop_req.pos = pos;
+		ctrlr->qp[0].prop_req.buf = buf;
+		ctrlr->qp[0].prop_req.count = count;
+		ctrlr->qp[0].prop_req.pos = pos;
 		spdk_wmb();
-		ctrlr->prop_req.dir = MUSER_NVMF_WRITE;
+		ctrlr->qp[0].prop_req.dir = MUSER_NVMF_WRITE;
 		break;
 	default:
 		if (pos >= DOORBELLS) {
@@ -1345,14 +1348,14 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	}
 
 	do {
-		err = sem_wait(&ctrlr->prop_req.wait);
+		err = sem_wait(&ctrlr->qp[0].prop_req.wait);
 	} while (err != 0 && errno != EINTR);
 
 	if (pos == SQ0TBDL) {
 		admin_queue_complete(ctrlr, ctrlr->qp[0].cmd);
 	}
 
-	return ctrlr->prop_req.ret;
+	return ctrlr->qp[0].prop_req.ret;
 }
 
 static ssize_t
@@ -1556,7 +1559,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	memcpy(muser_ctrlr->uuid, trid->traddr, sizeof(muser_ctrlr->uuid));
 	memcpy(&muser_ctrlr->trid, trid, sizeof(muser_ctrlr->trid));
 
-	err = sem_init(&muser_ctrlr->prop_req.wait, 0, 0);
+	err = sem_init(&muser_ctrlr->qp[0].prop_req.wait, 0, 0);
 	if (err) {
 		goto err_free_dev;
 	}
@@ -1757,8 +1760,8 @@ muser_req_done(struct spdk_nvmf_request *req)
 			int err;
 			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
 				      "fabric connect command completed\n");
-			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "sem_post %p\n", &muser_qpair->ctrlr->prop_req.wait);
-			err = sem_post(&muser_qpair->ctrlr->prop_req.wait);
+			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "sem_post %p\n", &muser_qpair->prop_req.wait);
+			err = sem_post(&muser_qpair->prop_req.wait);
 			if (err) {
 				SPDK_ERRLOG("failed to sem_post: %m\n");
 			}
@@ -1824,15 +1827,15 @@ handle_req(struct muser_qpair *muser_qpair)
 	} else {
 		req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 		req->cmd->prop_set_cmd.cid = 0;
-		if (muser_qpair->ctrlr->prop_req.dir == MUSER_NVMF_WRITE) {
+		if (muser_qpair->prop_req.dir == MUSER_NVMF_WRITE) {
 			req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
 			req->cmd->prop_set_cmd.value.u32.high = 0;
-			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)muser_qpair->ctrlr->prop_req.buf;
+			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)muser_qpair->prop_req.buf;
 		} else {
 			req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
 		}
-		req->cmd->prop_set_cmd.attrib.size = (muser_qpair->ctrlr->prop_req.count / 4) - 1;
-		req->cmd->prop_set_cmd.ofst = muser_qpair->ctrlr->prop_req.pos;
+		req->cmd->prop_set_cmd.attrib.size = (muser_qpair->prop_req.count / 4) - 1;
+		req->cmd->prop_set_cmd.ofst = muser_qpair->prop_req.pos;
 		req->length = 0;
 		req->data = NULL;
 	}
@@ -1847,14 +1850,14 @@ handle_req(struct muser_qpair *muser_qpair)
 	if (muser_qpair->cmd) {
 		/* FIXME we must now queue the response, either here or in write_bar0 */
 		;
-	} else if (muser_qpair->ctrlr->prop_req.dir == MUSER_NVMF_READ) {
-		memcpy(muser_qpair->ctrlr->prop_req.buf,
+	} else if (muser_qpair->prop_req.dir == MUSER_NVMF_READ) {
+		memcpy(muser_qpair->prop_req.buf,
 		       &req->rsp->prop_get_rsp.value.u64,
-		       muser_qpair->ctrlr->prop_req.count);
+		       muser_qpair->prop_req.count);
 	}
 
-	muser_qpair->ctrlr->prop_req.dir = MUSER_NVMF_INVALID;
-	return sem_post(&muser_qpair->ctrlr->prop_req.wait);
+	muser_qpair->prop_req.dir = MUSER_NVMF_INVALID;
+	return sem_post(&muser_qpair->prop_req.wait);
 }
 
 /*
@@ -1877,7 +1880,7 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	TAILQ_FOREACH(muser_qpair, &muser_group->qps, link) {
 		spdk_rmb();
 		/* FIXME this is a queue of size 1, needs to change */
-		if (muser_qpair->ctrlr->prop_req.dir != MUSER_NVMF_INVALID) {
+		if (muser_qpair->prop_req.dir != MUSER_NVMF_INVALID) {
 			err = handle_req(muser_qpair);
 			assert(err == 0);
 			(void)err;
