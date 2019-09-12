@@ -1794,21 +1794,26 @@ static void
 muser_close_qpair(struct spdk_nvmf_qpair *qpair)
 { }
 
+static struct spdk_nvmf_request*
+get_nvmf_req(struct muser_qpair *qp)
+{
+	struct muser_req *muser_req;
+
+	assert(qp);
+
+	muser_req = TAILQ_FIRST(&qp->reqs);
+	TAILQ_REMOVE(&qp->reqs, muser_req, link);
+	return &muser_req->req;
+}
+
 static int
 handle_req(struct muser_qpair *muser_qpair)
 {
 	struct spdk_nvmf_request *req;
-	struct muser_req *muser_req;
 
 	assert(muser_qpair);
 
-	/*
-	 * FIXME move this into a function, muser_req is not referenced again
-	 */
-	muser_req = TAILQ_FIRST(&muser_qpair->reqs);
-	TAILQ_REMOVE(&muser_qpair->reqs, muser_req, link);
-
-	req = &muser_req->req;
+	req = get_nvmf_req(muser_qpair);
 
 	if (muser_qpair->cmd) {
 		/* FIXME figure out how to initialize this field. */
