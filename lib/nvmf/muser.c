@@ -120,7 +120,7 @@ struct io_q {
 	 *
 	 * FIXME ID can be found in muser_qpair.qpair.qid
 	 */
-	uint16_t id;
+	bool is_cq;
 
 	void *addr;
 
@@ -159,6 +159,33 @@ struct muser_qpair {
 	TAILQ_HEAD(, muser_req)			reqs;
 	TAILQ_ENTRY(muser_qpair)		link;
 };
+
+/*
+ * XXX We need a way to extract the queue ID from an io_q, which is already
+ * available in muser_qpair->qpair.qid. Currently we stored the type of the
+ * queue within the queue, so retrieving the QID requires a comparison. Rather
+ * than duplicating this information in struct io_q, we could store a pointer
+ * to parent struct muser_qpair, however we would be using 8 bytes instead of
+ * just 2 (uint16_t vs. pointer). This is only per-queue so it's not that bad.
+ * Another approach is to define two types: struct io_cq { struct io_q q }; and
+ * struct io_sq { struct io_q q; };. The downside would be that we would need
+ * two almost identical functions to extract the QID.
+ */
+static uint16_t
+io_q_id(struct io_q *q) {
+
+	struct muser_qpair *muser_qpair;
+
+	assert(q);
+
+	if (q->is_cq) {
+		muser_qpair = SPDK_CONTAINEROF(q, struct muser_qpair, cq);
+	} else {
+		muser_qpair = SPDK_CONTAINEROF(q, struct muser_qpair, sq);
+	}
+	assert(muser_qpair);
+	return muser_qpair->qpair.qid;
+}
 
 struct muser_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
@@ -509,17 +536,18 @@ sq_tail_advance(struct muser_ctrlr const *d, struct io_q *q)
 }
 
 static void
-insert_queue(struct muser_ctrlr *ctrlr, struct io_q const *q,
-	     const bool is_cq)
+insert_queue(struct muser_ctrlr *ctrlr, struct io_q *q,
+	     const bool is_cq, const uint16_t id)
 {
 
 	assert(ctrlr);
 	assert(q);
 
+	q->is_cq = is_cq;
 	if (is_cq) {
-		ctrlr->qp[q->id].cq = *q;
+		ctrlr->qp[id].cq = *q;
 	} else {
-		ctrlr->qp[q->id].sq = *q;
+		ctrlr->qp[id].sq = *q;
 	}
 }
 
@@ -533,7 +561,6 @@ asq_map(struct muser_ctrlr *d)
 	/* XXX ctrlr->regs.asq == 0 is a valid memory address */
 
 	q.size = d->regs.aqa.bits.asqs + 1;
-	q.id = 0;
 	q.sq.old_tail = 0;
 	q.sq.head = q.sq.tdbl = 0;
 	q.sq.cqid = 0;
@@ -542,7 +569,7 @@ asq_map(struct muser_ctrlr *d)
 	if (!q.addr) {
 		return -1;
 	}
-	insert_queue(d, &q, false);
+	insert_queue(d, &q, false, 0);
 	return 0;
 }
 
@@ -580,14 +607,13 @@ acq_map(struct muser_ctrlr *d)
 	assert(d->regs.acq);
 
 	q.size = d->regs.aqa.bits.acqs + 1;
-	q.id = 0;
 	q.cq.tail = 0;
 	q.addr = map_one(d->lm_ctx, d->regs.acq,
 			 q.size * sizeof(struct spdk_nvme_cpl));
 	if (!q.addr) {
 		return -1;
 	}
-	insert_queue(d, &q, true);
+	insert_queue(d, &q, true, 0);
 	return 0;
 }
 
@@ -915,7 +941,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	union spdk_nvme_create_io_cq_cdw11 *cdw11_cq = NULL;
 	union spdk_nvme_create_io_sq_cdw11 *cdw11_sq = NULL;
 	size_t entry_size;
-	struct io_q io_q = { 0 };
+	struct io_q io_q = { 0 }; /* XXX don't call io_q_id on this */
 
 	assert(ctrlr);
 	assert(cmd);
@@ -958,7 +984,6 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		io_q.sq.cqid = cdw11_sq->bits.cqid;
 	}
 
-	io_q.id = cdw10->bits.qid;
 	io_q.size = cdw10->bits.qsize + 1;
 	if (io_q.size > max_queue_size(ctrlr)) {
 		SPDK_ERRLOG("queue too big, want=%d, max=%d\n", io_q.size,
@@ -979,7 +1004,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 			   MUSER_DEFAULT_MAX_QUEUE_DEPTH);
 	}
 
-	insert_queue(ctrlr, &io_q, is_cq);
+	insert_queue(ctrlr, &io_q, is_cq, cdw10->bits.qid);
 
 	/*
 	 * FIXME we need to complete the admin request when we hear back from
@@ -1057,7 +1082,7 @@ handle_io_read(struct muser_ctrlr *ctrlr, struct io_q *q,
 	}
 
 	assert(q);
-	ctrlr->qp[q->id].cmd = cmd;
+	ctrlr->qp[io_q_id(q)].cmd = cmd;
 	spdk_wmb();
 	ctrlr->prop_req.dir = MUSER_NVMF_READ;
 
@@ -1082,7 +1107,7 @@ static int
 consume_req(struct muser_ctrlr *d, struct io_q *q,
 	    struct spdk_nvme_cmd *cmd)
 {
-	if (q->id == 0) {
+	if (io_q_id(q) == 0) {
 		return consume_admin_req(d, cmd);
 	}
 	return consume_io_req(d, q, cmd);
@@ -1142,14 +1167,14 @@ handle_sq_tdbl_write(struct muser_ctrlr *d, const uint32_t new_tail,
 	assert(d);
 	assert(q);
 
-	SPDK_NOTICELOG("write to SQ%d tail=0x%x\n", q->id, new_tail);
+	SPDK_NOTICELOG("write to SQ%d tail=0x%x\n", io_q_id(q), new_tail);
 
 	/*
 	 * TODO we should be mapping the queue when ASQ gets written, however
 	 * the NVMe driver writes it in two steps and this complicates things,
 	 * e.g. is it guaranteed to write both upper and lower portions?
 	 */
-	if (q->id == 0 && !d->qp[0].sq.addr) {
+	if (io_q_id(q) == 0 && !d->qp[0].sq.addr) {
 		/* FIXME do this when EN is set to one */
 		int ret = asq_map(d);
 		if (ret) {
@@ -1172,7 +1197,7 @@ handle_cq_hdbl_write(struct muser_ctrlr *d, const uint32_t new_head,
 	 * FIXME is there anything we need to do with the new CQ0 head?
 	 * Incrementing the head means the host consumed completions, right?
 	 */
-	SPDK_NOTICELOG("write to CQ%d head=0x%x\n", q->id, new_head);
+	SPDK_NOTICELOG("write to CQ%d head=0x%x\n", io_q_id(q), new_head);
 	/* FIXME */
 	q->cq.hdbl = new_head;
 	return 0;
