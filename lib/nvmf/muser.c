@@ -1144,8 +1144,12 @@ handle_io_read(struct muser_ctrlr *ctrlr, struct io_q *q,
 
 	assert(q);
 	qp = &ctrlr->qp[io_q_id(q)];
+	while (qp->cmd != NULL) { /* FIXME wait for previous request to finish */
+		spdk_rmb();
+	}
 	qp->cmd = cmd;
 	spdk_wmb();
+	/* handle_req will pick up this request now */
 	qp->prop_req.dir = MUSER_NVMF_READ;
 
 	return 0;
