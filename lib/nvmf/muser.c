@@ -612,20 +612,22 @@ cq_tail_advance(struct muser_ctrlr *d, struct io_q *q)
 static int
 acq_map(struct muser_ctrlr *d)
 {
-	struct io_q q;
+	struct io_q *q;
 
-	assert(d);
-	assert(!d->qp[0].cq.addr);
-	assert(d->regs.acq);
+	assert(d != NULL);
+	assert(d->qp[0].cq.addr == NULL);
+	assert(d->regs.acq != 0);
 
-	q.size = d->regs.aqa.bits.acqs + 1;
-	q.cq.tail = 0;
-	q.addr = map_one(d->lm_ctx, d->regs.acq,
-			 q.size * sizeof(struct spdk_nvme_cpl));
-	if (!q.addr) {
+	q = &d->qp[0].cq;
+
+	q->size = d->regs.aqa.bits.acqs + 1;
+	q->cq.tail = 0;
+	q->addr = map_one(d->lm_ctx, d->regs.acq,
+			  q->size * sizeof(struct spdk_nvme_cpl));
+	if (q->addr == NULL) {
 		return -1;
 	}
-	insert_queue(d, &q, true, 0);
+	q->is_cq = true;
 	return 0;
 }
 
