@@ -552,8 +552,8 @@ insert_queue(struct muser_ctrlr *ctrlr, struct io_q *q,
 	     const bool is_cq, const uint16_t id)
 {
 
-	assert(ctrlr);
-	assert(q);
+	assert(ctrlr != NULL);
+	assert(q != NULL);
 
 	q->is_cq = is_cq;
 	if (is_cq) {
