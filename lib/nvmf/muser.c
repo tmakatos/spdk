@@ -1123,6 +1123,11 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 		return handle_create_io_q(ctrlr, cmd, true);
 	case SPDK_NVME_OPC_CREATE_IO_SQ:
 		return handle_create_io_q(ctrlr, cmd, false);
+	/* FIXME need to queue completion response */
+	case SPDK_NVME_OPC_ABORT:
+	case SPDK_NVME_OPC_DELETE_IO_SQ:
+	case SPDK_NVME_OPC_DELETE_IO_CQ:
+		return 0;
 	default:
 		SPDK_ERRLOG("unsupported command 0x%x\n", cmd->opc);
 		return -1;
