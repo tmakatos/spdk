@@ -302,7 +302,7 @@ mdev_create(const char *uuid)
 }
 
 static ssize_t
-read_cap(struct muser_ctrlr const *ctrlr, char *buf,
+read_nvme_cap(struct muser_ctrlr const *ctrlr, char *buf,
 	 const size_t count, loff_t pos)
 {
 	/*
@@ -318,7 +318,7 @@ read_cap(struct muser_ctrlr const *ctrlr, char *buf,
 }
 
 static bool
-is_cap(const loff_t pos)
+is_nvme_cap(const loff_t pos)
 {
 	const size_t off = offsetof(struct spdk_nvme_registers, cap);
 	return (size_t)pos >= off && (size_t)pos < off + sizeof(uint64_t);
@@ -337,11 +337,11 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		       muser_ctrlr, count, pos);
 
 	/*
-	 * CAP is 8 bytes long however the driver reads it 4 bytes at a time.
-	 * NVMf doesn't like this.
+	 * NVMe CAP is 8 bytes long however the driver reads it 4 bytes at a
+	 * time. NVMf doesn't like this.
 	 */
-	if (is_cap(pos)) {
-		return read_cap(muser_ctrlr, buf, count, pos);
+	if (is_nvme_cap(pos)) {
+		return read_nvme_cap(muser_ctrlr, buf, count, pos);
 	}
 
 	muser_ctrlr->qp[0].prop_req.buf = buf;
