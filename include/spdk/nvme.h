@@ -2663,6 +2663,10 @@ int spdk_nvme_cuse_register(struct spdk_nvme_ctrlr *ctrlr, const char *dev_path)
  */
 void spdk_nvme_cuse_unregister(struct spdk_nvme_ctrlr *ctrlr);
 
+int spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
+                   uint32_t len, size_t mps,
+                   void* (*gpa_to_vva)(void* prv, uint64_t addr, uint64_t len));
+
 #ifdef __cplusplus
 }
 #endif
