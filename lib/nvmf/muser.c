@@ -33,6 +33,8 @@
 #include <muser/muser.h>
 #include <muser/caps/pm.h>
 #include <muser/caps/px.h>
+#include <muser/caps/msi.h>
+#include <muser/caps/msix.h>
 
 #include "spdk/barrier.h"
 #include "spdk/stdinc.h"
@@ -81,6 +83,7 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define NVME_REG_BAR0_SIZE      0x4000
 
 #define NVME_IRQ_INTX_NUM       1
+#define NVME_IRQ_MSI_NUM       	2
 #define NVME_IRQ_MSIX_NUM       32
 
 enum muser_nvmf_dir {
@@ -204,6 +207,8 @@ struct muser_ctrlr {
 
 	/* PCI capabilities */
 	struct pmcap				pmcap;
+	struct msicap				msicap;
+	struct msixcap				msixcap;
 	struct pxcap				pxcap;
 
 	uint16_t				cntlid;
@@ -1474,8 +1479,8 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 }
 
 static ssize_t
-pmcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
-             loff_t offset, const bool is_write)
+pmcap_access(void *pvt, const uint8_t id, char * const buf, const size_t count,
+             const loff_t offset, const bool is_write)
 {
 	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
 
@@ -1488,13 +1493,344 @@ pmcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
 }
 
 static ssize_t
+handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc * const mxc)
+{
+	uint16_t n;
+
+	assert(ctrlr != NULL);
+	assert(mxc != NULL);
+
+	/*
+	 * FIXME we get a write of 0x03, which seems bogus as it touches the RO
+	 * part of MXC (only fm and ts are R/W). Need to figure out what's going
+	 * on.
+	 */
+	n = ~(PCI_MSIX_FLAGS_MASKALL | PCI_MSIX_FLAGS_ENABLE) & *((uint16_t*)mxc);
+	if (n != 0) {
+		SPDK_ERRLOG("bad write 0x%x to MXC\n", n);
+		return -EINVAL;
+	}
+
+	if (mxc->mxe != ctrlr->msixcap.mxc.mxe) {
+		/*
+		 * FIXME need to check that MSI enable bit is set to 0 before
+		 * enabling MSI-X.
+		 */
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s MSI-X\n",
+		              mxc->mxe ? "enable" : "disable");
+		ctrlr->msixcap.mxc.mxe = mxc->mxe;
+	}
+
+	if (mxc->fm != ctrlr->msixcap.mxc.fm) {
+		if (mxc->fm) {
+			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "all MSI-X vectors masked\n");
+		} else {
+			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "vector's mask bit determines whether whether vector is masked");
+		}
+		ctrlr->msixcap.mxc.fm = mxc->fm;
+	}
+	return sizeof (struct mxc);
+}
+
+static ssize_t
+handle_msix_write(struct muser_ctrlr *ctrlr, char * const buf, const size_t count,
+                  const loff_t offset)
+{
+	if (count == sizeof (struct mxc)) {
+		switch (offset) {
+			case offsetof(struct msixcap, mxc):
+				return handle_mxc_write(ctrlr, (struct mxc*)buf);
+			default:
+				SPDK_ERRLOG("invalid MSI-X write offset %ld\n",
+				            offset);
+				return -EINVAL;
+		}
+	}
+	SPDK_ERRLOG("invalid MSI-X write size %lu\n", count);
+	return -EINVAL;
+}
+
+static ssize_t
+msixcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
+               loff_t offset, const bool is_write)
+{
+	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+
+	if (is_write) {
+		return handle_msix_write(ctrlr, buf, count, offset);
+	}
+
+	memcpy(buf, ((char*)&ctrlr->msixcap) + offset, count);
+
+	return count;
+}
+
+static int
+handle_msicap_mc_write(struct muser_ctrlr * const ctrlr, const struct mc * const mc)
+{
+	assert(ctrlr != NULL);
+	assert(mc != NULL);
+
+	if (mc->msie != ctrlr->msicap.mc.msie) {
+		ctrlr->msicap.mc.msie = mc->msie;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MSI %s\n",
+		              mc->msie ? "enable" : "disable");
+	}
+
+	if (mc->mmc) {
+		SPDK_ERRLOG("invalid write %d to RO register MMC (%d)\n",
+		            mc->mmc, ctrlr->msicap.mc.mmc);
+	}
+
+	if (mc->mme != ctrlr->msicap.mc.mme) {
+		ctrlr->msicap.mc.mme = mc->mme;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MME set to %d\n",
+		              ctrlr->msicap.mc.mme);
+	}
+
+	if (mc->c64) {
+		SPDK_ERRLOG("invalid write %d to RO register C64 (%d)\n",
+		            mc->c64, ctrlr->msicap.mc.c64);
+	}
+
+	if (mc->pvm) {
+		SPDK_ERRLOG("invalid write %d to RO register PVM\n", mc->pvm);
+	}
+
+	if (mc->res1) {
+		SPDK_ERRLOG("invalid write %d to RO reserved\n", mc->res1);
+	}
+
+	return 0;
+}
+
+static int
+handle_msicap_md_write(struct muser_ctrlr *ctrlr, const uint16_t data)
+{
+	assert(ctrlr != NULL);
+
+	ctrlr->msicap.md = data;
+	return 0;
+}
+
+static int
+handle_msicap_ma_write(struct muser_ctrlr *ctrlr, const struct ma * const ma)
+{
+	assert(ctrlr != NULL);
+	assert(ma != NULL);
+
+	if (ma->res1) {
+		SPDK_ERRLOG("bad write to ma\n");
+		return -EINVAL;
+	}
+	ctrlr->msicap.ma.addr = ma->addr;
+	return 0;
+}
+
+static int
+handle_msicap_mua_write(struct muser_ctrlr *ctrlr, const uint32_t uaddr)
+{
+	assert(ctrlr != NULL);
+
+	ctrlr->msicap.mua = uaddr;
+	return 0;
+}
+
+static int
+handle_msicap_mmask_write(struct muser_ctrlr *ctrlr, const uint32_t mask)
+{
+	assert(ctrlr != NULL);
+
+	ctrlr->msicap.mmask = mask;
+
+	return 0;
+}
+
+static int
+handle_msicap_mpend_write(struct muser_ctrlr *ctrlr, const uint32_t pend)
+{
+	assert(ctrlr != NULL);
+
+	ctrlr->msicap.mpend = pend;
+
+	return 0;
+}
+
+static int
+handle_msicap_write_2_bytes(struct muser_ctrlr *c, char * const b, loff_t o)
+{
+	switch (o) {
+		case offsetof(struct msicap, mc):
+			return handle_msicap_mc_write(c, (struct mc*)b);
+		case offsetof(struct msicap, md):
+			return handle_msicap_md_write(c, *(uint16_t*)b);
+
+	}
+	return -EINVAL;
+}
+
+static int
+handle_msicap_write_4_bytes(struct muser_ctrlr *c, char * const b, loff_t o)
+{
+	switch (o) {
+		case offsetof(struct msicap, ma):
+			return handle_msicap_ma_write(c, (struct ma*)b);
+		case offsetof(struct msicap, mua):
+			return handle_msicap_mua_write(c, *(uint32_t*)b);
+		case offsetof(struct msicap, mmask):
+			return handle_msicap_mmask_write(c, *(uint32_t*)b);
+		case offsetof(struct msicap, mpend):
+			return handle_msicap_mpend_write(c, *(uint32_t*)b);
+	}
+	return -EINVAL;
+}
+
+static int
+handle_msicap_write(struct muser_ctrlr *ctrlr, char * const buf, size_t count,
+                    loff_t offset)
+{
+	assert(ctrlr != NULL);
+
+	switch (count) {
+		case 2:
+			return handle_msicap_write_2_bytes(ctrlr, buf, offset);
+		case 4:
+			return handle_msicap_write_4_bytes(ctrlr, buf, offset);
+	}
+	return -EINVAL;
+}
+
+static ssize_t
+msicap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
+              loff_t offset, const bool is_write)
+{
+	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+
+	if (is_write) {
+		int err = handle_msicap_write(ctrlr, buf, count, offset);
+		if (err != 0) {
+			return err;
+		}
+	} else {
+		memcpy(buf, ((char*)&ctrlr->msicap) + offset, count);
+	}
+
+	return count;
+}
+
+static int
+handle_pxcap_pxdc_write(struct muser_ctrlr * const c, const union pxdc * const p)
+{
+	assert(c != NULL);
+	assert(p != NULL);
+
+	if (p->cere != c->pxcap.pxdc.cere) {
+		c->pxcap.pxdc.cere = p->cere;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "CERE %s\n",
+		              p->cere ? "enable" : "disable");
+	}
+
+	if (p->nfere != c->pxcap.pxdc.nfere) {
+		c->pxcap.pxdc.nfere = p->nfere;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "NFERE %s\n",
+		              p->nfere ? "enable" : "disable");
+	}
+
+	if (p->fere != c->pxcap.pxdc.fere) {
+		c->pxcap.pxdc.fere = p->fere;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "FERE %s\n",
+		              p->fere ? "enable" : "disable");
+	}
+
+	if (p->urre != c->pxcap.pxdc.urre) {
+		c->pxcap.pxdc.urre = p->urre;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "URRE %s\n",
+		              p->urre ? "enable" : "disable");
+	}
+
+	if (p->ero != c->pxcap.pxdc.ero) {
+		c->pxcap.pxdc.ero = p->ero;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "ERO %s\n",
+		              p->ero ? "enable" : "disable");
+	}
+
+	if (p->mps != c->pxcap.pxdc.mps) {
+		c->pxcap.pxdc.mps = p->mps;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MPS set to %d\n", p->mps);
+	}
+
+	if (p->ete != c->pxcap.pxdc.ete) {
+		c->pxcap.pxdc.ete = p->ete;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "ETE %s\n",
+		              p->ete ? "enable" : "disable");
+	}
+
+	if (p->pfe != c->pxcap.pxdc.pfe) {
+		c->pxcap.pxdc.pfe = p->pfe;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "PFE %s\n",
+		              p->pfe ? "enable" : "disable");
+	}
+
+	if (p->appme != c->pxcap.pxdc.appme) {
+		c->pxcap.pxdc.appme = p->appme;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "APPME %s\n",
+		              p->appme ? "enable" : "disable");
+	}
+
+	if (p->ens != c->pxcap.pxdc.ens) {
+		c->pxcap.pxdc.ens = p->ens;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "ENS %s\n",
+		              p->ens ? "enable" : "disable");
+	}
+
+	if (p->mrrs != c->pxcap.pxdc.mrrs) {
+		c->pxcap.pxdc.mrrs = p->mrrs;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MRRS set to %d\n", p->mrrs);
+	}
+
+	if (p->iflr) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "initiate function level reset\n");
+	}
+
+	return 0;
+}
+
+static int
+handle_pxcap_write_2_bytes(struct muser_ctrlr *c, char * const b, loff_t o)
+{
+	switch (o) {
+		case offsetof(struct pxcap, pxdc):
+			return handle_pxcap_pxdc_write(c, (union pxdc*)b);
+	}
+	return -EINVAL;
+}
+
+static ssize_t
+handle_pxcap_write(struct muser_ctrlr *ctrlr, char * const buf, size_t count,
+                   loff_t offset)
+{
+	int err = -EINVAL;
+	switch (count) {
+		case 2:
+			err = handle_pxcap_write_2_bytes(ctrlr, buf, offset);
+			break;
+	}
+	if (err != 0) {
+		assert(false); /* FIXME */
+		return err;
+	}
+	return count;
+}
+
+static ssize_t
 pxcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
                     loff_t offset, const bool is_write)
 {
 	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
 
-	if (is_write)
-		assert(false); /* TODO */
+	if (is_write) {
+		return handle_pxcap_write(ctrlr, buf, count, offset);
+	}
 
 	memcpy(buf, ((char*)&ctrlr->pxcap) + offset, count);
 
@@ -1526,10 +1862,15 @@ nvme_log(void *pvt, char const *msg)
 }
 
 static void
-nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
+nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr,
+                   bool en_msi, bool en_msix)
 {
-	lm_cap_t pm = {.id = PCI_CAP_ID_PM, .size = sizeof(struct pmcap), .fn = pmcap_access};
-	lm_cap_t px = {.id = PCI_CAP_ID_EXP, .size = sizeof(struct pxcap), .fn = pxcap_access};
+	static const lm_cap_t pm = {.id = PCI_CAP_ID_PM,
+                                    .size = sizeof(struct pmcap),
+	                            .fn = pmcap_access};
+	static const lm_cap_t px = {.id = PCI_CAP_ID_EXP,
+	                            .size = sizeof(struct pxcap),
+	                            .fn = pxcap_access};
 
 	assert(dev_info != NULL);
 	assert(muser_ctrlr != NULL);
@@ -1551,7 +1892,26 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 	dev_info->pci_info.cc.bcc = 0x01;
 
 	dev_info->pci_info.irq_count[LM_DEV_INTX_IRQ_IDX] = NVME_IRQ_INTX_NUM;
-	dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
+
+	dev_info->caps[dev_info->nr_caps++] = pm;
+
+	if (en_msi) {
+		static const lm_cap_t msi = {.id = PCI_CAP_ID_MSI,
+		                             .size = sizeof(struct msicap),
+		                             .fn = msicap_access};
+		dev_info->pci_info.irq_count[LM_DEV_MSI_IRQ_IDX] = NVME_IRQ_MSI_NUM;
+		dev_info->caps[dev_info->nr_caps++] = msi;
+	}
+
+	if (en_msix) {
+		static const lm_cap_t msix = {.id = PCI_CAP_ID_MSIX,
+		                              .size = sizeof(struct msixcap),
+		                              .fn = msixcap_access};
+		dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
+		dev_info->caps[dev_info->nr_caps++] = msix;
+	}
+
+	dev_info->caps[dev_info->nr_caps++] = px;
 
 	dev_info->extended = true;
 
@@ -1559,10 +1919,6 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 
 	dev_info->log = nvme_log;
 	dev_info->log_lvl = LM_DBG;
-
-	dev_info->caps[0] = pm;
-	dev_info->caps[1] = px;
-	dev_info->nr_caps = 2;
 }
 
 static void *
@@ -1611,6 +1967,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	struct muser_ctrlr *muser_ctrlr;
 	lm_dev_info_t dev_info = { 0 };
 	int err;
+	const bool en_msi = true, en_msix = false;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -1641,10 +1998,31 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	}
 
 	/* LM setup */
-	nvme_dev_info_fill(&dev_info, muser_ctrlr);
+	nvme_dev_info_fill(&dev_info, muser_ctrlr, en_msi, en_msix);
 
 	/* PM */
 	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
+
+	/* MSI */
+	if (en_msi) {	
+		muser_ctrlr->msicap.mc.mmc = 0x1;
+		muser_ctrlr->msicap.mc.c64 = 0x1;
+	}
+
+	/* MSI-X */
+	if (en_msix) {
+		/*
+		 * TODO for now we put table BIR and PBA BIR in BAR4 because
+		 * it's just easier, otherwise in order to put it in BAR0 we'd
+		 * have to figure out where exactly doorbells end.
+		 */
+		muser_ctrlr->msixcap.mxc.ts = 0x3;
+		muser_ctrlr->msixcap.mtab.tbir = 0x4;
+		muser_ctrlr->msixcap.mtab.to = 0x0;
+		muser_ctrlr->msixcap.mpba.pbir = 0x4;
+		/* FIXME 4K, need to make sure pbir can fit in a page */
+		muser_ctrlr->msixcap.mpba.pbao = (1 << 12) >> 3;
+	}
 
 	/* EXP */
 	muser_ctrlr->pxcap.pxcaps.ver = 0x2;
