@@ -324,6 +324,10 @@ is_nvme_cap(const loff_t pos)
 	return (size_t)pos >= off && (size_t)pos < off + sizeof(uint64_t);
 }
 
+static int
+handle_dbl_access(struct muser_ctrlr *ctrlr, uint8_t const *buf,
+		  const size_t count, const loff_t pos, const bool is_write);
+
 /*
  * FIXME read_bar0 and write_bar0 are very similar, merge
  */
@@ -342,6 +346,11 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	 */
 	if (is_nvme_cap(pos)) {
 		return read_nvme_cap(muser_ctrlr, buf, count, pos);
+	}
+
+	/* FIXME */
+	if (pos >= DOORBELLS) {
+		return handle_dbl_access(muser_ctrlr, buf, count,  pos, false);
 	}
 
 	muser_ctrlr->qp[0].prop_req.buf = buf;
@@ -1266,17 +1275,34 @@ is_admin_q(struct io_q const *queues, struct io_q const *q)
 }
 #endif
 
+static int
+handle_dbl_write(struct muser_ctrlr *ctrlr, const uint32_t v, struct io_q *q)
+{
+	if (q->is_cq) {
+		return handle_cq_hdbl_write(ctrlr, v, q);
+	}
+	return handle_sq_tdbl_write(ctrlr, v, q);
+}
+
+static uint32_t
+handle_dbl_read(struct io_q *q)
+{
+	if (q->is_cq) {
+		return q->cq.hdbl;
+	}
+	return q->sq.tdbl;
+}
+
 /*
  * Handles a write at offset 0x1000 or more.
  */
 static int
-handle_dbl_write(struct muser_ctrlr *ctrlr, uint8_t const *buf,
-		 const size_t count, const loff_t pos)
+handle_dbl_access(struct muser_ctrlr *ctrlr, uint8_t const *buf,
+		  const size_t count, const loff_t pos, const bool is_write)
 {
 	int err;
 	uint16_t qid;
 	bool is_cq;
-	uint32_t v;
 	struct io_q *q;
 
 	assert(ctrlr);
@@ -1300,11 +1326,11 @@ handle_dbl_write(struct muser_ctrlr *ctrlr, uint8_t const *buf,
 		return -ENOENT;
 	}
 
-	v = *(int *)buf;
-	if (is_cq) {
-		return handle_cq_hdbl_write(ctrlr, v, q);
+	if (is_write) {
+		return handle_dbl_write(ctrlr, *(int *)buf, q);
 	}
-	return handle_sq_tdbl_write(ctrlr, v, q);
+	*(uint32_t*)buf = handle_dbl_read(q);
+	return 0;
 }
 
 static ssize_t
@@ -1330,8 +1356,8 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		break;
 	default:
 		if (pos >= DOORBELLS) {
-			err = handle_dbl_write(ctrlr, buf, count,
-					       pos);
+			err = handle_dbl_access(ctrlr, buf, count,
+					       pos, true);
 			if (err <= 0) {
 				return err;
 			}
