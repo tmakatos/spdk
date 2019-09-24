@@ -2282,6 +2282,40 @@ nlb(struct spdk_nvme_cmd *cmd)
 	return 0x0000ffff & cmd->cdw12;
 }
 
+/* TODO find better name */
+static int
+handle_cmd_req(struct muser_ctrlr * ctrlr,
+               struct spdk_nvme_cmd * cmd,
+               struct spdk_nvmf_request * req)
+{
+	assert(ctrlr != NULL);
+	assert(cmd != NULL);
+	assert(req != NULL);
+
+	req->cmd->nvme_cmd = *cmd;
+	req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
+	/* FIXME figure out how to initialize this field. */
+	if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ &&
+	    !spdk_nvmf_qpair_is_admin_queue(req->qpair)) {
+		assert(is_prp(&req->cmd->nvme_cmd));
+		req->length = (nlb(&req->cmd->nvme_cmd) + 1) << 9;
+		/* FIXME prp address is still GPA, do we need to fix it? */
+		int err = muser_map_prps(ctrlr, &req->cmd->nvme_cmd,
+		                     req->iov, req->length);
+		if (err < 0) {
+			SPDK_ERRLOG("failed to map PRP: %d\n", err);
+			/* FIXME need to explicitly fail request */
+			return err;
+		}
+		req->iovcnt = err; 
+		req->data = NULL;
+	} else { /* FIXME in which case is muser_qpair->cmd == NULL? */
+		req->length = 1 << 12;
+		req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << ctrlr->regs.cc.bits.mps);
+	}
+	return 0;
+}
+
 static int
 handle_req(struct muser_qpair *muser_qpair)
 {
@@ -2292,29 +2326,11 @@ handle_req(struct muser_qpair *muser_qpair)
 
 	req = get_nvmf_req(muser_qpair);
 
-	if (muser_qpair->cmd) {
-		req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
-		req->cmd->nvme_cmd = *muser_qpair->cmd;
-		/* FIXME figure out how to initialize this field. */
-		if (muser_qpair->cmd->opc == SPDK_NVME_OPC_READ &&
-		    !spdk_nvmf_qpair_is_admin_queue(req->qpair)) {
-			assert(is_prp(muser_qpair->cmd));
-			req->length = (nlb(muser_qpair->cmd) + 1) << 9;
-			/* FIXME prp address is still GPA, do we need to fix it? */
-			err = muser_map_prps(muser_qpair->ctrlr,
-			                     &req->cmd->nvme_cmd,
-			                     req->iov, req->length);
-			if (err < 0) {
-				SPDK_ERRLOG("failed to map PRP: %d\n", err);
-				/* FIXME need to explicitly fail request */
-				return err;
-			}
-			req->iovcnt = err; 
-			req->data = NULL;
-		} else { /* FIXME in which case is muser_qpair->cmd == NULL? */
-			req->length = 1 << 12;
-			req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << muser_qpair->ctrlr->regs.cc.bits.mps);
-		}
+	if (muser_qpair->cmd != NULL) {
+		err = handle_cmd_req(muser_qpair->ctrlr, muser_qpair->cmd, req);
+		if (err != 0) {
+			return err;
+		}		
 	} else {
 		req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 		req->cmd->prop_set_cmd.cid = 0;
