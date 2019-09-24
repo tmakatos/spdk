@@ -135,6 +135,8 @@ struct io_q {
 		struct {
 			uint32_t hdbl;
 			uint32_t tail;
+			uint16_t iv;
+			bool ien;
 		} cq;
 	};
 };
@@ -964,8 +966,8 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		entry_size = sizeof(struct spdk_nvme_cpl);
 		/* FIXME implement */
 		assert(cdw11_cq->bits.pc == 0x1);
-		assert(cdw11_cq->bits.ien == 0x1);
-		assert(cdw11_cq->bits.iv == 0x0);
+		io_q.cq.ien = cdw11_cq->bits.ien;
+		io_q.cq.iv = cdw11_cq->bits.iv;
 	} else {
 		cdw11_sq = (union spdk_nvme_create_io_sq_cdw11 *)&cmd->cdw11;
 		if (!lookup_io_q(ctrlr, cdw11_sq->bits.cqid, true)) {
