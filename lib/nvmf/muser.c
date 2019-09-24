@@ -1006,7 +1006,12 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	union spdk_nvme_create_io_cq_cdw11 *cdw11_cq = NULL;
 	union spdk_nvme_create_io_sq_cdw11 *cdw11_sq = NULL;
 	size_t entry_size;
-	struct io_q io_q = { 0 }; /* XXX don't call io_q_id on this */
+
+	/*
+	 * XXX don't call io_q_id on this. Maybe operate directly on the
+	 * ctrlr->qp[id].cq/sq?
+	 */
+	struct io_q io_q = { 0 };
 
 	assert(ctrlr);
 	assert(cmd);
@@ -1047,6 +1052,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		assert(cdw11_sq->bits.pc == 0x1);
 
 		io_q.sq.cqid = cdw11_sq->bits.cqid;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "CQID=%d\n", io_q.sq.cqid);
 	}
 
 	io_q.size = cdw10->bits.qsize + 1;
@@ -1438,6 +1444,11 @@ access_bar_fn(void *pvt, char *buf, size_t count, loff_t offset,
 {
 	ssize_t ret;
 
+	/*
+	 * FIXME it doesn't make sense to have separate functions for the BAR0,
+	 * since a lot of the code is common, e.g. figuring out which doorbell
+	 * is accessed. Merge.
+	 */
 	if (is_write) {
 		ret = write_bar0(pvt, buf, count, offset);
 	} else {
@@ -1463,7 +1474,7 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
 
 	if (is_write) {
-		fprintf(stderr, "writes non supported\n");
+		fprintf(stderr, "writes not supported\n");
 		return -EINVAL;
 	}
 
@@ -1956,6 +1967,7 @@ init_pci_config_space(lm_pci_config_space_t *p)
 	p->hdr.bars[4].raw = 0x0;
 	p->hdr.bars[5].raw = 0x0;
 
+	/* enable INTx */
 	p->hdr.intr.ipin = 0x1;
 }
 
@@ -2029,7 +2041,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	muser_ctrlr->pxcap.pxdcap.per = 0x1;
 	muser_ctrlr->pxcap.pxdcap.flrc = 0x1;
 	muser_ctrlr->pxcap.pxdcap2.ctds = 0x1;
-
+	/* FIXME check PXCAPS.DPT */
 
 	muser_ctrlr->lm_ctx = lm_ctx_create(&dev_info);
 	if (muser_ctrlr->lm_ctx == NULL) {
@@ -2273,7 +2285,6 @@ handle_req(struct muser_qpair *muser_qpair)
 	req = get_nvmf_req(muser_qpair);
 
 	if (muser_qpair->cmd) {
-		/* FIXME figure out how to initialize this field. */
 		req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
 		req->cmd->nvme_cmd = *muser_qpair->cmd;
 		/* FIXME figure out how to initialize this field. */
