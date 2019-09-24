@@ -505,11 +505,12 @@ admin_queue_write(struct muser_ctrlr *ctrlr, uint8_t const *buf,
 
 /* TODO this should be a libmuser public function */
 static void *
-map_one(lm_ctx_t *ctx, const uint64_t addr, const size_t len)
+map_one(void *prv, uint64_t addr, uint64_t len)
 {
 	dma_sg_t sg[1];
 	struct iovec iov;
 	int ret;
+	lm_ctx_t *ctx = (lm_ctx_t*)prv;
 
 	ret = lm_addr_to_sg(ctx, addr, len, sg, 1);
 	if (ret != 1) {
@@ -623,24 +624,54 @@ acq_map(struct muser_ctrlr *d)
 	return 0;
 }
 
-static int
-dptr_remap(struct muser_ctrlr const *ctrlr, union spdk_nvme_dptr *dptr)
+static ssize_t
+host_mem_page_size(uint8_t mps)
 {
-	void *p;
+	/*
+	 * only 4 lower bits can be set
+	 * TODO this function could go into core SPDK
+	 */
+	if (0xf0 & mps) {
+		return -EINVAL;
+	}
+	return 1 << (12 + mps);
+}
+
+static int
+muser_map_prps(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
+               struct iovec *iov, uint32_t length)
+{
+	return spdk_nvme_map_prps(ctrlr->lm_ctx, cmd, iov, length,
+	                          host_mem_page_size(ctrlr->regs.cc.bits.mps), /* TODO don't compute this every time, store it in ctrlr */
+	                          map_one);
+}
+
+/*
+ * Maps a DPTR (currently a single page PRP) to our virtual memory.
+ */
+static int
+dptr_remap(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd, size_t size)
+{
+	struct iovec iov;
 
 	assert(ctrlr);
-	assert(dptr);
+	assert(cmd);
 
 	/* FIXME implement */
-	assert(!dptr->prp.prp2);
+	assert(!cmd->dptr.prp.prp2);
 
-	p = map_one(ctrlr->lm_ctx, dptr->prp.prp1 << ctrlr->regs.cc.bits.mps,
-		    sizeof(struct spdk_nvme_cmd));
-	if (!p) {
+	if (muser_map_prps(ctrlr, cmd, &iov, size) != 1) {
 		return -1;
 	}
-	dptr->prp.prp1 = (uint64_t)p >> ctrlr->regs.cc.bits.mps;
+	cmd->dptr.prp.prp1 = (uint64_t)iov.iov_base >> ctrlr->regs.cc.bits.mps;
 	return 0;
+}
+
+/* TODO does such a function already exist in SPDK? */
+static bool
+is_prp(struct spdk_nvme_cmd *cmd)
+{
+	return cmd->psdt == 0;
 }
 
 /* FIXME rename function, it handles more opcodes other than identify */
@@ -652,10 +683,14 @@ handle_identify_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	assert(ctrlr);
 	assert(cmd);
 
-	/* FIXME implement */
-	assert(!cmd->psdt);
+	/* FIXME ensure it's PRP, implement for SGL */
+	assert(is_prp(cmd));
 
-	err = dptr_remap(ctrlr, &cmd->dptr);
+	/*
+	 * FIXME why do we specify size sizeof(struct spdk_nvme_cmd)? Check the
+	 * spec.
+	 */
+	err = dptr_remap(ctrlr, cmd, sizeof(struct spdk_nvme_cmd));
 	if (err) {
 		SPDK_ERRLOG("failed to remap DPTR: %d\n", err);
 		return -1;
@@ -708,24 +743,24 @@ SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_sq_cdw11) == 4, "Incorrect s
  * Completes a admin request.
  */
 static int
-do_admin_queue_complete(struct muser_ctrlr *d,
-			struct spdk_nvme_cmd *cmd)
+do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
+                        struct io_q *cq)
 {
 	struct spdk_nvme_cpl *cpl;
-	struct io_q *cq0;
+	uint16_t qid;
 
 	assert(d);
 	assert(cmd);
 
-	cq0 = &d->qp[0].cq;
+	qid = io_q_id(cq);
 
-	if (cq_is_full(d, cq0)) {
-		SPDK_ERRLOG("CQ0 full (tail=%d, head=%d)\n",
-			    cq0->cq.tail, cq0->cq.hdbl);
+	if (cq_is_full(d, cq)) {
+		SPDK_ERRLOG("CQ%d full (tail=%d, head=%d)\n",
+			    qid, cq->cq.tail, cq->cq.hdbl);
 		return -1;
 	}
 
-	cpl = ((struct spdk_nvme_cpl *)cq0->addr) + cq0->cq.tail;
+	cpl = ((struct spdk_nvme_cpl *)cq->addr) + cq->cq.tail;
 
 	/*
 	 * FIXME intercept controller ID, we'll need it for converting a create
@@ -734,14 +769,18 @@ do_admin_queue_complete(struct muser_ctrlr *d,
 	 * create the I/O queues, so we'll have a chance to intercept it. This
 	 * is a hack, and racy. Fix.
 	 */
-	if (cmd->opc == SPDK_NVME_OPC_IDENTIFY) {
-		struct spdk_nvme_ctrlr_data *p = (struct spdk_nvme_ctrlr_data *)cmd->dptr.prp.prp1;
+	if (qid == 0 && cmd->opc == SPDK_NVME_OPC_IDENTIFY) {
 		if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR && !d->cntlid) {
+			struct spdk_nvme_ctrlr_data *p =
+				(struct spdk_nvme_ctrlr_data *)cmd->dptr.prp.prp1;
 			d->cntlid = p->cntlid;
+			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+			              "FIXME intercepted controlled ID %d\n",
+			              d->cntlid);
 		}
 	}
 
-	cpl->sqhd = d->qp[0].sq.sq.head;
+	cpl->sqhd = d->qp[qid].sq.sq.head;
 	cpl->cid = cmd->cid;
 	cpl->status.dnr = 0x0;
 	cpl->status.m = 0x0;
@@ -749,30 +788,45 @@ do_admin_queue_complete(struct muser_ctrlr *d,
 	cpl->status.p = ~cpl->status.p; /* FIXME */
 	cpl->status.sc = 0x0;
 
-	cq_tail_advance(d, cq0);
+	cq_tail_advance(d, cq);
+
+	if (qid != 0) {
+		/*
+		 * FIXME check STS.IS "Indicates the interrupt status of the device (‘1’ = asserted)."
+		 */
+		int err = lm_irq_trigger(d->lm_ctx, 0);
+		if (err != 0) {
+			SPDK_ERRLOG("failed to trigger interrupt: %m\n");
+			return err;
+		}
+	}
 
 	return 0;
 }
 
 /*
- * Completes a admin request, mapping the completion queue if not already done
- * so.
+ * Completes a request by placing a completion response in the completion queue.
+ * FIXME rename function this now handles completions for I/O queues as well.
  */
 static int
-admin_queue_complete(struct muser_ctrlr *ctrlr,
-		     struct spdk_nvme_cmd *cmd)
+admin_queue_complete(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
+                     struct io_q *cq)
 {
+	uint16_t qid;
+
 	assert(ctrlr);
 	assert(cmd);
 
-	if (!ctrlr->qp[0].cq.addr) {
+	qid = io_q_id(cq);
+
+	if (qid == 0 && ctrlr->qp[0].cq.addr == NULL) {
 		int ret = acq_map(ctrlr);
 		if (ret) {
 			SPDK_ERRLOG("failed to map CQ0: %d\n", ret);
 			return -1;
 		}
 	}
-	do_admin_queue_complete(ctrlr, cmd);
+	do_admin_queue_complete(ctrlr, cmd, cq); /* FIXME check return value */
 	return 0;
 }
 
@@ -1017,7 +1071,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	 * NVMf (muser_req_complete), not here.
 	 */
 
-	return admin_queue_complete(ctrlr, cmd);
+	return admin_queue_complete(ctrlr, cmd, &ctrlr->qp[0].cq);
 }
 
 /*
@@ -1069,24 +1123,13 @@ static int
 handle_io_read(struct muser_ctrlr *ctrlr, struct io_q *q,
                struct spdk_nvme_cmd *cmd)
 {
-	int err;
-	uint64_t slba;
-	uint16_t nlb;
 	struct muser_qpair *qp;
 
 	assert(cmd);
 
-	slba = (((uint64_t)cmd->cdw11) << 32) + (uint64_t)cmd->cdw10;
 
-	nlb = 0x0000ffff & cmd->cdw12;
-
-	SPDK_NOTICELOG("read MPTR=0x%lx, PRP1=0x%lx, PRP2=0x%lx, SLBA=0x%lx, NLB=0x%x\n",
-		       cmd->mptr, cmd->dptr.prp.prp1, cmd->dptr.prp.prp2, slba, nlb);
-
-	err = dptr_remap(ctrlr, &cmd->dptr);
-	if (err) {
-		return err;
-	}
+	SPDK_NOTICELOG("read MPTR=0x%lx, PRP1=0x%lx, PRP2=0x%lx\n",
+		       cmd->mptr, cmd->dptr.prp.prp1, cmd->dptr.prp.prp2);
 
 	assert(q);
 	qp = &ctrlr->qp[io_q_id(q)];
@@ -1373,8 +1416,12 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		err = sem_wait(&ctrlr->qp[0].prop_req.wait);
 	} while (err != 0 && errno != EINTR);
 
-	if (pos == SQ0TBDL) {
-		admin_queue_complete(ctrlr, ctrlr->qp[0].cmd);
+	/*
+	 * FIXME we also call admin_queue_complete at end of handle_req for
+	 * I/O reads, this started getting a bit messy.
+	 */
+	if (pos == SQ0TBDL && ctrlr->qp[0].cmd != NULL) {
+		admin_queue_complete(ctrlr, ctrlr->qp[0].cmd, &ctrlr->qp[0].cq);
 	}
 
 	return ctrlr->qp[0].prop_req.ret;
@@ -1831,10 +1878,17 @@ get_nvmf_req(struct muser_qpair *qp)
 	return &muser_req->req;
 }
 
+static uint16_t
+nlb(struct spdk_nvme_cmd *cmd)
+{
+	return 0x0000ffff & cmd->cdw12;
+}
+
 static int
 handle_req(struct muser_qpair *muser_qpair)
 {
 	struct spdk_nvmf_request *req;
+	int err;
 
 	assert(muser_qpair);
 
@@ -1844,8 +1898,26 @@ handle_req(struct muser_qpair *muser_qpair)
 		/* FIXME figure out how to initialize this field. */
 		req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
 		req->cmd->nvme_cmd = *muser_qpair->cmd;
-		req->length = 1 << 12;
-		req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << muser_qpair->ctrlr->regs.cc.bits.mps);
+		/* FIXME figure out how to initialize this field. */
+		if (muser_qpair->cmd->opc == SPDK_NVME_OPC_READ &&
+		    !spdk_nvmf_qpair_is_admin_queue(req->qpair)) {
+			assert(is_prp(muser_qpair->cmd));
+			req->length = (nlb(muser_qpair->cmd) + 1) << 9;
+			/* FIXME prp address is still GPA, do we need to fix it? */
+			err = muser_map_prps(muser_qpair->ctrlr,
+			                     &req->cmd->nvme_cmd,
+			                     req->iov, req->length);
+			if (err < 0) {
+				SPDK_ERRLOG("failed to map PRP: %d\n", err);
+				/* FIXME need to explicitly fail request */
+				return err;
+			}
+			req->iovcnt = err; 
+			req->data = NULL;
+		} else { /* FIXME in which case is muser_qpair->cmd == NULL? */
+			req->length = 1 << 12;
+			req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << muser_qpair->ctrlr->regs.cc.bits.mps);
+		}
 	} else {
 		req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 		req->cmd->prop_set_cmd.cid = 0;
@@ -1871,7 +1943,11 @@ handle_req(struct muser_qpair *muser_qpair)
 
 	if (muser_qpair->cmd) {
 		/* FIXME we must now queue the response, either here or in write_bar0 */
-		;
+		/* FIXME must use cq specified in cqid */
+		err = admin_queue_complete(muser_qpair->ctrlr, muser_qpair->cmd,
+		                           &muser_qpair->cq);
+		assert(!err);
+		muser_qpair->cmd = NULL; /* FIXME where do we free the request? */
 	} else if (muser_qpair->prop_req.dir == MUSER_NVMF_READ) {
 		memcpy(muser_qpair->prop_req.buf,
 		       &req->rsp->prop_get_rsp.value.u64,
