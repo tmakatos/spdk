@@ -118,7 +118,7 @@ struct io_q {
 	 * XXX we can trivially figure out the QID based on the offset of a
 	 * queue within the sq/cq array, however it's just faster to store it.
 	 *
-	 * FIXME move to parent struct muser_qpair?
+	 * FIXME ID can be found in muser_qpair.qpair.qid
 	 */
 	uint16_t id;
 
@@ -631,7 +631,7 @@ handle_identify_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 
 	ctrlr->qp[0].cmd = cmd;
 	spdk_wmb();
-	ctrlr->prop_req.dir = MUSER_NVMF_WRITE;
+	ctrlr->prop_req.dir = MUSER_NVMF_READ; /* FIXME shouldn't this be MUSER_NVMF_READ? */
 
 	return 0;
 }
@@ -1035,7 +1035,8 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 }
 
 static int
-handle_io_read(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
+handle_io_read(struct muser_ctrlr *ctrlr, struct io_q *q,
+               struct spdk_nvme_cmd *cmd)
 {
 	int err;
 	uint64_t slba;
@@ -1055,8 +1056,8 @@ handle_io_read(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 		return err;
 	}
 
-	/* FIXME we must use the I/O QP, not the admin one */
-	ctrlr->qp[0].cmd = cmd;
+	assert(q);
+	ctrlr->qp[q->id].cmd = cmd;
 	spdk_wmb();
 	ctrlr->prop_req.dir = MUSER_NVMF_READ;
 
@@ -1067,10 +1068,9 @@ static int
 consume_io_req(struct muser_ctrlr *d, struct io_q *q,
 	       struct spdk_nvme_cmd *cmd)
 {
-	SPDK_NOTICELOG("XXX opc=0x%x\n", cmd->opc);
 	switch (cmd->opc) {
 	case SPDK_NVME_OPC_READ:
-		return handle_io_read(d, cmd);
+		return handle_io_read(d, q, cmd);
 	default:
 		SPDK_ERRLOG("bad I/O command 0x%x\n", cmd->opc);
 		return -1;
@@ -1777,6 +1777,9 @@ handle_req(struct muser_qpair *muser_qpair)
 
 	assert(muser_qpair);
 
+	/*
+	 * FIXME move this into a function, muser_req is not referenced again
+	 */
 	muser_req = TAILQ_FIRST(&muser_qpair->reqs);
 	TAILQ_REMOVE(&muser_qpair->reqs, muser_req, link);
 
