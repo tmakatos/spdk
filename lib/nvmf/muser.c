@@ -114,12 +114,6 @@ struct muser_nvmf_prop_req {
  * for submission queues, maybe rethink this approach.
  */
 struct io_q {
-	/*
-	 * XXX we can trivially figure out the QID based on the offset of a
-	 * queue within the sq/cq array, however it's just faster to store it.
-	 *
-	 * FIXME ID can be found in muser_qpair.qpair.qid
-	 */
 	bool is_cq;
 
 	void *addr;
