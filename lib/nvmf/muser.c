@@ -1100,22 +1100,15 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	SPDK_NOTICELOG("handle admin req opc=0x%x\n", cmd->opc);
 
 	switch (cmd->opc) {
+	case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST: /* FIXME implement */
+		return 0;
 	/* TODO put all cases in order */
 	case SPDK_NVME_OPC_IDENTIFY:
 	case SPDK_NVME_OPC_SET_FEATURES:
 	case SPDK_NVME_OPC_GET_LOG_PAGE:
-	case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
 	case SPDK_NVME_OPC_NS_MANAGEMENT:
 		err = handle_identify_req(ctrlr, cmd);
 		if (!err) {
-
-			/*
-			 * FIXME This request is now probably lost.
-			 */
-			if (cmd->opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST) {
-				return 0;
-			}
-
 			return 1;
 		}
 		return err;
