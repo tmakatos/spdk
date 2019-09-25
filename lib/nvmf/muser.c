@@ -2264,10 +2264,60 @@ nlb(struct spdk_nvme_cmd *cmd)
 	return 0x0000ffff & cmd->cdw12;
 }
 
+static int
+handle_cmd_io_req(struct muser_ctrlr * ctrlr, struct spdk_nvmf_request *req)
+{
+	int err;
+	bool remap = true;
+
+	assert(ctrlr != NULL);
+	assert(req != NULL);
+
+	switch (req->cmd->nvme_cmd.opc) {
+		case SPDK_NVME_OPC_FLUSH:
+			req->xfer = SPDK_NVME_DATA_NONE;
+			remap = false;
+			break;
+		case SPDK_NVME_OPC_READ:
+			req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
+			break;
+		case SPDK_NVME_OPC_WRITE:
+			req->xfer = SPDK_NVME_DATA_HOST_TO_CONTROLLER;
+			break;
+		case SPDK_NVME_OPC_DATASET_MANAGEMENT:
+			req->xfer = SPDK_NVME_DATA_HOST_TO_CONTROLLER;
+			break;
+		default:
+			SPDK_ERRLOG("invalid I/O request type 0x%x\n",
+			            req->cmd->nvme_cmd.opc);
+			return -EINVAL;
+	}
+
+	req->data = NULL;
+	if (remap) {
+		assert(is_prp(&req->cmd->nvme_cmd));
+		req->length = (nlb(&req->cmd->nvme_cmd) + 1) << 9;
+		/* FIXME prp address is still GPA, do we need to fix it? */
+		err = muser_map_prps(ctrlr, &req->cmd->nvme_cmd, req->iov,
+		                     req->length);
+		if (err < 0) {
+			SPDK_ERRLOG("failed to map PRP: %d\n", err);
+			/* FIXME need to explicitly fail request */
+			return err;
+		}
+		req->iovcnt = err;
+		if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_DATASET_MANAGEMENT) {
+			assert(req->iovcnt == 1);
+			req->data = req->iov->iov_base;
+			req->length = req->iov->iov_len;
+		} 
+	}
+	return 0;
+}
+
 /* TODO find better name */
 static int
-handle_cmd_req(struct muser_ctrlr * ctrlr,
-               struct spdk_nvme_cmd * cmd,
+handle_cmd_req(struct muser_ctrlr * ctrlr, struct spdk_nvme_cmd * cmd,
                struct spdk_nvmf_request * req)
 {
 	assert(ctrlr != NULL);
@@ -2275,26 +2325,14 @@ handle_cmd_req(struct muser_ctrlr * ctrlr,
 	assert(req != NULL);
 
 	req->cmd->nvme_cmd = *cmd;
-	req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
 	/* FIXME figure out how to initialize this field. */
-	if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_READ &&
-	    !spdk_nvmf_qpair_is_admin_queue(req->qpair)) {
-		assert(is_prp(&req->cmd->nvme_cmd));
-		req->length = (nlb(&req->cmd->nvme_cmd) + 1) << 9;
-		/* FIXME prp address is still GPA, do we need to fix it? */
-		int err = muser_map_prps(ctrlr, &req->cmd->nvme_cmd,
-		                     req->iov, req->length);
-		if (err < 0) {
-			SPDK_ERRLOG("failed to map PRP: %d\n", err);
-			/* FIXME need to explicitly fail request */
-			return err;
-		}
-		req->iovcnt = err; 
-		req->data = NULL;
-	} else { /* FIXME in which case is muser_qpair->cmd == NULL? */
-		req->length = 1 << 12;
-		req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << ctrlr->regs.cc.bits.mps);
+	if (!spdk_nvmf_qpair_is_admin_queue(req->qpair)) {
+		return handle_cmd_io_req(ctrlr, req);
 	}
+	/* FIXME in which case is muser_qpair->cmd == NULL? */
+	req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
+	req->length = 1 << 12;
+	req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << ctrlr->regs.cc.bits.mps);
 	return 0;
 }
 
