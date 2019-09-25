@@ -1131,18 +1131,14 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 }
 
 static int
-handle_io_read(struct muser_ctrlr *ctrlr, struct io_q *q,
+consume_io_req(struct muser_ctrlr *ctrlr, struct io_q *q,
                struct spdk_nvme_cmd *cmd)
 {
 	struct muser_qpair *qp;
 
-	assert(cmd);
+	assert(cmd != NULL);
+	assert(q != NULL);
 
-
-	SPDK_NOTICELOG("read MPTR=0x%lx, PRP1=0x%lx, PRP2=0x%lx\n",
-		       cmd->mptr, cmd->dptr.prp.prp1, cmd->dptr.prp.prp2);
-
-	assert(q);
 	qp = &ctrlr->qp[io_q_id(q)];
 	while (qp->cmd != NULL) { /* FIXME wait for previous request to finish */
 		spdk_rmb();
@@ -1152,20 +1148,6 @@ handle_io_read(struct muser_ctrlr *ctrlr, struct io_q *q,
 	/* handle_req will pick up this request now */
 	qp->prop_req.dir = MUSER_NVMF_READ;
 
-	return 0;
-}
-
-static int
-consume_io_req(struct muser_ctrlr *d, struct io_q *q,
-	       struct spdk_nvme_cmd *cmd)
-{
-	switch (cmd->opc) {
-	case SPDK_NVME_OPC_READ:
-		return handle_io_read(d, q, cmd);
-	default:
-		SPDK_ERRLOG("bad I/O command 0x%x\n", cmd->opc);
-		return -1;
-	}
 	return 0;
 }
 
