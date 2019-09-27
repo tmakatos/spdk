@@ -1582,8 +1582,8 @@ handle_msicap_mc_write(struct muser_ctrlr * const ctrlr, const struct mc * const
 		              mc->msie ? "enable" : "disable");
 	}
 
-	if (mc->mmc) {
-		SPDK_ERRLOG("invalid write %d to RO register MMC (%d)\n",
+	if (mc->mmc != ctrlr->msicap.mc.mmc) {
+		SPDK_ERRLOG("invalid write %#x to RO register MMC (%#x)\n",
 		            mc->mmc, ctrlr->msicap.mc.mmc);
 	}
 
@@ -1593,13 +1593,14 @@ handle_msicap_mc_write(struct muser_ctrlr * const ctrlr, const struct mc * const
 		              ctrlr->msicap.mc.mme);
 	}
 
-	if (mc->c64) {
-		SPDK_ERRLOG("invalid write %d to RO register C64 (%d)\n",
+	if (mc->c64 != ctrlr->msicap.mc.c64) {
+		SPDK_ERRLOG("invalid write %#x to RO register C64 (%#x)\n",
 		            mc->c64, ctrlr->msicap.mc.c64);
 	}
 
-	if (mc->pvm) {
-		SPDK_ERRLOG("invalid write %d to RO register PVM\n", mc->pvm);
+	if (mc->pvm != ctrlr->msicap.mc.pvm) {
+		SPDK_ERRLOG("invalid write %#x to RO register PVM (%#x)\n",
+		            mc->pvm, ctrlr->msicap.mc.pvm);
 	}
 
 	if (mc->res1) {
