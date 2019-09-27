@@ -1589,7 +1589,7 @@ handle_msicap_mc_write(struct muser_ctrlr * const ctrlr, const struct mc * const
 
 	if (mc->mme != ctrlr->msicap.mc.mme) {
 		ctrlr->msicap.mc.mme = mc->mme;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MME set to %d\n",
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MME set to %#x\n",
 		              ctrlr->msicap.mc.mme);
 	}
 
@@ -1604,7 +1604,7 @@ handle_msicap_mc_write(struct muser_ctrlr * const ctrlr, const struct mc * const
 	}
 
 	if (mc->res1) {
-		SPDK_ERRLOG("invalid write %d to RO reserved\n", mc->res1);
+		SPDK_ERRLOG("invalid write %#x to RO reserved\n", mc->res1);
 	}
 
 	return 0;
@@ -1616,7 +1616,7 @@ handle_msicap_md_write(struct muser_ctrlr *ctrlr, const uint16_t data)
 	assert(ctrlr != NULL);
 
 	ctrlr->msicap.md = data;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MD.DATA=0x%x\n", ctrlr->msicap.md);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MD.DATA=%#x\n", ctrlr->msicap.md);
 	return 0;
 }
 
@@ -1631,7 +1631,7 @@ handle_msicap_ma_write(struct muser_ctrlr *ctrlr, const struct ma * const ma)
 		return -EINVAL;
 	}
 	ctrlr->msicap.ma.addr = ma->addr;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MA.ADDR=0x%x\n", ctrlr->msicap.ma.addr);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MA.ADDR=%#x\n", ctrlr->msicap.ma.addr);
 	return 0;
 }
 
@@ -1641,8 +1641,7 @@ handle_msicap_mua_write(struct muser_ctrlr *ctrlr, const uint32_t uaddr)
 	assert(ctrlr != NULL);
 
 	ctrlr->msicap.mua = uaddr;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MUA.UADDR=0x%x\n",
-	              ctrlr->msicap.mua);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MUA.UADDR=%#x\n", ctrlr->msicap.mua);
 	return 0;
 }
 
@@ -1652,7 +1651,7 @@ handle_msicap_mmask_write(struct muser_ctrlr *ctrlr, const uint32_t mask)
 	assert(ctrlr != NULL);
 
 	ctrlr->msicap.mmask = mask;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MMASK.MASK=0x%x\n", ctrlr->msicap.mmask);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MMASK.MASK=%#x\n", ctrlr->msicap.mmask);
 	return 0;
 }
 
@@ -1662,7 +1661,7 @@ handle_msicap_mpend_write(struct muser_ctrlr *ctrlr, const uint32_t pend)
 	assert(ctrlr != NULL);
 
 	ctrlr->msicap.mpend = pend;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MPEND.PEND=0x%x\n", ctrlr->msicap.mpend);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MPEND.PEND=%#x\n", ctrlr->msicap.mpend);
 	return 0;
 }
 
