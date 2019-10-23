@@ -1908,7 +1908,7 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr,
 		static const lm_cap_t msi = {.id = PCI_CAP_ID_MSI,
 		                             .size = sizeof(struct msicap),
 		                             .fn = msicap_access};
-		dev_info->pci_info.irq_count[LM_DEV_MSI_IRQ_IDX] = NVME_IRQ_MSI_NUM;
+		dev_info->pci_info.irq_count[LM_DEV_MSI_IRQ_IDX] = 1 << NVME_IRQ_MSI_NUM;
 		dev_info->caps[dev_info->nr_caps++] = msi;
 	}
 
