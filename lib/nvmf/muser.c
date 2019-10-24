@@ -70,7 +70,7 @@ SPDK_STATIC_ASSERT(sizeof(struct nvme_pcie_bar2) == sizeof(uint32_t), "Bad NVMe 
 
 struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 
-#define MUSER_DEFAULT_MAX_QUEUE_DEPTH 128
+#define MUSER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define MUSER_DEFAULT_AQ_DEPTH 32
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
 #define MUSER_DEFAULT_IN_CAPSULE_DATA_SIZE 0
