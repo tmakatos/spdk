@@ -751,7 +751,7 @@ SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_sq_cdw11) == 4, "Incorrect s
  */
 static int
 do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
-                        struct io_q *cq)
+                        struct io_q *cq, struct spdk_nvmf_request *req)
 {
 	struct spdk_nvme_cpl *cpl;
 	uint16_t qid;
@@ -776,14 +776,24 @@ do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
 	 * create the I/O queues, so we'll have a chance to intercept it. This
 	 * is a hack, and racy. Fix.
 	 */
-	if (qid == 0 && cmd->opc == SPDK_NVME_OPC_IDENTIFY) {
-		if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR && !d->cntlid) {
-			struct spdk_nvme_ctrlr_data *p =
-				(struct spdk_nvme_ctrlr_data *)cmd->dptr.prp.prp1;
-			d->cntlid = p->cntlid;
-			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-			              "FIXME intercepted controlled ID %d\n",
-			              d->cntlid);
+	if (qid == 0) {
+		switch (cmd->opc) {
+		case SPDK_NVME_OPC_IDENTIFY:
+			if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR && !d->cntlid) {
+				struct spdk_nvme_ctrlr_data *p =
+					(struct spdk_nvme_ctrlr_data *)cmd->dptr.prp.prp1;
+				d->cntlid = p->cntlid;
+				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+			        	      "FIXME intercepted controlled ID %d\n",
+				              d->cntlid);
+			}
+			break;
+		case SPDK_NVME_OPC_SET_FEATURES:
+			assert(req != NULL);
+			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "XXX number of queues=%#x\n",
+			              req->rsp->nvme_cpl.cdw0);
+			cpl->cdw0 = req->rsp->nvme_cpl.cdw0;
+			break;
 		}
 	}
 
@@ -817,7 +827,7 @@ do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
  */
 static int
 admin_queue_complete(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
-                     struct io_q *cq)
+                     struct io_q *cq, struct spdk_nvmf_request *req)
 {
 	uint16_t qid;
 
@@ -833,7 +843,7 @@ admin_queue_complete(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 			return -1;
 		}
 	}
-	do_admin_queue_complete(ctrlr, cmd, cq); /* FIXME check return value */
+	do_admin_queue_complete(ctrlr, cmd, cq, req); /* FIXME check return value */
 	return 0;
 }
 
@@ -1084,7 +1094,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	 * NVMf (muser_req_complete), not here.
 	 */
 
-	return admin_queue_complete(ctrlr, cmd, &ctrlr->qp[0].cq);
+	return admin_queue_complete(ctrlr, cmd, &ctrlr->qp[0].cq, NULL);
 }
 
 /*
@@ -1417,8 +1427,8 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	 * FIXME we also call admin_queue_complete at end of handle_req for
 	 * I/O reads, this started getting a bit messy.
 	 */
-	if (pos == SQ0TBDL && ctrlr->qp[0].cmd != NULL) {
-		admin_queue_complete(ctrlr, ctrlr->qp[0].cmd, &ctrlr->qp[0].cq);
+	if (pos == SQ0TBDL && ctrlr->qp[0].cmd != NULL) { /* FIXME is this only for CC? */
+		admin_queue_complete(ctrlr, ctrlr->qp[0].cmd, &ctrlr->qp[0].cq, NULL);
 	}
 
 	return ctrlr->qp[0].prop_req.ret;
@@ -2378,7 +2388,7 @@ handle_req(struct muser_qpair *muser_qpair)
 		/* FIXME we must now queue the response, either here or in write_bar0 */
 		/* FIXME must use cq specified in cqid */
 		err = admin_queue_complete(muser_qpair->ctrlr, muser_qpair->cmd,
-		                           &muser_qpair->cq);
+		                           &muser_qpair->cq, req);
 		assert(!err);
 		muser_qpair->cmd = NULL; /* FIXME where do we free the request? */
 	} else if (muser_qpair->prop_req.dir == MUSER_NVMF_READ) {
