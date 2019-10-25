@@ -1860,6 +1860,12 @@ nvme_reg_info_fill(lm_reg_info_t *reg_info)
 	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
 	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar_fn;
 
+	reg_info[LM_DEV_BAR4_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_BAR4_REG_IDX].size  = PAGE_SIZE;
+
+	reg_info[LM_DEV_BAR5_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_BAR5_REG_IDX].size  = PAGE_SIZE;
+
 	reg_info[LM_DEV_CFG_REG_IDX].flags = LM_REG_FLAG_RW;
 	reg_info[LM_DEV_CFG_REG_IDX].size  = NVME_REG_CFG_SIZE;
 	reg_info[LM_DEV_CFG_REG_IDX].fn  = access_pci_config;
@@ -1978,7 +1984,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	struct muser_ctrlr *muser_ctrlr;
 	lm_dev_info_t dev_info = { 0 };
 	int err;
-	const bool en_msi = true, en_msix = false;
+	const bool en_msi = false, en_msix = true;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -2030,9 +2036,8 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		muser_ctrlr->msixcap.mxc.ts = 0x3;
 		muser_ctrlr->msixcap.mtab.tbir = 0x4;
 		muser_ctrlr->msixcap.mtab.to = 0x0;
-		muser_ctrlr->msixcap.mpba.pbir = 0x4;
-		/* FIXME 4K, need to make sure pbir can fit in a page */
-		muser_ctrlr->msixcap.mpba.pbao = (1 << 12) >> 3;
+		muser_ctrlr->msixcap.mpba.pbir = 0x5;
+		muser_ctrlr->msixcap.mpba.pbao = 0x0;
 	}
 
 	/* EXP */
