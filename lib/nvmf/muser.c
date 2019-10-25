@@ -811,7 +811,7 @@ do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
 		/*
 		 * FIXME check STS.IS "Indicates the interrupt status of the device (‘1’ = asserted)."
 		 */
-		int err = lm_irq_trigger(d->lm_ctx, 0);
+		int err = lm_irq_trigger(d->lm_ctx, cq->cq.iv);
 		if (err != 0) {
 			SPDK_ERRLOG("failed to trigger interrupt: %m\n");
 			return err;
