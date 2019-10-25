@@ -1505,11 +1505,11 @@ handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc * const mxc)
 	assert(ctrlr != NULL);
 	assert(mxc != NULL);
 
-	/*
-	 * FIXME we get a write of 0x03, which seems bogus as it touches the RO
-	 * part of MXC (only fm and ts are R/W). Need to figure out what's going
-	 * on.
-	 */
+	/* host driver writes RO field, don't know why */
+	if (ctrlr->msixcap.mxc.ts == *(uint16_t*)mxc) {
+		goto out;
+	}
+
 	n = ~(PCI_MSIX_FLAGS_MASKALL | PCI_MSIX_FLAGS_ENABLE) & *((uint16_t*)mxc);
 	if (n != 0) {
 		SPDK_ERRLOG("bad write 0x%x to MXC\n", n);
@@ -1534,6 +1534,7 @@ handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc * const mxc)
 		}
 		ctrlr->msixcap.mxc.fm = mxc->fm;
 	}
+out:
 	return sizeof (struct mxc);
 }
 
