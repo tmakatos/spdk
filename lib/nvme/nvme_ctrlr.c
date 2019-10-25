@@ -3190,6 +3190,7 @@ spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
 
 	if (len) {
 		if (spdk_unlikely(prp2 == 0)) {
+			SPDK_ERRLOG("no PRP2\n");
 			return -1;
 		}
 
@@ -3198,6 +3199,8 @@ spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
 			iovcnt = 2;
 			vva = gpa_to_vva(prv, prp2, len);
 			if (spdk_unlikely(vva == NULL)) {
+				SPDK_ERRLOG("no VVA for %#lx, len%#x\n",
+					prp2, len);
 				return -1;
 			}
 			iovs[1].iov_base = vva;
@@ -3207,6 +3210,8 @@ spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
 			nents = (len + mps - 1) / mps;
 			vva = gpa_to_vva(prv, prp2, nents * sizeof(*prp_list));
 			if (spdk_unlikely(vva == NULL)) {
+				SPDK_ERRLOG("no VVA for %#lx, nents=%#x\n",
+					prp2, nents);
 				return -1;
 			}
 			prp_list = vva;
@@ -3215,6 +3220,8 @@ spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
 				residue_len = spdk_min(len, mps);
 				vva = gpa_to_vva(prv, prp_list[i], residue_len);
 				if (spdk_unlikely(vva == NULL)) {
+					SPDK_ERRLOG("no VVA for %#lx, residue_len=%#x\n",
+						prp_list[i], residue_len);
 					return -1;
 				}
 				iovs[i + 1].iov_base = vva;
