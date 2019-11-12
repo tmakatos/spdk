@@ -674,12 +674,14 @@ dptr_remap(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd, size_t size)
 	return 0;
 }
 
+#ifdef DEBUG
 /* TODO does such a function already exist in SPDK? */
 static bool
 is_prp(struct spdk_nvme_cmd *cmd)
 {
 	return cmd->psdt == 0;
 }
+#endif
 
 /* FIXME rename function, it handles more opcodes other than identify */
 static int
