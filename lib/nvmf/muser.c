@@ -2092,7 +2092,8 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 }
 
 static void
-muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn)
+muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn,
+             void *cb_arg)
 {
 	int err;
 	struct muser_transport *muser_transport;
@@ -2109,7 +2110,7 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn)
 
 	TAILQ_FOREACH_SAFE(qp, &muser_transport->new_qps, link, tmp) {
 		TAILQ_REMOVE(&muser_transport->new_qps, qp, link);
-		cb_fn(&qp->qpair);
+		cb_fn(&qp->qpair, NULL);
 	}
 
 	err = pthread_mutex_unlock(&muser_transport->lock);
