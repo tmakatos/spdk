@@ -3190,7 +3190,7 @@ spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
 
 	if (len) {
 		if (spdk_unlikely(prp2 == 0)) {
-			SPDK_ERRLOG("no PRP2\n");
+			SPDK_ERRLOG("no PRP2, %d remaining\n", len);
 			return -1;
 		}
 
