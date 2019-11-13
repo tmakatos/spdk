@@ -2483,12 +2483,15 @@ iscsi_pdu_hdr_op_logout(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu
 	SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "reason=%d, ITT=%x, cid=%d\n",
 		      reqh->reason, task_tag, cid);
 
-	if (reqh->reason != 0 && conn->sess->session_type == SESSION_TYPE_DISCOVERY) {
-		SPDK_ERRLOG("only logout with close the session reason can be in discovery session");
-		return SPDK_ISCSI_CONNECTION_FATAL;
-	}
-
 	if (conn->sess != NULL) {
+		if (conn->sess->session_type == SESSION_TYPE_DISCOVERY &&
+		    reqh->reason != ISCSI_LOGOUT_REASON_CLOSE_SESSION) {
+			SPDK_ERRLOG("Target can accept logout only with reason \"close the session\" "
+				    "on discovery session. %d is not acceptable reason.\n",
+				    reqh->reason);
+			return SPDK_ISCSI_CONNECTION_FATAL;
+		}
+
 		SPDK_DEBUGLOG(SPDK_LOG_ISCSI,
 			      "CmdSN=%u, ExpStatSN=%u, StatSN=%u, ExpCmdSN=%u, MaxCmdSN=%u\n",
 			      pdu->cmd_sn, ExpStatSN, conn->StatSN,
@@ -3379,7 +3382,6 @@ iscsi_pdu_hdr_op_scsi(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu)
 	uint8_t *cdb;
 	uint64_t lun;
 	uint32_t task_tag;
-	uint32_t data_len;
 	uint32_t transfer_len;
 	int R_bit, W_bit;
 	int lun_i;
@@ -3396,7 +3398,6 @@ iscsi_pdu_hdr_op_scsi(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu)
 	W_bit = reqh->write_bit;
 	lun = from_be64(&reqh->lun);
 	task_tag = from_be32(&reqh->itt);
-	data_len = pdu->data_segment_len;
 	transfer_len = from_be32(&reqh->expected_data_xfer_len);
 	cdb = reqh->cdb;
 
@@ -3462,8 +3463,8 @@ iscsi_pdu_hdr_op_scsi(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu)
 		}
 
 		/* check the ImmediateData and also pdu->data_segment_len */
-		if ((!conn->sess->ImmediateData && (data_len > 0)) ||
-		    (data_len > conn->sess->FirstBurstLength)) {
+		if ((!conn->sess->ImmediateData && (pdu->data_segment_len > 0)) ||
+		    (pdu->data_segment_len > conn->sess->FirstBurstLength)) {
 			spdk_iscsi_task_put(task);
 			return iscsi_reject(conn, pdu, ISCSI_REASON_PROTOCOL_ERROR);
 		}
