@@ -1911,14 +1911,14 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr,
 
 	dev_info->pci_info.irq_count[LM_DEV_INTX_IRQ_IDX] = NVME_IRQ_INTX_NUM;
 
-	dev_info->caps[dev_info->nr_caps++] = pm;
+	dev_info->pci_info.caps[dev_info->pci_info.nr_caps++] = pm;
 
 	if (en_msi) {
 		static const lm_cap_t msi = {.id = PCI_CAP_ID_MSI,
 		                             .size = sizeof(struct msicap),
 		                             .fn = msicap_access};
 		dev_info->pci_info.irq_count[LM_DEV_MSI_IRQ_IDX] = 1 << NVME_IRQ_MSI_NUM;
-		dev_info->caps[dev_info->nr_caps++] = msi;
+		dev_info->pci_info.caps[dev_info->pci_info.nr_caps++] = msi;
 	}
 
 	if (en_msix) {
@@ -1926,12 +1926,10 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr,
 		                              .size = sizeof(struct msixcap),
 		                              .fn = msixcap_access};
 		dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
-		dev_info->caps[dev_info->nr_caps++] = msix;
+		dev_info->pci_info.caps[dev_info->pci_info.nr_caps++] = msix;
 	}
 
-	dev_info->caps[dev_info->nr_caps++] = px;
-
-	dev_info->extended = true;
+	dev_info->pci_info.caps[dev_info->pci_info.nr_caps++] = px;
 
 	nvme_reg_info_fill(dev_info->pci_info.reg_info);
 
