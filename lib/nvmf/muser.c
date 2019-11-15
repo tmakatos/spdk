@@ -2358,6 +2358,7 @@ handle_req(struct muser_qpair *muser_qpair)
 {
 	struct spdk_nvmf_request *req;
 	int err;
+	bool reset = false;
 
 	assert(muser_qpair);
 
@@ -2369,6 +2370,20 @@ handle_req(struct muser_qpair *muser_qpair)
 			return err;
 		}		
 	} else {
+		if (muser_qpair->prop_req.pos == CC) {
+			union spdk_nvme_cc_register *cc = (union spdk_nvme_cc_register*)muser_qpair->prop_req.buf;
+			if (cc->bits.en == 0 && muser_qpair->ctrlr->qp[0].qpair.ctrlr->vcprop.cc.bits.en == 1) {
+				/*
+				 * Host driver attempts to reset (set CC.EN to 0), which isn't
+				 * supported in NVMf. We must first shutdown the controller and then set CC.EN to 0.
+				 */
+				cc->bits.en = 1;
+				cc->bits.shn = SPDK_NVME_SHN_NORMAL;
+				SPDK_NOTICELOG("shutdown controller\n");
+				reset = true;
+			} 
+		}
+again:
 		req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 		req->cmd->prop_set_cmd.cid = 0;
 		if (muser_qpair->prop_req.dir == MUSER_NVMF_WRITE) {
@@ -2402,6 +2417,26 @@ handle_req(struct muser_qpair *muser_qpair)
 		memcpy(muser_qpair->prop_req.buf,
 		       &req->rsp->prop_get_rsp.value.u64,
 		       muser_qpair->prop_req.count);
+	} else if (reset) {
+		int i;
+		union spdk_nvme_cc_register *cc = (union spdk_nvme_cc_register*)muser_qpair->prop_req.buf;
+		/* FIXME we shouldn't expect it to shutdown immediately */
+		if (muser_qpair->ctrlr->qp[0].qpair.ctrlr->vcprop.csts.bits.shst != SPDK_NVME_SHST_COMPLETE) {
+			SPDK_ERRLOG("controller didn't shutdown\n");
+			return -1;
+		}
+		/* FIXME CSTS.SHST is only set to SPDK_NVME_SHST_COMPLETE in the core NVMe */
+		muser_qpair->ctrlr->qp[0].qpair.ctrlr->vcprop.csts.bits.shst = 0;
+		cc->bits.en = 0;
+		cc->bits.shn = 0;
+		reset = false;
+		for (i = 0; i < MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+			memset(&muser_qpair->ctrlr->qp[i].sq, 0,
+			       sizeof(struct io_q));
+			memset(&muser_qpair->ctrlr->qp[i].cq, 0,
+			       sizeof(struct io_q));
+		}
+		goto again;
 	}
 
 	muser_qpair->prop_req.dir = MUSER_NVMF_INVALID;
