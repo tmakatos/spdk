@@ -706,7 +706,6 @@ handle_identify_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	assert(ctrlr);
 	assert(cmd);
 
-	/* FIXME ensure it's PRP, implement for SGL */
 	assert(is_prp(cmd));
 
 	/*
@@ -771,6 +770,35 @@ union __attribute__((packed)) spdk_nvme_del_io_q_cdw10 {
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_del_io_q_cdw10) == 4, "Incorrect size");
 
+static void
+handle_identify_ctrlr_rsp(struct muser_ctrlr *ctrlr,
+                          struct spdk_nvme_ctrlr_data *data)
+{
+	assert(ctrlr != NULL);
+	assert(data != NULL);
+
+	if (!ctrlr->cntlid) {
+		ctrlr->cntlid = data->cntlid;
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+		              "FIXME intercepted controlled ID %d\n",
+		              ctrlr->cntlid);
+	}
+	data->sgls.supported = SPDK_NVME_SGLS_NOT_SUPPORTED;
+}
+
+static void
+handle_identify_rsp(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
+{
+	assert(ctrlr != NULL);
+	assert(cmd != NULL);
+
+	if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR) {
+		handle_identify_ctrlr_rsp(ctrlr,
+		                          (struct spdk_nvme_ctrlr_data *)cmd->dptr.prp.prp1);
+	}
+}
+
+
 /*
  * Completes a admin request.
  */
@@ -805,14 +833,7 @@ do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
 	if (qid == 0) {
 		switch (cmd->opc) {
 		case SPDK_NVME_OPC_IDENTIFY:
-			if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR && !d->cntlid) {
-				struct spdk_nvme_ctrlr_data *p =
-					(struct spdk_nvme_ctrlr_data *)cmd->dptr.prp.prp1;
-				d->cntlid = p->cntlid;
-				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-			        	      "FIXME intercepted controlled ID %d\n",
-				              d->cntlid);
-			}
+			handle_identify_rsp(d, cmd);
 			break;
 		case SPDK_NVME_OPC_SET_FEATURES:
 			assert(req != NULL);
