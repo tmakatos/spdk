@@ -61,6 +61,7 @@ $valgrind $testdir/lib/bdev/part.c/part_ut
 $valgrind $testdir/lib/bdev/scsi_nvme.c/scsi_nvme_ut
 $valgrind $testdir/lib/bdev/gpt/gpt.c/gpt_ut
 $valgrind $testdir/lib/bdev/vbdev_lvol.c/vbdev_lvol_ut
+$valgrind $testdir/lib/bdev/vbdev_zone_block.c/vbdev_zone_block_ut
 
 if grep -q '#define SPDK_CONFIG_CRYPTO 1' $rootdir/include/spdk/config.h; then
 	$valgrind $testdir/lib/bdev/crypto.c/crypto_ut
@@ -189,9 +190,7 @@ if [ "$cov_avail" = "yes" ]; then
 	rm -f $UT_COVERAGE/ut_cov_base.info $UT_COVERAGE/ut_cov_test.info
 	genhtml $UT_COVERAGE/ut_cov_unit.info --output-directory $UT_COVERAGE
 	# git -C option not used for compatibility reasons
-	cd $rootdir
-	git clean -f "*.gcda"
-	cd -
+	(cd $rootdir && git clean -f "*.gcda")
 fi
 
 set +x

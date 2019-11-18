@@ -25,9 +25,29 @@ function disconnect_init()
 	$rpc_py nvmf_subsystem_add_listener nqn.2016-06.io.spdk:cnode1 -t $TEST_TRANSPORT -a $1 -s $NVMF_PORT
 }
 
+# There is an intermittent error relating to this test and Soft-RoCE. for now, just
+# skip this test if we are using rxe. TODO: get to the bottom of GitHub issue #1043
+if check_ip_is_soft_roce $NVMF_FIRST_TARGET_IP; then
+	echo "Using software RDMA, skipping the target disconnect tests."
+	exit 0
+fi
+
 timing_enter target_disconnect
 
 nvmftestinit
+
+# Test to make sure we don't segfault or access null pointers when we try to connect to
+# a discovery controller that doesn't exist yet.
+set +e
+$rootdir/examples/nvme/reconnect/reconnect -q 32 -o 4096 -w randrw -M 50 -t 10 -c 0xF \
+-r "trtype:$TEST_TRANSPORT adrfam:IPv4 traddr:$NVMF_FIRST_TARGET_IP trsvcid:$NVMF_PORT"
+# If the program crashes, the high bit of $? will be set so we will get a value in the hundreds.
+# But if the reconnect code detects errors and exits normally it will return 1.
+if [ $? != 1 ]; then
+	set -e
+	exit 1
+fi
+set -e
 
 disconnect_init $NVMF_FIRST_TARGET_IP
 

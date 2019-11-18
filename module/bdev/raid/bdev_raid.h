@@ -90,6 +90,9 @@ struct raid_base_bdev_info {
  * related to bdev_io for a raid bdev
  */
 struct raid_bdev_io {
+	/* The raid bdev associated with this IO */
+	struct raid_bdev *raid_bdev;
+
 	/* WaitQ entry, used only in waitq logic */
 	struct spdk_bdev_io_wait_entry	waitq_entry;
 
@@ -250,6 +253,27 @@ struct raid_bdev_module {
 	/* RAID level implemented by this module */
 	enum raid_level level;
 
+	/*
+	 * Called when the raid is starting, right before changing the state to
+	 * online and registering the bdev. Parameters of the bdev like blockcnt
+	 * should be set here.
+	 *
+	 * Non-zero return value will abort the startup process.
+	 */
+	int (*start)(struct raid_bdev *raid_bdev);
+
+	/*
+	 * Called when the raid is stopping, right before changing the state to
+	 * offline and unregistering the bdev. Optional.
+	 */
+	void (*stop)(struct raid_bdev *raid_bdev);
+
+	/* Handler for R/W requests */
+	void (*submit_rw_request)(struct raid_bdev_io *raid_io);
+
+	/* Handler for requests without payload (flush, unmap) */
+	void (*submit_null_payload_request)(struct raid_bdev_io *raid_io);
+
 	TAILQ_ENTRY(raid_bdev_module) link;
 };
 
@@ -266,13 +290,11 @@ __RAID_MODULE_REGISTER(__LINE__)(void)					\
 }
 
 void
-raid0_submit_rw_request(struct raid_bdev_io *raid_io);
-void
-raid0_submit_null_payload_request(struct raid_bdev_io *raid_io);
-void
 raid_bdev_base_io_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg);
 void
-raid_bdev_queue_io_wait(struct spdk_bdev_io *raid_bdev_io, uint8_t pd_idx,
-			spdk_bdev_io_wait_cb cb_fn, int ret);
+raid_bdev_queue_io_wait(struct raid_bdev_io *raid_io, struct spdk_bdev *bdev,
+			struct spdk_io_channel *ch, spdk_bdev_io_wait_cb cb_fn);
+void
+raid_bdev_io_complete(struct raid_bdev_io *raid_io, enum spdk_bdev_io_status status);
 
 #endif /* SPDK_BDEV_RAID_INTERNAL_H */

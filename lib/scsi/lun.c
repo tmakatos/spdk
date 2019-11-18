@@ -68,6 +68,12 @@ scsi_lun_has_pending_mgmt_tasks(const struct spdk_scsi_lun *lun)
 	       !TAILQ_EMPTY(&lun->mgmt_tasks);
 }
 
+static bool
+scsi_lun_has_outstanding_mgmt_tasks(const struct spdk_scsi_lun *lun)
+{
+	return !TAILQ_EMPTY(&lun->mgmt_tasks);
+}
+
 /* This check includes both pending and submitted (outstanding) tasks. */
 static bool
 scsi_lun_has_pending_tasks(const struct spdk_scsi_lun *lun)
@@ -118,6 +124,12 @@ _scsi_lun_execute_mgmt_task(struct spdk_scsi_lun *lun,
 			    struct spdk_scsi_task *task)
 {
 	TAILQ_INSERT_TAIL(&lun->mgmt_tasks, task, scsi_link);
+
+	if (lun->removed) {
+		task->response = SPDK_SCSI_TASK_MGMT_RESP_INVALID_LUN;
+		scsi_lun_complete_mgmt_task(lun, task);
+		return;
+	}
 
 	switch (task->function) {
 	case SPDK_SCSI_TASK_FUNC_ABORT_TASK:
@@ -216,21 +228,26 @@ spdk_scsi_lun_append_task(struct spdk_scsi_lun *lun, struct spdk_scsi_task *task
 	TAILQ_INSERT_TAIL(&lun->pending_tasks, task, scsi_link);
 }
 
-void
-spdk_scsi_lun_execute_tasks(struct spdk_scsi_lun *lun)
+static void
+scsi_lun_execute_tasks(struct spdk_scsi_lun *lun)
 {
 	struct spdk_scsi_task *task, *task_tmp;
-
-	if (scsi_lun_has_pending_mgmt_tasks(lun)) {
-		/* Pending IO tasks will wait for completion of existing mgmt tasks.
-		 */
-		return;
-	}
 
 	TAILQ_FOREACH_SAFE(task, &lun->pending_tasks, scsi_link, task_tmp) {
 		TAILQ_REMOVE(&lun->pending_tasks, task, scsi_link);
 		_scsi_lun_execute_task(lun, task);
 	}
+}
+
+void
+spdk_scsi_lun_execute_tasks(struct spdk_scsi_lun *lun)
+{
+	if (scsi_lun_has_pending_mgmt_tasks(lun)) {
+		/* Pending IO tasks will wait for completion of existing mgmt tasks.
+		 */
+		return;
+	}
+	scsi_lun_execute_tasks(lun);
 }
 
 static void
@@ -302,12 +319,12 @@ scsi_lun_notify_hot_remove(struct spdk_scsi_lun *lun)
 }
 
 static int
-scsi_lun_check_pending_tasks(void *arg)
+scsi_lun_check_outstanding_tasks(void *arg)
 {
 	struct spdk_scsi_lun *lun = (struct spdk_scsi_lun *)arg;
 
-	if (scsi_lun_has_pending_tasks(lun) ||
-	    scsi_lun_has_pending_mgmt_tasks(lun)) {
+	if (scsi_lun_has_outstanding_tasks(lun) ||
+	    scsi_lun_has_outstanding_mgmt_tasks(lun)) {
 		return -1;
 	}
 	spdk_poller_unregister(&lun->hotremove_poller);
@@ -321,9 +338,17 @@ _scsi_lun_hot_remove(void *arg1)
 {
 	struct spdk_scsi_lun *lun = arg1;
 
-	if (scsi_lun_has_pending_tasks(lun) ||
-	    scsi_lun_has_pending_mgmt_tasks(lun)) {
-		lun->hotremove_poller = spdk_poller_register(scsi_lun_check_pending_tasks,
+	/* If lun->removed is set, no new task can be submitted to the LUN.
+	 * Execute previously queued tasks, which will be immediately aborted.
+	 */
+	scsi_lun_execute_tasks(lun);
+
+	/* Then we only need to wait for all outstanding tasks to be completed
+	 * before notifying the upper layer about the removal.
+	 */
+	if (scsi_lun_has_outstanding_tasks(lun) ||
+	    scsi_lun_has_outstanding_mgmt_tasks(lun)) {
+		lun->hotremove_poller = spdk_poller_register(scsi_lun_check_outstanding_tasks,
 					lun, 10);
 	} else {
 		scsi_lun_notify_hot_remove(lun);

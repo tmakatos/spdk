@@ -119,6 +119,7 @@ DEPDIRS-bdev_split := $(BDEV_DEPS_CONF)
 
 DEPDIRS-bdev_compress := $(BDEV_DEPS_THREAD) reduce
 DEPDIRS-bdev_delay := $(BDEV_DEPS_THREAD)
+DEPDIRS-bdev_zone_block := $(BDEV_DEPS_THREAD)
 
 DEPDIRS-bdev_aio := $(BDEV_DEPS_CONF_THREAD)
 DEPDIRS-bdev_crypto := $(BDEV_DEPS_CONF_THREAD)
