@@ -121,6 +121,9 @@ struct io_q {
 
 	void *addr;
 
+	dma_sg_t sg;
+	struct iovec iov;
+
 	/*
 	 * FIXME move to parent struct muser_qpair? There's already qsize therenvme_config_space,
 	 * duplicate?
@@ -510,12 +513,17 @@ admin_queue_write(struct muser_ctrlr *ctrlr, uint8_t const *buf,
 
 /* TODO this should be a libmuser public function */
 static void *
-map_one(void *prv, uint64_t addr, uint64_t len)
+map_one(void *prv, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 {
-	dma_sg_t sg[1];
-	struct iovec iov;
 	int ret;
 	lm_ctx_t *ctx = (lm_ctx_t*)prv;
+
+	if (sg == NULL) {
+		sg = alloca(sizeof(*sg));
+	}
+	if (iov == NULL) {
+		iov = alloca(sizeof(*iov));
+	}
 
 	ret = lm_addr_to_sg(ctx, addr, len, sg, 1);
 	if (ret != 1) {
@@ -523,13 +531,13 @@ map_one(void *prv, uint64_t addr, uint64_t len)
 		return NULL;
 	}
 
-	ret = lm_map_sg(ctx, PROT_READ | PROT_WRITE, sg, &iov, 1);
+	ret = lm_map_sg(ctx, PROT_READ | PROT_WRITE, sg, iov, 1);
 	if (ret != 0) {
 		SPDK_ERRLOG("failed to map segment: %d\n", ret);
 		return NULL;
 	}
 
-	return iov.iov_base;
+	return iov->iov_base;
 }
 
 static uint32_t
@@ -577,7 +585,7 @@ asq_map(struct muser_ctrlr *d)
 	q.sq.head = q.sq.tdbl = 0;
 	q.sq.cqid = 0;
 	q.addr = map_one(d->lm_ctx, d->regs.asq,
-			 q.size * sizeof(struct spdk_nvme_cmd));
+			 q.size * sizeof(struct spdk_nvme_cmd), NULL, NULL);
 	if (!q.addr) {
 		return -1;
 	}
@@ -623,7 +631,7 @@ acq_map(struct muser_ctrlr *d)
 	q->size = d->regs.aqa.bits.acqs + 1;
 	q->cq.tail = 0;
 	q->addr = map_one(d->lm_ctx, d->regs.acq,
-			  q->size * sizeof(struct spdk_nvme_cpl));
+			  q->size * sizeof(struct spdk_nvme_cpl), NULL, NULL);
 	if (q->addr == NULL) {
 		return -1;
 	}
@@ -644,13 +652,19 @@ host_mem_page_size(uint8_t mps)
 	return 1 << (12 + mps);
 }
 
+static void *
+_map_one(void *prv, uint64_t addr, uint64_t len)
+{
+	return map_one(prv, addr, len, NULL, NULL);
+}
+
 static int
 muser_map_prps(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
                struct iovec *iov, uint32_t length)
 {
 	return spdk_nvme_map_prps(ctrlr->lm_ctx, cmd, iov, length,
 	                          host_mem_page_size(ctrlr->regs.cc.bits.mps), /* TODO don't compute this every time, store it in ctrlr */
-	                          map_one);
+	                          _map_one);
 }
 
 /*
@@ -748,12 +762,22 @@ union __attribute__((packed)) spdk_nvme_create_io_sq_cdw11 {
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_sq_cdw11) == 4, "Incorrect size");
 
+union __attribute__((packed)) spdk_nvme_del_io_q_cdw10 {
+	uint32_t raw;
+	struct __attribute__((packed)) {
+		uint32_t qid		: 16;
+		uint32_t reserved	: 16;
+	} bits;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_del_io_q_cdw10) == 4, "Incorrect size");
+
 /*
  * Completes a admin request.
  */
 static int
 do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
-                        struct io_q *cq, struct spdk_nvmf_request *req)
+                        struct io_q *cq, struct spdk_nvmf_request *req,
+                        uint16_t sc)
 {
 	struct spdk_nvme_cpl *cpl;
 	uint16_t qid;
@@ -805,7 +829,7 @@ do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
 	cpl->status.m = 0x0;
 	cpl->status.sct = 0x0;
 	cpl->status.p = ~cpl->status.p; /* FIXME */
-	cpl->status.sc = 0x0;
+	cpl->status.sc = sc;
 
 	cq_tail_advance(d, cq);
 
@@ -829,7 +853,8 @@ do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
  */
 static int
 admin_queue_complete(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
-                     struct io_q *cq, struct spdk_nvmf_request *req)
+                     struct io_q *cq, struct spdk_nvmf_request *req,
+                     uint16_t sc)
 {
 	uint16_t qid;
 
@@ -845,7 +870,7 @@ admin_queue_complete(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 			return -1;
 		}
 	}
-	do_admin_queue_complete(ctrlr, cmd, cq, req); /* FIXME check return value */
+	do_admin_queue_complete(ctrlr, cmd, cq, req, sc); /* FIXME check return value */
 	return 0;
 }
 
@@ -878,11 +903,25 @@ lookup_io_q(struct muser_ctrlr *ctrlr, const uint16_t qid, const bool is_cq)
 }
 
 static void
+destroy_io_q(lm_ctx_t *lm_ctx, struct io_q *q)
+{
+	if (!q) {
+		return;
+	}
+	if (q->addr) {
+		lm_unmap_sg(lm_ctx, &q->sg, &q->iov, 1);
+	}
+	memset(q, 0, sizeof(*q));
+}
+
+static void
 destroy_qp(struct muser_qpair *qp)
 {
 	if (!qp) {
 		return;
 	}
+	destroy_io_q(qp->ctrlr->lm_ctx, &qp->sq);
+	destroy_io_q(qp->ctrlr->lm_ctx, &qp->cq);
 	free(qp->reqs_internal);
 	qp->reqs_internal = NULL;
 	free(qp->cmds_internal);
@@ -1076,7 +1115,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		return -E2BIG;
 	}
 	io_q.addr = map_one(ctrlr->lm_ctx, cmd->dptr.prp.prp1,
-			    io_q.size * entry_size);
+			    io_q.size * entry_size, &io_q.sg, &io_q.iov);
 	if (!io_q.addr) {
 		SPDK_ERRLOG("failed to map I/O queue\n");
 		return -1;
@@ -1094,7 +1133,47 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	 * NVMf (muser_req_complete), not here.
 	 */
 
-	return admin_queue_complete(ctrlr, cmd, &ctrlr->qp[0].cq, NULL);
+	return admin_queue_complete(ctrlr, cmd, &ctrlr->qp[0].cq, NULL, 0);
+}
+
+/*
+ * Deletes a completion or sumbission I/O queue.
+ */
+static int
+handle_del_io_q(struct muser_ctrlr *ctrlr,
+		struct spdk_nvme_cmd *cmd, const bool is_cq)
+{
+	union spdk_nvme_del_io_q_cdw10 *cdw10;
+	struct io_q *q;
+	uint16_t sc = 0;
+
+	cdw10 = (union spdk_nvme_del_io_q_cdw10 *)&cmd->cdw10;
+
+	SPDK_NOTICELOG("delete I/O %cQ: QID=0x%x",
+		       is_cq ? 'C' : 'S', cdw10->bits.qid);
+
+	q = lookup_io_q(ctrlr, cdw10->bits.qid, is_cq);
+	if (q == NULL) {
+		SPDK_ERRLOG("%cQ%d does not exist\n", is_cq ? 'C' : 'S',
+			    cdw10->bits.qid);
+		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
+		goto out;
+	}
+
+	if (is_cq) {
+		/* SQ must have been deleted first */
+		struct io_q *sq = lookup_io_q(ctrlr, cdw10->bits.qid, false);
+		if (sq) {
+			sc = SPDK_NVME_SC_INVALID_QUEUE_DELETION;
+			goto out;
+		}
+		destroy_qp(&ctrlr->qp[cdw10->bits.qid]);
+	} else {
+		/* FIXME need to make sure there are no pending requests. */
+		destroy_io_q(ctrlr->lm_ctx, q);
+	}
+out:
+	return admin_queue_complete(ctrlr, cmd, &ctrlr->qp[0].cq, NULL, sc);
 }
 
 /*
@@ -1130,9 +1209,10 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 		return handle_create_io_q(ctrlr, cmd, false);
 	/* FIXME need to queue completion response */
 	case SPDK_NVME_OPC_ABORT:
+		return 0;
 	case SPDK_NVME_OPC_DELETE_IO_SQ:
 	case SPDK_NVME_OPC_DELETE_IO_CQ:
-		return 0;
+		return handle_del_io_q(ctrlr, cmd, cmd->opc == SPDK_NVME_OPC_DELETE_IO_CQ);
 	default:
 		SPDK_ERRLOG("unsupported command 0x%x\n", cmd->opc);
 		return -1;
@@ -1428,7 +1508,8 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	 * I/O reads, this started getting a bit messy.
 	 */
 	if (pos == SQ0TBDL && ctrlr->qp[0].cmd != NULL) { /* FIXME is this only for CC? */
-		admin_queue_complete(ctrlr, ctrlr->qp[0].cmd, &ctrlr->qp[0].cq, NULL);
+		admin_queue_complete(ctrlr, ctrlr->qp[0].cmd, &ctrlr->qp[0].cq,
+		                     NULL, 0);
 	}
 
 	return ctrlr->qp[0].prop_req.ret;
@@ -2410,7 +2491,7 @@ again:
 		/* FIXME we must now queue the response, either here or in write_bar0 */
 		/* FIXME must use cq specified in cqid */
 		err = admin_queue_complete(muser_qpair->ctrlr, muser_qpair->cmd,
-		                           &muser_qpair->cq, req);
+		                           &muser_qpair->cq, req, 0);
 		assert(!err);
 		muser_qpair->cmd = NULL; /* FIXME where do we free the request? */
 	} else if (muser_qpair->prop_req.dir == MUSER_NVMF_READ) {
