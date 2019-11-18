@@ -1204,9 +1204,8 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 		}
 		return err;
 	case SPDK_NVME_OPC_CREATE_IO_CQ:
-		return handle_create_io_q(ctrlr, cmd, true);
 	case SPDK_NVME_OPC_CREATE_IO_SQ:
-		return handle_create_io_q(ctrlr, cmd, false);
+		return handle_create_io_q(ctrlr, cmd, cmd->opc == SPDK_NVME_OPC_CREATE_IO_CQ);
 	/* FIXME need to queue completion response */
 	case SPDK_NVME_OPC_ABORT:
 		return 0;
