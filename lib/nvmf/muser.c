@@ -721,7 +721,7 @@ handle_identify_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 
 	ctrlr->qp[0].cmd = cmd;
 	spdk_wmb();
-	ctrlr->qp[0].prop_req.dir = MUSER_NVMF_READ; /* FIXME shouldn't this be MUSER_NVMF_READ? */
+	ctrlr->qp[0].prop_req.dir = MUSER_NVMF_READ;
 
 	return 0;
 }
