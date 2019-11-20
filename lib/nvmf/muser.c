@@ -1064,9 +1064,14 @@ prep_io_qp(struct muser_ctrlr *d, struct muser_qpair *qp,
 	do {
 		err = sem_wait(&d->qp[id].prop_req.wait);
 	} while (err != 0 && errno != EINTR);
-	SPDK_NOTICELOG("NVMf connected\n");
 
 	/* FIXME now we need to get the response from NVMf and pass it back */
+	if (d->qp[id].prop_req.ret != 0) {
+		SPDK_ERRLOG("NVMf failed to connect: %ld\n",
+		            d->qp[id].prop_req.ret);
+		return -1;
+	}
+	SPDK_NOTICELOG("NVMf connected\n");
 
 	return 0;
 }
@@ -1082,6 +1087,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	union spdk_nvme_create_io_cq_cdw11 *cdw11_cq = NULL;
 	union spdk_nvme_create_io_sq_cdw11 *cdw11_sq = NULL;
 	size_t entry_size;
+	uint16_t sc = 0;
 
 	/*
 	 * XXX don't call io_q_id on this. Maybe operate directly on the
@@ -1145,8 +1151,17 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	}
 
 	if (is_cq) {
-		prep_io_qp(ctrlr, &ctrlr->qp[cdw10->bits.qid], cdw10->bits.qid,
-			   MUSER_DEFAULT_MAX_QUEUE_DEPTH);
+		int err = prep_io_qp(ctrlr, &ctrlr->qp[cdw10->bits.qid],
+		                 cdw10->bits.qid,
+		                 MUSER_DEFAULT_MAX_QUEUE_DEPTH);
+		if (err != 0) {
+			/*
+			 * FIXME this doesn't seem to be honored by the host
+			 * driver.
+			 */
+			sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			goto out;
+		}
 	}
 
 	insert_queue(ctrlr, &io_q, is_cq, cdw10->bits.qid);
@@ -1155,8 +1170,8 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	 * FIXME we need to complete the admin request when we hear back from
 	 * NVMf (muser_req_complete), not here.
 	 */
-
-	return admin_queue_complete(ctrlr, cmd, &ctrlr->qp[0].cq, NULL, 0);
+out:
+	return admin_queue_complete(ctrlr, cmd, &ctrlr->qp[0].cq, NULL, sc);
 }
 
 /*
@@ -2314,29 +2329,53 @@ muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 }
 
 static void
+handle_io_q_connect_rsp(struct spdk_nvmf_request *req,
+                        struct muser_qpair *muser_qpair)
+{
+	int err;
+
+	assert(req != NULL);
+	assert(muser_qpair != NULL);
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "fabric connect command completed\n");
+	if (spdk_nvme_cpl_is_error(&req->rsp->nvme_cpl)) {
+		SPDK_ERRLOG("failed to connect\n");
+		muser_qpair->prop_req.ret = -1;
+	}
+	err = sem_post(&muser_qpair->prop_req.wait);
+	if (err) {
+		SPDK_ERRLOG("failed to sem_post: %m\n");
+	}
+}
+
+static void
+handle_connect_rsp(struct spdk_nvmf_request *req,
+                   struct muser_qpair *muser_qpair)
+{
+	assert(req != NULL);
+	assert(muser_qpair != NULL);
+
+	if (req->cmd->connect_cmd.qid != 0) {
+		handle_io_q_connect_rsp(req, muser_qpair);
+	}
+	free(req->data);
+	req->data = NULL;
+}
+
+static void
 muser_req_done(struct spdk_nvmf_request *req)
 {
 	struct muser_qpair *muser_qpair;
 	struct muser_req *muser_req;
+
+	assert(req != NULL);
 
 	muser_qpair = (struct muser_qpair *)req->qpair;
 	muser_req = (struct muser_req *)req;
 
 	if (req->cmd->connect_cmd.opcode == SPDK_NVME_OPC_FABRIC &&
 	    req->cmd->connect_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_CONNECT) {
-
-		if (req->cmd->connect_cmd.qid) {
-			int err;
-			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-				      "fabric connect command completed\n");
-			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "sem_post %p\n", &muser_qpair->prop_req.wait);
-			err = sem_post(&muser_qpair->prop_req.wait);
-			if (err) {
-				SPDK_ERRLOG("failed to sem_post: %m\n");
-			}
-		}
-		free(req->data);
-		req->data = NULL;
+		handle_connect_rsp(req, muser_qpair);
 	}
 
 	TAILQ_INSERT_TAIL(&muser_qpair->reqs, muser_req, link);
