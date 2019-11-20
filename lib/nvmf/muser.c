@@ -823,6 +823,9 @@ do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
 
 	cpl = ((struct spdk_nvme_cpl *)cq->addr) + cq->cq.tail;
 
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "request complete Q%d cid=%d status=%#x\n",
+	              qid, cmd->cid, sc);
+
 	/*
 	 * FIXME intercept controller ID, we'll need it for converting a create
 	 * I/O queue command to a fabric connect command. We assume that the
@@ -837,8 +840,6 @@ do_admin_queue_complete(struct muser_ctrlr *d, struct spdk_nvme_cmd *cmd,
 			break;
 		case SPDK_NVME_OPC_SET_FEATURES:
 			assert(req != NULL);
-			SPDK_DEBUGLOG(SPDK_LOG_MUSER, "XXX number of queues=%#x\n",
-			              req->rsp->nvme_cpl.cdw0);
 			cpl->cdw0 = req->rsp->nvme_cpl.cdw0;
 			break;
 		}
@@ -2206,6 +2207,8 @@ static int
 muser_stop_listen(struct spdk_nvmf_transport *transport,
 		  const struct spdk_nvme_transport_id *trid)
 {
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "stop listen\n");
 	return -1;
 }
 
@@ -2249,6 +2252,8 @@ muser_poll_group_create(struct spdk_nvmf_transport *transport)
 {
 	struct muser_poll_group *muser_group;
 
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "create poll group\n");
+
 	muser_group = calloc(1, sizeof(*muser_group));
 	if (muser_group == NULL) {
 		SPDK_ERRLOG("Error allocating poll group: %m");
@@ -2264,6 +2269,8 @@ static void
 muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct muser_poll_group *muser_group;
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "destroy poll group\n");
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 
@@ -2281,6 +2288,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	struct spdk_nvmf_request *req;
 	struct spdk_nvmf_fabric_connect_data *data;
 
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "add poll group\n");
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
@@ -2325,6 +2333,7 @@ static int
 muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 			struct spdk_nvmf_qpair *qpair)
 {
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "remove poll group\n");
 	return -1;
 }
 
