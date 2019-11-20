@@ -996,6 +996,8 @@ init_qp(struct muser_ctrlr *ctrlr, struct muser_qpair *qp,
 		qp->reqs_internal[i].req.cmd = &qp->cmds_internal[i];
 		TAILQ_INSERT_TAIL(&qp->reqs, &qp->reqs_internal[i], link);
 	}
+
+	err = sem_init(&qp->prop_req.wait, 0, 0);
 out:
 	if (err) {
 		destroy_qp(qp);
