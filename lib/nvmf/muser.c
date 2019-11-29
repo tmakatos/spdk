@@ -214,9 +214,6 @@ struct muser_ctrlr {
 
 	struct muser_poll_group			*muser_group;
 
-	/* NB the doorbell member is not used for the admin SQ/CQ */
-	struct spdk_nvme_registers		regs;
-
 	/* PCI capabilities */
 	struct pmcap				pmcap;
 	struct msicap				msicap;
@@ -228,6 +225,12 @@ struct muser_ctrlr {
 	struct muser_qpair			qp[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
 
 	TAILQ_ENTRY(muser_ctrlr)		link;
+
+	union spdk_nvme_cc_register		cc;
+	union spdk_nvme_aqa_register		aqa;
+	uint64_t				asq;
+	uint64_t				acq;
+
 };
 
 struct muser_transport {
@@ -451,8 +454,8 @@ aqa_write(struct muser_ctrlr *ctrlr,
 			    max_queue_size(ctrlr));
 		return -EINVAL;
 	}
-	ctrlr->regs.aqa.raw = from->raw;
-	SPDK_NOTICELOG("write to AQA %x\n", ctrlr->regs.aqa.raw);
+	ctrlr->aqa.raw = from->raw;
+	SPDK_NOTICELOG("write to AQA %x\n", ctrlr->aqa.raw);
 	return 0;
 }
 
@@ -557,9 +560,9 @@ admin_queue_write(struct muser_ctrlr *ctrlr, uint8_t const *buf,
 		return aqa_write(ctrlr,
 				 (union spdk_nvme_aqa_register *)buf);
 	case ASQ:
-		return asq_write(&ctrlr->regs.asq, buf, pos, count);
+		return asq_write(&ctrlr->asq, buf, pos, count);
 	case ACQ:
-		return acq_write(&ctrlr->regs.acq, buf, pos, count);
+		return acq_write(&ctrlr->acq, buf, pos, count);
 	default:
 		break;
 	}
@@ -634,13 +637,13 @@ asq_map(struct muser_ctrlr *d)
 
 	assert(d);
 	assert(!d->qp[0].sq.addr);
-	/* XXX ctrlr->regs.asq == 0 is a valid memory address */
+	/* XXX ctrlr->asq == 0 is a valid memory address */
 
-	q.size = d->regs.aqa.bits.asqs + 1;
+	q.size = d->aqa.bits.asqs + 1;
 	q.sq.old_tail = 0;
 	q.sq.head = q.sq.tdbl = 0;
 	q.sq.cqid = 0;
-	q.addr = map_one(d->lm_ctx, d->regs.asq,
+	q.addr = map_one(d->lm_ctx, d->asq,
 			 q.size * sizeof(struct spdk_nvme_cmd), NULL, NULL);
 	if (!q.addr) {
 		return -1;
@@ -680,13 +683,13 @@ acq_map(struct muser_ctrlr *d)
 
 	assert(d != NULL);
 	assert(d->qp[0].cq.addr == NULL);
-	assert(d->regs.acq != 0);
+	assert(d->acq != 0);
 
 	q = &d->qp[0].cq;
 
-	q->size = d->regs.aqa.bits.acqs + 1;
+	q->size = d->aqa.bits.acqs + 1;
 	q->cq.tail = 0;
-	q->addr = map_one(d->lm_ctx, d->regs.acq,
+	q->addr = map_one(d->lm_ctx, d->acq,
 			  q->size * sizeof(struct spdk_nvme_cpl), NULL, NULL);
 	if (q->addr == NULL) {
 		return -1;
@@ -719,7 +722,7 @@ muser_map_prps(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
                struct iovec *iov, uint32_t length)
 {
 	return spdk_nvme_map_prps(ctrlr->lm_ctx, cmd, iov, length,
-	                          host_mem_page_size(ctrlr->regs.cc.bits.mps), /* TODO don't compute this every time, store it in ctrlr */
+	                          host_mem_page_size(ctrlr->cc.bits.mps), /* TODO don't compute this every time, store it in ctrlr */
 	                          _map_one);
 }
 
@@ -740,7 +743,7 @@ dptr_remap(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd, size_t size)
 	if (muser_map_prps(ctrlr, cmd, &iov, size) != 1) {
 		return -1;
 	}
-	cmd->dptr.prp.prp1 = (uint64_t)iov.iov_base >> ctrlr->regs.cc.bits.mps;
+	cmd->dptr.prp.prp1 = (uint64_t)iov.iov_base >> ctrlr->cc.bits.mps;
 	return 0;
 }
 
@@ -1688,8 +1691,7 @@ write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		break;
 	default:
 		if (pos >= DOORBELLS) {
-			err = handle_dbl_access(ctrlr, buf, count,
-					       pos, true);
+			err = handle_dbl_access(ctrlr, buf, count, pos, true);
 			if (err <= 0) {
 				return err;
 			}
@@ -2690,7 +2692,7 @@ handle_cmd_req(struct muser_ctrlr * ctrlr, struct spdk_nvme_cmd * cmd,
 	/* FIXME in which case is muser_qpair->cmd == NULL? */
 	req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
 	req->length = 1 << 12;
-	req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << ctrlr->regs.cc.bits.mps);
+	req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << ctrlr->cc.bits.mps);
 	return 0;
 }
 
