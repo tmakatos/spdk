@@ -217,11 +217,12 @@ struct spdk_nvmf_fabric_auth_send_cmd {
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_fabric_auth_send_cmd) == 64, "Incorrect size");
 
+typedef uint8_t subnqn_t[256];
 struct spdk_nvmf_fabric_connect_data {
 	uint8_t		hostid[16];
 	uint16_t	cntlid;
 	uint8_t		reserved5[238];
-	uint8_t		subnqn[256];
+	subnqn_t	subnqn;
 	uint8_t		hostnqn[256];
 	uint8_t		reserved6[256];
 };
