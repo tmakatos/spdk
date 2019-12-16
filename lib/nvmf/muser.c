@@ -950,6 +950,13 @@ handle_identify_ctrlr_rsp(struct muser_ctrlr *ctrlr,
 	assert(data != NULL);
 
 	data->sgls.supported = SPDK_NVME_SGLS_NOT_SUPPORTED;
+
+	/*
+	 * Intentionally disabled, otherwise we get a
+	 * SPDK_NVME_OPC_DATASET_MANAGEMENT command we don't know how to
+	 * properly handle.
+	 */
+	data->oncs.dsm = 0;
 }
 
 static void
@@ -2771,9 +2778,6 @@ handle_cmd_io_req(struct muser_ctrlr * ctrlr, struct spdk_nvmf_request *req)
 		case SPDK_NVME_OPC_WRITE:
 			req->xfer = SPDK_NVME_DATA_HOST_TO_CONTROLLER;
 			break;
-		case SPDK_NVME_OPC_DATASET_MANAGEMENT:
-			req->xfer = SPDK_NVME_DATA_HOST_TO_CONTROLLER;
-			break;
 		default:
 			SPDK_ERRLOG("SQ%d invalid I/O request type 0x%x\n",
 			            req->qpair->qid, req->cmd->nvme_cmd.opc);
@@ -2793,11 +2797,6 @@ handle_cmd_io_req(struct muser_ctrlr * ctrlr, struct spdk_nvmf_request *req)
 			return err;
 		}
 		req->iovcnt = err;
-		if (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_DATASET_MANAGEMENT) {
-			assert(req->iovcnt == 1);
-			req->data = req->iov->iov_base;
-			req->length = req->iov->iov_len;
-		} 
 	}
 	return 0;
 }
