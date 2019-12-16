@@ -1059,12 +1059,7 @@ lookup_io_q(struct muser_ctrlr *ctrlr, const uint16_t qid, const bool is_cq)
 		q = &ctrlr->qp[qid]->sq;
 	}
 
-	/*
-	 * XXX ASQ and ACQ are lazily mapped, see relevant comment in
-	 * handle_sq0tdbl_write
-	 * FIXME is this comment correct now?
-	 */
-	if (q->addr == NULL && qid != 0) {
+	if (q->addr == NULL) {
 		return NULL;
 	}
 
