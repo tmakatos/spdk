@@ -973,9 +973,6 @@ handle_identify_rsp(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 
 /*
  * Completes a admin request.
- *
- * FIXME must be using CQ specified in SQ, as multiple SQs might share the same
- * CQ.
  */
 static int
 post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
@@ -1388,8 +1385,7 @@ out:
 /*
  * XXX SPDK thread
  *
- * Returns >0 if the request requires spdk_nvmf_request_exec, 0 if no further
- * action is needed, and -errno on error.
+ * Returns 0 on success and -errno on error.
  */
 static int
 consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
@@ -1457,8 +1453,7 @@ consume_io_req(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
 
 /* XXX SPDK thread
  *
- * Returns >0 if the request requires spdk_nvmf_request_exec, 0 if no further
- * action is needed, and -errno on error.
+ * Returns 0 on success and -errno on error.
  */
 static int
 consume_req(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
