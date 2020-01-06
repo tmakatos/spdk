@@ -70,6 +70,9 @@ SPDK_STATIC_ASSERT(sizeof(struct nvme_pcie_bar2) == sizeof(uint32_t), "Bad NVMe 
 
 struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 
+#define PAGE_MASK (~(PAGE_SIZE-1))
+#define PAGE_ALIGN(x) ((x + PAGE_SIZE - 1) & PAGE_MASK)
+
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define MUSER_DEFAULT_AQ_DEPTH 32
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
@@ -78,6 +81,7 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define MUSER_DEFAULT_IO_UNIT_SIZE 131072
 #define MUSER_DEFAULT_NUM_SHARED_BUFFERS 512 /* internal buf size */
 #define MUSER_DEFAULT_BUFFER_CACHE_SIZE 0
+#define MUSER_DOORBELLS_SIZE PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2)
 
 #define NVME_REG_CFG_SIZE       0x1000
 #define NVME_REG_BAR0_SIZE      0x4000
@@ -260,7 +264,7 @@ struct muser_ctrlr {
 	uint64_t				acq;
 
 	/* even indices are SQ, odd indices are CQ */
-	uint32_t				doorbells[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * 2];
+	uint32_t				*doorbells;
 };
 
 struct muser_transport {
@@ -2088,7 +2092,32 @@ pxcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
 	return count;
 }
 
+static unsigned long
+bar0_mmap(void *pvt, unsigned long off, unsigned long len)
+{
+	struct muser_ctrlr *ctrlr;
 
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "map doorbells %#lx@%#lx\n", len, off);
+
+	ctrlr = pvt;
+
+	if (off != DOORBELLS || len != MUSER_DOORBELLS_SIZE) {
+		SPDK_ERRLOG("bad map region %#lx@%#lx\n", len, off);
+		return (unsigned long)MAP_FAILED;
+	}
+
+	if (ctrlr->doorbells != NULL) {
+		goto out;
+	}
+
+	ctrlr->doorbells = lm_mmap(ctrlr->lm_ctx, off, len);
+	if (ctrlr->doorbells == NULL) {
+		SPDK_ERRLOG("failed to allocate device memory: %m\n");
+	}
+	assert(ctrlr->doorbells != NULL); /* FIXME */
+out:
+	return (unsigned long)ctrlr->doorbells;
+}
 
 static void
 nvme_reg_info_fill(lm_reg_info_t *reg_info)
@@ -2097,9 +2126,10 @@ nvme_reg_info_fill(lm_reg_info_t *reg_info)
 
 	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
 
-	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW | LM_REG_FLAG_MMAP;
 	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
 	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar_fn;
+	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
 
 	reg_info[LM_DEV_BAR4_REG_IDX].flags = LM_REG_FLAG_RW;
 	reg_info[LM_DEV_BAR4_REG_IDX].size  = PAGE_SIZE;
@@ -2291,6 +2321,11 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 	/* LM setup */
 	nvme_dev_info_fill(&dev_info, muser_ctrlr, en_msi, en_msix);
+
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
 
 	/* PM */
 	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
