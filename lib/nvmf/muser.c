@@ -901,51 +901,6 @@ handle_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	return handle_cmd_req(ctrlr, cmd, req);
 }
 
-/*
- * TODO move into nvme_spec.h and change nvme_pcie_ctrlr_cmd_create_io_cq to
- * use it, also check for other functions
- */
-union __attribute__((packed)) spdk_nvme_create_io_q_cdw10 {
-	uint32_t raw;
-	struct __attribute__((packed)) {
-		uint32_t qid	: 16;
-		uint32_t qsize	: 16;
-	} bits;
-};
-SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_q_cdw10) == 4, "Incorrect size");
-
-union __attribute__((packed)) spdk_nvme_create_io_cq_cdw11 {
-	uint32_t raw;
-	struct __attribute__((packed)) {
-		uint32_t pc		: 1;
-		uint32_t ien		: 1;
-		uint32_t reserved	: 14;
-		uint32_t iv		: 16;
-
-	} bits;
-};
-SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_cq_cdw11) == 4, "Incorrect size");
-
-union __attribute__((packed)) spdk_nvme_create_io_sq_cdw11 {
-	uint32_t raw;
-	struct __attribute__((packed)) {
-		uint32_t pc		: 1;
-		uint32_t qprio		: 2;
-		uint32_t reserved	: 13;
-		uint32_t cqid		: 16;
-	} bits;
-};
-SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_create_io_sq_cdw11) == 4, "Incorrect size");
-
-union __attribute__((packed)) spdk_nvme_del_io_q_cdw10 {
-	uint32_t raw;
-	struct __attribute__((packed)) {
-		uint32_t qid		: 16;
-		uint32_t reserved	: 16;
-	} bits;
-};
-SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_del_io_q_cdw10) == 4, "Incorrect size");
-
 static void
 handle_identify_ctrlr_rsp(struct muser_ctrlr *ctrlr,
                           struct spdk_nvme_ctrlr_data *data)
@@ -1242,9 +1197,6 @@ static int
 handle_create_io_q(struct muser_ctrlr *ctrlr,
 		   struct spdk_nvme_cmd *cmd, const bool is_cq)
 {
-	union spdk_nvme_create_io_q_cdw10 *cdw10;
-	union spdk_nvme_create_io_cq_cdw11 *cdw11_cq = NULL;
-	union spdk_nvme_create_io_sq_cdw11 *cdw11_sq = NULL;
 	size_t entry_size;
 	int err = 0;
 
@@ -1257,20 +1209,20 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	assert(ctrlr != NULL);
 	assert(cmd != NULL);
 
-	cdw10 = (union spdk_nvme_create_io_q_cdw10 *)&cmd->cdw10;
-
 	SPDK_NOTICELOG("create I/O %cQ: QID=0x%x, QSIZE=0x%x\n",
-		       is_cq ? 'C' : 'S', cdw10->bits.qid, cdw10->bits.qsize);
+		       is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid,
+	               cmd->cdw10_bits.create_io_q.qsize);
 
-	if (cdw10->bits.qid >= MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
-		SPDK_ERRLOG("invalid QID=%d, max=%d\n", cdw10->bits.qid,
+	if (cmd->cdw10_bits.create_io_q.qid >= MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
+		SPDK_ERRLOG("invalid QID=%d, max=%d\n",
+		            cmd->cdw10_bits.create_io_q.qid,
 			    MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR);
 		return -EINVAL;
 	}
 
-	if (lookup_io_q(ctrlr, cdw10->bits.qid, is_cq)) {
+	if (lookup_io_q(ctrlr, cmd->cdw10_bits.create_io_q.qid, is_cq)) {
 		SPDK_ERRLOG("%cQ%d already exists\n", is_cq ? 'C' : 'S',
-			    cdw10->bits.qid);
+			    cmd->cdw10_bits.create_io_q.qid);
 
 		/*
 		 * FIXME once this functions fails we seem to endlessly call it,
@@ -1283,26 +1235,25 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 
 	/* TODO break rest of this function into smaller functions */
 	if (is_cq) {
-		cdw11_cq = (union spdk_nvme_create_io_cq_cdw11 *)&cmd->cdw11;
 		entry_size = sizeof(struct spdk_nvme_cpl);
-		assert(cdw11_cq->bits.pc == 0x1); /* FIXME */
-		io_q.ien = cdw11_cq->bits.ien;
-		io_q.iv = cdw11_cq->bits.iv;
+		assert(cmd->cdw11_bits.create_io_cq.pc == 0x1); /* FIXME */
+		io_q.ien = cmd->cdw11_bits.create_io_cq.ien;
+		io_q.iv = cmd->cdw11_bits.create_io_cq.iv;
 	} else {
 		/* CQ must be created before SQ */
-		cdw11_sq = (union spdk_nvme_create_io_sq_cdw11 *)&cmd->cdw11;
-		if (!lookup_io_q(ctrlr, cdw11_sq->bits.cqid, true)) {
-			SPDK_ERRLOG("CQ%d does not exist\n", cdw11_sq->bits.cqid);
+		if (!lookup_io_q(ctrlr, cmd->cdw11_bits.create_io_sq.cqid, true)) {
+			SPDK_ERRLOG("CQ%d does not exist\n",
+			            cmd->cdw11_bits.create_io_sq.cqid);
 			return -ENOENT;
 		}
 		entry_size = sizeof(struct spdk_nvme_cmd);
-		assert(cdw11_sq->bits.pc == 0x1); /* FIXME */
+		assert(cmd->cdw11_bits.create_io_sq.pc == 0x1); /* FIXME */
 
-		io_q.cqid = cdw11_sq->bits.cqid;
+		io_q.cqid = cmd->cdw11_bits.create_io_sq.cqid;
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "CQID=%d\n", io_q.cqid);
 	}
 
-	io_q.size = cdw10->bits.qsize + 1;
+	io_q.size = cmd->cdw10_bits.create_io_q.qsize + 1;
 	if (io_q.size > max_queue_size(ctrlr)) {
 		SPDK_ERRLOG("queue too big, want=%d, max=%d\n", io_q.size,
 			    max_queue_size(ctrlr));
@@ -1317,12 +1268,12 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
-		             cdw10->bits.qid, cmd);
+		             cmd->cdw10_bits.create_io_q.qid, cmd);
 		assert(err == 0); /* FIXME */
 	}
 
 	/* FIXME shouldn't we do this at completion? */
-	insert_queue(ctrlr, &io_q, is_cq, cdw10->bits.qid);
+	insert_queue(ctrlr, &io_q, is_cq, cmd->cdw10_bits.create_io_q.qid);
 
 	/* For CQ the completion is posted at by handle_connect_rsp. */
 	if (!is_cq) {
@@ -1340,26 +1291,25 @@ static int
 handle_del_io_q(struct muser_ctrlr *ctrlr,
 		struct spdk_nvme_cmd *cmd, const bool is_cq)
 {
-	union spdk_nvme_del_io_q_cdw10 *cdw10;
 	struct io_q *q;
 	uint16_t sc = 0;
 
-	cdw10 = (union spdk_nvme_del_io_q_cdw10 *)&cmd->cdw10;
-
 	SPDK_NOTICELOG("delete I/O %cQ: QID=%d\n",
-		       is_cq ? 'C' : 'S', cdw10->bits.qid);
+		       is_cq ? 'C' : 'S', cmd->cdw10_bits.delete_io_q.qid);
 
-	q = lookup_io_q(ctrlr, cdw10->bits.qid, is_cq);
+	q = lookup_io_q(ctrlr, cmd->cdw10_bits.delete_io_q.qid, is_cq);
 	if (q == NULL) {
 		SPDK_ERRLOG("%cQ%d does not exist\n", is_cq ? 'C' : 'S',
-			    cdw10->bits.qid);
+			    cmd->cdw10_bits.delete_io_q.qid);
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
 		goto out;
 	}
 
 	if (is_cq) {
 		/* SQ must have been deleted first */
-		struct io_q *sq = lookup_io_q(ctrlr, cdw10->bits.qid, false);
+		struct io_q *sq = lookup_io_q(ctrlr,
+		                              cmd->cdw10_bits.delete_io_q.qid,
+		                              false);
 		if (sq) {
 			/* FIXME add error message */
 			sc = SPDK_NVME_SC_INVALID_QUEUE_DELETION;
@@ -1374,7 +1324,7 @@ handle_del_io_q(struct muser_ctrlr *ctrlr,
 		 * stopping the subsystem, so we know the relevant callbacks to
 		 * destroy the queues will be called.
 		 */
-		ctrlr->qp[cdw10->bits.qid]->del = true;
+		ctrlr->qp[cmd->cdw10_bits.delete_io_q.qid]->del = true;
 	}
 
 out:
@@ -2269,7 +2219,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	lm_dev_info_t dev_info = { 0 };
 	int err;
 	const bool en_msi = false, en_msix = true;
-	uint8_t subnqn[SPDK_NVME_NQN_FIELD_SIZE];
+	uint8_t	subnqn[SPDK_NVME_NQN_FIELD_SIZE];
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
