@@ -476,17 +476,6 @@ enum spdk_nvme_cc_ams {
 	SPDK_NVME_CC_AMS_VS		= 0x7,	/**< vendor specific */
 };
 
-/* dword 6-9: data pointer */
-union spdk_nvme_dptr {
-	struct {
-		uint64_t prp1;		/* prp entry 1 */
-		uint64_t prp2;		/* prp entry 2 */
-	} prp;
-
-	struct spdk_nvme_sgl_descriptor sgl1;
-};
-
-
 struct spdk_nvme_cmd {
 	/* dword 0 */
 	uint16_t opc	:  8;	/* opcode */
@@ -506,7 +495,14 @@ struct spdk_nvme_cmd {
 	uint64_t mptr;		/* metadata pointer */
 
 	/* dword 6-9: data pointer */
-	union spdk_nvme_dptr dptr;
+	union {
+		struct {
+			uint64_t prp1;		/* prp entry 1 */
+			uint64_t prp2;		/* prp entry 2 */
+		} prp;
+
+		struct spdk_nvme_sgl_descriptor sgl1;
+	} dptr;
 
 	/* dword 10-15 */
 	uint32_t cdw10;		/* command-specific */
