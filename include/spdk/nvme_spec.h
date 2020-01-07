@@ -356,12 +356,6 @@ struct spdk_nvme_registers {
 #define CC \
 	offsetof(struct spdk_nvme_registers, cc)
 
-#define SQ0TBDL \
-	offsetof(struct spdk_nvme_registers, doorbell[0].sq_tdbl)
-
-#define CQ0HDBL \
-	offsetof(struct spdk_nvme_registers, doorbell[0].cq_hdbl)
-
 #define DOORBELLS 0x1000
 
 /* NVMe controller register space offsets */
