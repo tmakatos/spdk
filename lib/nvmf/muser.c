@@ -516,7 +516,7 @@ aqa_write(struct muser_ctrlr *ctrlr,
 
 static void
 write_partial(uint8_t const *buf, const loff_t pos, const size_t count,
-	      const size_t reg_off, uint64_t *reg)
+	      const size_t reg_off, uint8_t *reg)
 {
 	memcpy(reg + pos - reg_off, buf, count);
 }
@@ -567,7 +567,7 @@ asq_or_acq_write(uint8_t const *buf, const loff_t pos,
 		return -EINVAL;
 	}
 
-	write_partial(buf, pos, count, reg_off, reg);
+	write_partial(buf, pos, count, reg_off, (uint8_t*)reg);
 
 	return 0;
 }
