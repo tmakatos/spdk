@@ -57,7 +57,7 @@ struct nvme_pcie_mlbar {
 	uint32_t tp :	2;
 	uint32_t pf :	1;
 	uint32_t res1 :	10;
-	uint32_t ba :	16;
+	uint32_t ba :	18;
 };
 SPDK_STATIC_ASSERT(sizeof(struct nvme_pcie_mlbar) == sizeof(uint32_t), "Invalid size");
 
