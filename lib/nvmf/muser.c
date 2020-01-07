@@ -2248,16 +2248,16 @@ init_pci_config_space(lm_pci_config_space_t *p)
 }
 
 static int
-muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, subnqn_t *subnqn)
+muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
 {
 	int ret;
 
 	assert(ctrlr != NULL);
 	assert(subnqn != NULL);
 
-	ret = snprintf((uint8_t*)subnqn, sizeof(*subnqn),
+	ret = snprintf(subnqn, SPDK_NVME_NQN_FIELD_SIZE,
 	               "nqn.2019-07.io.spdk.muser:%s", ctrlr->uuid);
-	return (size_t)ret >= sizeof(*subnqn) ? -1 : 0;
+	return (size_t)ret >= SPDK_NVME_NQN_FIELD_SIZE ? -1 : 0;
 }
 
 static int
@@ -2269,7 +2269,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	lm_dev_info_t dev_info = { 0 };
 	int err;
 	const bool en_msi = false, en_msix = true;
-	subnqn_t subnqn;
+	uint8_t subnqn[SPDK_NVME_NQN_FIELD_SIZE];
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -2297,10 +2297,10 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	err = sem_init(&muser_ctrlr->sem, 0, 0);
 	assert(err == 0); /* FIXME */
 
-	err = muser_snprintf_subnqn(muser_ctrlr, &subnqn);
+	err = muser_snprintf_subnqn(muser_ctrlr, subnqn);
 	assert(err == 0); /* FIXME */
 	muser_ctrlr->subsys = spdk_nvmf_tgt_find_subsystem(transport->tgt,
-	                                                   (char*)&subnqn);
+	                                                   subnqn);
 	assert(muser_ctrlr->subsys != NULL); /* FIXME */
 
 	/*
@@ -2517,7 +2517,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	/* data->hostid = { 0 } */
 
 	data->cntlid = !spdk_nvmf_qpair_is_admin_queue(&muser_qpair->qpair) ? muser_ctrlr->cntlid : 0xffff;
-	err = muser_snprintf_subnqn(muser_ctrlr, &data->subnqn);
+	err = muser_snprintf_subnqn(muser_ctrlr, data->subnqn);
 	assert(err == 0); /* FIXME */
 	/* data->hostnqn = { 0 } */
 

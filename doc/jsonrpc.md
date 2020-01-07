@@ -485,6 +485,50 @@ Example response:
 }
 ~~~
 
+## framework_get_reactors {#rpc_framework_get_reactors}
+
+Retrieve an array of all reactors.
+
+### Parameters
+
+This method has no parameters.
+
+### Response
+
+The response is an array of all reactors.
+
+### Example
+
+Example request:
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "framework_get_reactors",
+  "id": 1
+}
+~~~
+
+Example response:
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "reactors": [
+      {
+        "lcore": 0,
+        "lw_threads": [
+          {
+            "name": "app_thread",
+            "cpumask": "1"
+          }
+        ]
+      }
+    ]
+  }
+}
+~~~
+
 ## thread_get_stats {#rpc_thread_get_stats}
 
 Retrieve current statistics of all the threads.
@@ -515,9 +559,11 @@ Example response:
   "id": 1,
   "result": {
     "tick_rate": 2400000000,
+    "ticks": 2523538189523655,
     "threads": [
       {
-        "name": "reactor_0",
+        "name": "app_thread",
+	"cpumask": "1",
         "busy": 139223208,
         "idle": 8641080608
       }
@@ -1415,6 +1461,7 @@ high_priority_weight       | Optional | number      | The maximum number of comm
 nvme_adminq_poll_period_us | Optional | number      | How often the admin queue is polled for asynchronous events in microseconds
 nvme_ioq_poll_period_us    | Optional | number      | How often I/O queues are polled for completions, in microseconds. Default: 0 (as fast as possible).
 io_queue_requests          | Optional | number      | The number of requests allocated for each NVMe I/O queue. Default: 512.
+delay_cmd_submit           | Optional | boolean     | Enable delaying NVMe command submission to allow batching of multiple commands. Default: `true`.
 
 ### Example
 
@@ -1433,6 +1480,7 @@ request:
     "timeout_us": 10000000,
     "action_on_timeout": "reset",
     "io_queue_requests" : 2048,
+    "delay_cmd_submit": true
   },
   "jsonrpc": "2.0",
   "method": "bdev_nvme_set_options",
@@ -3539,7 +3587,6 @@ Example response:
     {
       "portals": [
         {
-          "cpumask": "0x2",
           "host": "127.0.0.1",
           "port": "3260"
         }

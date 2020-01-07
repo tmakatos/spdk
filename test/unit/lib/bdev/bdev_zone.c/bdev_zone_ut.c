@@ -38,11 +38,11 @@
 
 #include "bdev/bdev_zone.c"
 
-DEFINE_STUB_V(spdk_bdev_io_init, (struct spdk_bdev_io *bdev_io,
-				  struct spdk_bdev *bdev, void *cb_arg,
-				  spdk_bdev_io_completion_cb cb));
+DEFINE_STUB_V(bdev_io_init, (struct spdk_bdev_io *bdev_io,
+			     struct spdk_bdev *bdev, void *cb_arg,
+			     spdk_bdev_io_completion_cb cb));
 
-DEFINE_STUB_V(spdk_bdev_io_submit, (struct spdk_bdev_io *bdev_io));
+DEFINE_STUB_V(bdev_io_submit, (struct spdk_bdev_io *bdev_io));
 
 /* Construct zone_io_operation structure */
 struct zone_io_operation {
@@ -166,7 +166,7 @@ stop_operation(void)
 }
 
 struct spdk_bdev_io *
-spdk_bdev_get_io(struct spdk_bdev_channel *channel)
+bdev_channel_get_io(struct spdk_bdev_channel *channel)
 {
 	struct spdk_bdev_io *bdev_io;
 

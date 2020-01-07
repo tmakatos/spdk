@@ -3,53 +3,37 @@
 
 Vagrant.configure(2) do |config|
 
-  # Pick the right distro and bootstrap, default is fedora28
-  distro = ( ENV['SPDK_VAGRANT_DISTRO'] || "fedora28")
+  # Pick the right distro and bootstrap, default is fedora30
+  distro = ( ENV['SPDK_VAGRANT_DISTRO'] || "fedora30")
   provider = (ENV['SPDK_VAGRANT_PROVIDER'] || "virtualbox")
   case distro
   when "centos7"
-    config.vm.box = "puppetlabs/centos-7.2-64-nocm"
-    config.ssh.insert_key = false
-    # Puppetlabs does not provide libvirt Box so we will use official one
-    config.vm.provider :libvirt do |libvirt|
-      config.vm.box = "centos/7"
-    end if Vagrant.has_plugin?('vagrant-libvirt')
+    # See: https://app.vagrantup.com/generic/boxes/centos7
+    config.vm.box = "generic/centos7"
+  when "centos8"
+    # See: https://app.vagrantup.com/generic/boxes/centos8
+    config.vm.box = "generic/centos8"
   when "ubuntu16"
-    if provider.eql?("libvirt")
-      # https://app.vagrantup.com/sjohnsen/boxes/ubuntu1604
-      config.vm.box = "sjohnsen/ubuntu1604"
-    else
-      # See: https://app.vagrantup.com/puppetlabs/boxes/ubuntu-16.04-64-nocm
-      config.vm.box = "puppetlabs/ubuntu-16.04-64-nocm"
-      config.vm.box_version = "1.0.0"
-    end
+    #See: https://app.vagrantup.com/generic/boxes/ubuntu1604
+    config.vm.box = "generic/ubuntu1604"
   when "ubuntu18"
-    if provider.eql?("libvirt")
-      # https://app.vagrantup.com/sjohnsen/boxes/ubuntu1804
-      config.vm.box = "sjohnsen/ubuntu1804"
-    else
-      # See: https://app.vagrantup.com/bento/boxes/ubuntu-18.04
-      config.vm.box = "bento/ubuntu-18.04"
-      config.vm.box_version = "201803.24.0"
-    end
-  when "fedora28"
-    #See: https://app.vagrantup.com/generic/boxes/fedora28
-    config.vm.box = "generic/fedora28"
+    #See: https://app.vagrantup.com/generic/boxes/ubuntu1804
+    config.vm.box = "generic/ubuntu1804"
   when "fedora29"
     #See: https://app.vagrantup.com/generic/boxes/fedora29
     config.vm.box = "generic/fedora29"
   when "fedora30"
     #See: https://app.vagrantup.com/generic/boxes/fedora30
     config.vm.box = "generic/fedora30"
+  when "fedora31"
+    #See: https://app.vagrantup.com/generic/boxes/fedora31
+    config.vm.box = "generic/fedora31"
   when "freebsd11"
     #See: https://app.vagrantup.com/generic/boxes/freebsd11
     config.vm.box = "generic/freebsd11"
-    if File.file?(File.expand_path("~/vagrant_pkg.conf"))
-      config.vm.provision  "file", source: "~/vagrant_pkg.conf", destination: "pkg.conf"
-      config.vm.provision "shell", inline: "sudo mv pkg.conf /usr/local/etc/pkg.conf"
-      config.vm.provision "shell", inline: "sudo chown root:wheel /usr/local/etc/pkg.conf"
-      config.vm.provision "shell", inline: "sudo chmod 644 /usr/local/etc/pkg.conf"
-    end
+  when "freebsd12"
+    #See: https://app.vagrantup.com/generic/boxes/freebsd12
+    config.vm.box = "generic/freebsd12"
   when "arch-linux"
     #See: https://app.vagrantup.com/generic/boxes/arch
     config.vm.box = "generic/arch"
@@ -66,10 +50,14 @@ Vagrant.configure(2) do |config|
 
   # Copy the tsocks configuration file for use when installing some spdk test pool dependencies
   if File.file?("/etc/tsocks.conf")
+    $tsocks_copy = <<-SCRIPT
+    sudo -s
+    mv -f tsocks.conf /etc/tsocks.conf
+    chown root /etc/tsocks.conf
+    chmod 644 /etc/tsocks.conf
+    SCRIPT
     config.vm.provision  "file", source: "/etc/tsocks.conf", destination: "tsocks.conf"
-    config.vm.provision "shell", inline: "sudo mv tsocks.conf /etc/tsocks.conf"
-    config.vm.provision "shell", inline: "sudo chown root:wheel /etc/tsocks.conf"
-    config.vm.provision "shell", inline: "sudo chmod 644 /etc/tsocks.conf"
+    config.vm.provision "shell", inline: $tsocks_copy
   end
 
   # vagrant-cachier caches apt/yum etc to speed subsequent
@@ -81,15 +69,35 @@ Vagrant.configure(2) do |config|
     config.cache.scope = :box
   end
 
-  if !(distro.include?("ubuntu"))
+  if (distro.include?("ubuntu"))
+    # Ubuntu boxes from generic/ubuntuX do not generate /etc/resolv.conf files properly which causes
+    # DNS to not work. Copy host /etc/resolv.conf file to the VM as a workaround.
     config.vm.network "private_network", type: "dhcp"
+    config.vm.provision "file", source: "/etc/resolv.conf", destination: "/home/vagrant/resolv.conf"
+    config.vm.provision "shell", inline: "sudo mv -f /home/vagrant/resolv.conf /etc/resolv.conf"
   end
 
   # use http proxy if avaiable
-  if ENV['http_proxy'] && Vagrant.has_plugin?("vagrant-proxyconf")
-   config.proxy.http     = ENV['http_proxy']
-   config.proxy.https    = ENV['https_proxy']
-   config.proxy.no_proxy = "localhost,127.0.0.1"
+  if ENV['http_proxy']
+    if Vagrant.has_plugin?("vagrant-proxyconf")
+      config.proxy.http     = ENV['http_proxy']
+      config.proxy.https    = ENV['https_proxy']
+      config.proxy.no_proxy = "localhost,127.0.0.1"
+    end
+
+    # Proxyconf does not seem to support FreeBSD boxes or at least it's
+    # docs do not mention that. Set up proxy configuration manually.
+    if distro.include?("freebsd")
+      $freebsd_proxy = <<-SCRIPT
+      sudo -s
+      echo "export http_proxy=#{ENV['http_proxy']}" >> /etc/profile
+      echo "export https_proxy=#{ENV['http_proxy']}" >> /etc/profile
+      echo "pkg_env: {http_proxy: #{ENV['http_proxy']}}" > /usr/local/etc/pkg.conf
+      chown root:wheel /usr/local/etc/pkg.conf
+      chmod 644 /usr/local/etc/pkg.conf
+      SCRIPT
+      config.vm.provision "shell", inline: $freebsd_proxy
+    end
   end
 
   vmcpu=(ENV['SPDK_VAGRANT_VMCPU'] || 2)
@@ -128,6 +136,13 @@ Vagrant.configure(2) do |config|
   config.vm.provider "libvirt" do |libvirt, override|
     libvirt.random_hostname = "1"
     libvirt.disk_bus = "virtio"
+
+    # generic/freebsd boxes need to be explicitly run with SCSI bus,
+    # otherwise boot process fails on mounting the disk
+    if (distro.include?("freebsd"))
+      libvirt.disk_bus = "scsi"
+    end
+
     if not vmemulator.empty?
       libvirt.emulator_path = "#{vmemulator}"
     end
@@ -152,7 +167,7 @@ Vagrant.configure(2) do |config|
         libvirt.qemuargs :value => "-drive"
         libvirt.qemuargs :value => "format=raw,file=#{nvme_disk},if=none,id=#{nvme_disk_id}"
         libvirt.qemuargs :value => "-device"
-        if nvme_namespaces["#{index}".to_i].nil?
+        if nvme_namespaces["#{index}".to_i].nil? || nvme_namespaces["#{index}".to_i] == "1"
           libvirt.qemuargs :value => "nvme,drive=#{nvme_disk_id},serial=1234#{index}"
         else
           libvirt.qemuargs :value => "nvme,drive=#{nvme_disk_id},serial=1234#{index},namespaces=#{nvme_namespaces["#{index}".to_i]}"
@@ -181,7 +196,8 @@ Vagrant.configure(2) do |config|
   end
 
   # rsync the spdk directory if provision hasn't happened yet
-  if ENV['COPY_SPDK_DIR'] == "1" && spdk_dir != "none"
+  # Warning: rsync does not work with freebsd boxes, so this step is disabled
+  if ENV['COPY_SPDK_DIR'] == "1" && spdk_dir != "none" && !distro.include?("freebsd")
     config.vm.synced_folder "#{spdk_dir}", "/home/vagrant/spdk_repo/spdk", type: "rsync", rsync__auto: false
   end
 

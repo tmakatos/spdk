@@ -33,33 +33,18 @@
 
 #ifndef SPDK_VHOST_INTERNAL_H
 #define SPDK_VHOST_INTERNAL_H
+#include <linux/virtio_config.h>
 
 #include "spdk/stdinc.h"
 
 #include <rte_vhost.h>
 
+#include "spdk_internal/vhost_user.h"
 #include "spdk_internal/log.h"
 #include "spdk/event.h"
+#include "spdk/util.h"
 #include "spdk/rpc.h"
 #include "spdk/config.h"
-
-#define SPDK_CACHE_LINE_SIZE RTE_CACHE_LINE_SIZE
-
-#ifndef VHOST_USER_F_PROTOCOL_FEATURES
-#define VHOST_USER_F_PROTOCOL_FEATURES	30
-#endif
-
-#ifndef VIRTIO_F_VERSION_1
-#define VIRTIO_F_VERSION_1 32
-#endif
-
-#ifndef VIRTIO_BLK_F_MQ
-#define VIRTIO_BLK_F_MQ		12	/* support more than one vq */
-#endif
-
-#ifndef VIRTIO_BLK_F_CONFIG_WCE
-#define VIRTIO_BLK_F_CONFIG_WCE	11
-#endif
 
 #define SPDK_VHOST_MAX_VQUEUES	256
 #define SPDK_VHOST_MAX_VQ_SIZE	1024
@@ -100,8 +85,12 @@ struct vhost_poll_group {
 	TAILQ_ENTRY(vhost_poll_group) tailq;
 };
 
+typedef struct rte_vhost_resubmit_desc spdk_vhost_resubmit_desc;
+typedef struct rte_vhost_resubmit_info spdk_vhost_resubmit_info;
+
 struct spdk_vhost_virtqueue {
 	struct rte_vhost_vring vring;
+	struct rte_vhost_ring_inflight vring_inflight;
 	uint16_t last_avail_idx;
 	uint16_t last_used_idx;
 
@@ -168,8 +157,12 @@ struct spdk_vhost_dev {
 	char *name;
 	char *path;
 
-	struct spdk_cpuset *cpumask;
+	struct spdk_cpuset cpumask;
 	bool registered;
+
+	uint64_t virtio_features;
+	uint64_t disabled_features;
+	uint64_t protocol_features;
 
 	const struct spdk_vhost_dev_backend *backend;
 
@@ -214,9 +207,6 @@ typedef int (*spdk_vhost_session_fn)(struct spdk_vhost_dev *vdev,
 typedef void (*spdk_vhost_dev_fn)(struct spdk_vhost_dev *vdev, void *arg);
 
 struct spdk_vhost_dev_backend {
-	uint64_t virtio_features;
-	uint64_t disabled_features;
-
 	/**
 	 * Size of additional per-session context data
 	 * allocated whenever a new client connects.
@@ -316,6 +306,27 @@ int vhost_blk_controller_construct(void);
 void vhost_dump_info_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_ctx *w);
 
 /*
+ * Vhost callbacks for vhost_device_ops interface
+ */
+
+int vhost_new_connection_cb(int vid, const char *ifname);
+int vhost_start_device_cb(int vid);
+int vhost_stop_device_cb(int vid);
+int vhost_destroy_connection_cb(int vid);
+
+#ifdef SPDK_CONFIG_VHOST_INTERNAL_LIB
+int vhost_get_config_cb(int vid, uint8_t *config, uint32_t len);
+int vhost_set_config_cb(int vid, uint8_t *config, uint32_t offset,
+			uint32_t size, uint32_t flags);
+#endif
+
+/*
+ * Memory registration functions used in start/stop device callbacks
+ */
+void vhost_session_mem_register(struct rte_vhost_memory *mem);
+void vhost_session_mem_unregister(struct rte_vhost_memory *mem);
+
+/*
  * Call a function for each session of the provided vhost device.
  * The function will be called one-by-one on each session's thread.
  *
@@ -385,7 +396,11 @@ void vhost_session_stop_done(struct spdk_vhost_session *vsession, int response);
 
 struct spdk_vhost_session *vhost_session_find_by_vid(int vid);
 void vhost_session_install_rte_compat_hooks(struct spdk_vhost_session *vsession);
-void vhost_dev_install_rte_compat_hooks(struct spdk_vhost_dev *vdev);
+int vhost_register_unix_socket(const char *path, const char *ctrl_name,
+			       uint64_t virtio_features, uint64_t disabled_features, uint64_t protocol_features);
+int vhost_driver_unregister(const char *path);
+int vhost_get_mem_table(int vid, struct rte_vhost_memory **mem);
+int vhost_get_negotiated_features(int vid, uint64_t *negotiated_features);
 
 struct vhost_poll_group *vhost_get_poll_group(struct spdk_cpuset *cpumask);
 

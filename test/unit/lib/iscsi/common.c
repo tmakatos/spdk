@@ -14,6 +14,16 @@
 
 SPDK_LOG_REGISTER_COMPONENT("iscsi", SPDK_LOG_ISCSI)
 
+struct spdk_trace_histories *g_trace_histories;
+DEFINE_STUB_V(spdk_trace_add_register_fn, (struct spdk_trace_register_fn *reg_fn));
+DEFINE_STUB_V(spdk_trace_register_owner, (uint8_t type, char id_prefix));
+DEFINE_STUB_V(spdk_trace_register_object, (uint8_t type, char id_prefix));
+DEFINE_STUB_V(spdk_trace_register_description, (const char *name,
+		uint16_t tpoint_id, uint8_t owner_type, uint8_t object_type, uint8_t new_object,
+		uint8_t arg1_type, const char *arg1_name));
+DEFINE_STUB_V(_spdk_trace_record, (uint64_t tsc, uint16_t tpoint_id, uint16_t poller_id,
+				   uint32_t size, uint64_t object_id, uint64_t arg1));
+
 TAILQ_HEAD(, spdk_iscsi_pdu) g_write_pdu_list = TAILQ_HEAD_INITIALIZER(g_write_pdu_list);
 
 static bool g_task_pool_is_empty = false;
@@ -34,6 +44,25 @@ spdk_iscsi_task_get(struct spdk_iscsi_conn *conn,
 	if (!task) {
 		return NULL;
 	}
+
+	task->conn = conn;
+	task->scsi.cpl_fn = cpl_fn;
+	if (parent) {
+		parent->scsi.ref++;
+		task->parent = parent;
+		task->tag = parent->tag;
+		task->lun_id = parent->lun_id;
+		task->scsi.dxfer_dir = parent->scsi.dxfer_dir;
+		task->scsi.transfer_len = parent->scsi.transfer_len;
+		task->scsi.lun = parent->scsi.lun;
+		task->scsi.cdb = parent->scsi.cdb;
+		task->scsi.target_port = parent->scsi.target_port;
+		task->scsi.initiator_port = parent->scsi.initiator_port;
+		if (conn && (task->scsi.dxfer_dir == SPDK_SCSI_DIR_FROM_DEV)) {
+			conn->data_in_cnt++;
+		}
+	}
+
 	task->scsi.iovs = &task->scsi.iov;
 	return task;
 }
@@ -141,6 +170,11 @@ spdk_iscsi_task_cpl(struct spdk_scsi_task *scsi_task)
 
 	if (scsi_task != NULL) {
 		iscsi_task = spdk_iscsi_task_from_scsi_task(scsi_task);
+		if (iscsi_task->parent && (iscsi_task->scsi.dxfer_dir == SPDK_SCSI_DIR_FROM_DEV)) {
+			assert(iscsi_task->conn->data_in_cnt > 0);
+			iscsi_task->conn->data_in_cnt--;
+		}
+
 		free(iscsi_task);
 	}
 }

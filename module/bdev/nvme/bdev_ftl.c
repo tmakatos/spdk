@@ -145,6 +145,7 @@ bdev_ftl_add_ctrlr(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transpo
 		ftl_ctrlr->ctrlr = ctrlr;
 		ftl_ctrlr->trid = *trid;
 		ftl_ctrlr->ref = 1;
+		ftl_ctrlr->ftl_managed = true;
 
 		ftl_ctrlr->name = spdk_sprintf_alloc("NVMe_%s", trid->traddr);
 		if (!ftl_ctrlr->name) {
@@ -473,8 +474,8 @@ bdev_ftl_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 	spdk_json_write_named_object_begin(w, "ftl");
 
 	_bdev_ftl_write_config_info(ftl_bdev, w);
-	spdk_json_write_named_string_fmt(w, "num_chunks", "%zu", attrs.num_chunks);
-	spdk_json_write_named_string_fmt(w, "chunk_size", "%zu", attrs.chunk_size);
+	spdk_json_write_named_string_fmt(w, "num_zones", "%zu", attrs.num_zones);
+	spdk_json_write_named_string_fmt(w, "zone_size", "%zu", attrs.zone_size);
 
 	/* ftl */
 	spdk_json_write_object_end(w);

@@ -1,8 +1,8 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (c) Intel Corporation.
- *   All rights reserved.
+ *   Copyright (c) Intel Corporation. All rights reserved.
+ *   Copyright (c) 2019 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -253,8 +253,8 @@ spdk_nvme_ctrlr_get_default_io_qpair_opts(struct spdk_nvme_ctrlr *ctrlr,
 		opts->io_queue_requests = ctrlr->opts.io_queue_requests;
 	}
 
-	if (FIELD_OK(delay_pcie_doorbell)) {
-		opts->delay_pcie_doorbell = false;
+	if (FIELD_OK(delay_cmd_submit)) {
+		opts->delay_cmd_submit = false;
 	}
 
 	if (FIELD_OK(sq.vaddr)) {
@@ -333,8 +333,7 @@ spdk_nvme_ctrlr_alloc_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		return NULL;
 	}
 
-	/* Only the low 2 bits (values 0, 1, 2, 3) of QPRIO are valid. */
-	if ((opts.qprio & 3) != opts.qprio) {
+	if (opts.qprio & ~SPDK_NVME_CREATE_IO_SQ_QPRIO_MASK) {
 		nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);
 		return NULL;
 	}
@@ -408,7 +407,7 @@ spdk_nvme_ctrlr_reconnect_io_qpair(struct spdk_nvme_qpair *qpair)
 		goto out;
 	}
 
-	if (!qpair->transport_qp_is_failed) {
+	if (nvme_qpair_get_state(qpair) != NVME_QPAIR_DISABLED) {
 		rc = 0;
 		goto out;
 	}
@@ -419,16 +418,21 @@ spdk_nvme_ctrlr_reconnect_io_qpair(struct spdk_nvme_qpair *qpair)
 	rc = nvme_transport_ctrlr_connect_qpair(ctrlr, qpair);
 	if (rc) {
 		nvme_qpair_set_state(qpair, NVME_QPAIR_DISABLED);
-		qpair->transport_qp_is_failed = true;
 		rc = -EAGAIN;
 		goto out;
 	}
+	qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_NONE;
 	nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
-	qpair->transport_qp_is_failed = false;
 
 out:
 	nvme_robust_mutex_unlock(&ctrlr->ctrlr_lock);
 	return rc;
+}
+
+spdk_nvme_qp_failure_reason
+spdk_nvme_ctrlr_get_admin_qp_failure_reason(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return ctrlr->adminq->transport_failure_reason;
 }
 
 /*
@@ -1078,12 +1082,13 @@ spdk_nvme_ctrlr_reset(struct spdk_nvme_ctrlr *ctrlr)
 
 	/* Disable all queues before disabling the controller hardware. */
 	TAILQ_FOREACH(qpair, &ctrlr->active_io_qpairs, tailq) {
+		qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_LOCAL;
 		nvme_qpair_set_state(qpair, NVME_QPAIR_DISABLED);
-		qpair->transport_qp_is_failed = true;
 	}
 	nvme_qpair_set_state(ctrlr->adminq, NVME_QPAIR_DISABLED);
 	nvme_qpair_complete_error_reqs(ctrlr->adminq);
 	nvme_transport_qpair_abort_reqs(ctrlr->adminq, 0 /* retry */);
+	ctrlr->adminq->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_LOCAL;
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, ctrlr->adminq);
 	if (nvme_transport_ctrlr_connect_qpair(ctrlr, ctrlr->adminq) != 0) {
 		SPDK_ERRLOG("Controller reinitialization failed.\n");
@@ -1091,6 +1096,7 @@ spdk_nvme_ctrlr_reset(struct spdk_nvme_ctrlr *ctrlr)
 		rc = -1;
 		goto out;
 	}
+	ctrlr->adminq->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_NONE;
 	nvme_qpair_set_state(ctrlr->adminq, NVME_QPAIR_CONNECTED);
 
 	/* Doorbell buffer config is invalid during reset */
@@ -1119,12 +1125,13 @@ spdk_nvme_ctrlr_reset(struct spdk_nvme_ctrlr *ctrlr)
 		/* Reinitialize qpairs */
 		TAILQ_FOREACH(qpair, &ctrlr->active_io_qpairs, tailq) {
 			if (nvme_transport_ctrlr_connect_qpair(ctrlr, qpair) != 0) {
+				qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_LOCAL;
 				nvme_qpair_set_state(qpair, NVME_QPAIR_DISABLED);
 				rc = -1;
 				continue;
 			}
+			qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_NONE;
 			nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTED);
-			qpair->transport_qp_is_failed = false;
 		}
 	}
 
@@ -1225,6 +1232,11 @@ nvme_ctrlr_identify_done(void *arg, const struct spdk_nvme_cpl *cpl)
 
 	if (ctrlr->cdata.oacs.security) {
 		ctrlr->flags |= SPDK_NVME_CTRLR_SECURITY_SEND_RECV_SUPPORTED;
+	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_NVME, "fuses compare and write: %d\n", ctrlr->cdata.fuses.compare_and_write);
+	if (ctrlr->cdata.fuses.compare_and_write) {
+		ctrlr->flags |= SPDK_NVME_CTRLR_COMPARE_AND_WRITE_SUPPORTED;
 	}
 
 	nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_SET_NUM_QUEUES,

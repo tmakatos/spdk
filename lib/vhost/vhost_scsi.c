@@ -151,8 +151,6 @@ static void vhost_scsi_write_config_json(struct spdk_vhost_dev *vdev,
 static int vhost_scsi_dev_remove(struct spdk_vhost_dev *vdev);
 
 const struct spdk_vhost_dev_backend spdk_vhost_scsi_device_backend = {
-	.virtio_features = SPDK_VHOST_SCSI_FEATURES,
-	.disabled_features = SPDK_VHOST_SCSI_DISABLED_FEATURES,
 	.session_ctx_size = sizeof(struct spdk_vhost_scsi_session) - sizeof(struct spdk_vhost_session),
 	.start_session =  vhost_scsi_start,
 	.stop_session = vhost_scsi_stop,
@@ -836,6 +834,9 @@ spdk_vhost_scsi_dev_construct(const char *name, const char *cpumask)
 		return -ENOMEM;
 	}
 
+	svdev->vdev.virtio_features = SPDK_VHOST_SCSI_FEATURES;
+	svdev->vdev.disabled_features = SPDK_VHOST_SCSI_DISABLED_FEATURES;
+
 	spdk_vhost_lock();
 	rc = vhost_dev_register(&svdev->vdev, name, cpumask,
 				&spdk_vhost_scsi_device_backend);
@@ -1366,7 +1367,7 @@ vhost_scsi_start(struct spdk_vhost_session *vsession)
 	svsession->svdev = svdev;
 
 	if (svdev->vdev.active_session_num == 0) {
-		svdev->poll_group = vhost_get_poll_group(svdev->vdev.cpumask);
+		svdev->poll_group = vhost_get_poll_group(&svdev->vdev.cpumask);
 	}
 
 	return vhost_session_send_event(svdev->poll_group, vsession,
@@ -1520,7 +1521,7 @@ vhost_scsi_write_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write
 
 	spdk_json_write_named_object_begin(w, "params");
 	spdk_json_write_named_string(w, "ctrlr", vdev->name);
-	spdk_json_write_named_string(w, "cpumask", spdk_cpuset_fmt(vdev->cpumask));
+	spdk_json_write_named_string(w, "cpumask", spdk_cpuset_fmt(&vdev->cpumask));
 	spdk_json_write_object_end(w);
 
 	spdk_json_write_object_end(w);

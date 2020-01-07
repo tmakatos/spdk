@@ -214,7 +214,7 @@ spdk_iscsi_conn_construct(struct spdk_iscsi_portal *portal,
 	}
 
 	pthread_mutex_lock(&g_spdk_iscsi.mutex);
-	conn->timeout = g_spdk_iscsi.timeout;
+	conn->timeout = g_spdk_iscsi.timeout * spdk_get_ticks_hz(); /* seconds to TSC */
 	conn->nopininterval = g_spdk_iscsi.nopininterval;
 	conn->nopininterval *= spdk_get_ticks_hz(); /* seconds to TSC */
 	conn->nop_outstanding = false;
@@ -258,7 +258,7 @@ spdk_iscsi_conn_construct(struct spdk_iscsi_portal *portal,
 	TAILQ_INIT(&conn->queued_r2t_tasks);
 	TAILQ_INIT(&conn->active_r2t_tasks);
 	TAILQ_INIT(&conn->queued_datain_tasks);
-	memset(&conn->open_lun_descs, 0, sizeof(conn->open_lun_descs));
+	memset(&conn->luns, 0, sizeof(conn->luns));
 
 	rc = spdk_sock_getaddr(sock, conn->target_addr, sizeof conn->target_addr, NULL,
 			       conn->initiator_addr, sizeof conn->initiator_addr, NULL);
@@ -304,36 +304,9 @@ error_return:
 void
 spdk_iscsi_conn_free_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu)
 {
-	struct spdk_iscsi_task *primary;
-
 	if (pdu->task) {
-		primary = spdk_iscsi_task_get_primary(pdu->task);
-		if (pdu->bhs.opcode == ISCSI_OP_SCSI_DATAIN) {
-			if (pdu->task->scsi.offset > 0) {
-				assert(conn->data_in_cnt > 0);
-				conn->data_in_cnt--;
-				if (pdu->bhs.flags & ISCSI_DATAIN_STATUS) {
-					/* Free the primary task after the last subtask done */
-					assert(conn->data_in_cnt > 0);
-					conn->data_in_cnt--;
-					spdk_iscsi_task_put(primary);
-				}
-				spdk_iscsi_conn_handle_queued_datain_tasks(conn);
-			}
-		} else if (pdu->bhs.opcode == ISCSI_OP_SCSI_RSP &&
-			   pdu->task->scsi.status != SPDK_SCSI_STATUS_GOOD) {
-			if (pdu->task->scsi.offset > 0) {
-				if (spdk_iscsi_task_is_read(primary)) {
-					if (primary->bytes_completed == primary->scsi.transfer_len) {
-						/* Free the primary task after the last subtask done */
-						assert(conn->data_in_cnt > 0);
-						conn->data_in_cnt--;
-						spdk_iscsi_task_put(primary);
-					}
-				}
-			}
-		}
 		spdk_iscsi_task_put(pdu->task);
+		spdk_iscsi_conn_handle_queued_datain_tasks(conn);
 	}
 	spdk_put_pdu(pdu);
 }
@@ -344,28 +317,27 @@ iscsi_conn_free_tasks(struct spdk_iscsi_conn *conn)
 	struct spdk_iscsi_pdu *pdu, *tmp_pdu;
 	struct spdk_iscsi_task *iscsi_task, *tmp_iscsi_task;
 
-	TAILQ_FOREACH_SAFE(pdu, &conn->write_pdu_list, tailq, tmp_pdu) {
-		TAILQ_REMOVE(&conn->write_pdu_list, pdu, tailq);
-		spdk_iscsi_conn_free_pdu(conn, pdu);
-	}
-
 	TAILQ_FOREACH_SAFE(pdu, &conn->snack_pdu_list, tailq, tmp_pdu) {
 		TAILQ_REMOVE(&conn->snack_pdu_list, pdu, tailq);
-		if (pdu->task) {
-			spdk_iscsi_task_put(pdu->task);
-		}
-		spdk_put_pdu(pdu);
+		spdk_iscsi_conn_free_pdu(conn, pdu);
 	}
 
 	TAILQ_FOREACH_SAFE(iscsi_task, &conn->queued_datain_tasks, link, tmp_iscsi_task) {
 		if (!iscsi_task->is_queued) {
 			TAILQ_REMOVE(&conn->queued_datain_tasks, iscsi_task, link);
-			if (iscsi_task->current_datain_offset > 0) {
-				assert(conn->data_in_cnt > 0);
-				conn->data_in_cnt--;
-			}
 			spdk_iscsi_task_put(iscsi_task);
 		}
+	}
+
+	/* We have to parse conn->write_pdu_list in the end.  In spdk_iscsi_conn_free_pdu(),
+	 *  spdk_iscsi_conn_handle_queued_datain_tasks() may be called, and
+	 *  spdk_iscsi_conn_handle_queued_datain_tasks() will parse conn->queued_datain_tasks
+	 *  and may stack some PDUs to conn->write_pdu_list.  Hence when we come here, we
+	 *  have to ensure there is no associated task in conn->queued_datain_tasks.
+	 */
+	TAILQ_FOREACH_SAFE(pdu, &conn->write_pdu_list, tailq, tmp_pdu) {
+		TAILQ_REMOVE(&conn->write_pdu_list, pdu, tailq);
+		spdk_iscsi_conn_free_pdu(conn, pdu);
 	}
 
 	if (conn->pending_task_cnt) {
@@ -450,14 +422,19 @@ end:
 static void
 iscsi_conn_close_lun(struct spdk_iscsi_conn *conn, int lun_id)
 {
-	struct spdk_scsi_lun_desc *desc;
+	struct spdk_iscsi_lun *iscsi_lun;
 
-	desc = conn->open_lun_descs[lun_id];
-	if (desc != NULL) {
-		spdk_scsi_lun_free_io_channel(desc);
-		spdk_scsi_lun_close(desc);
-		conn->open_lun_descs[lun_id] = NULL;
+	iscsi_lun = conn->luns[lun_id];
+	if (iscsi_lun == NULL) {
+		return;
 	}
+
+	spdk_scsi_lun_free_io_channel(iscsi_lun->desc);
+	spdk_scsi_lun_close(iscsi_lun->desc);
+	spdk_poller_unregister(&iscsi_lun->remove_poller);
+	free(iscsi_lun);
+
+	conn->luns[lun_id] = NULL;
 }
 
 static void
@@ -470,22 +447,62 @@ iscsi_conn_close_luns(struct spdk_iscsi_conn *conn)
 	}
 }
 
-struct _iscsi_conn_remove_ctx {
-	struct spdk_iscsi_conn *conn;
-	struct spdk_scsi_lun *lun;
-};
+static bool
+iscsi_conn_check_tasks_for_lun(struct spdk_iscsi_conn *conn,
+			       struct spdk_scsi_lun *lun)
+{
+	struct spdk_iscsi_pdu *pdu, *tmp_pdu;
+	struct spdk_iscsi_task *task;
+
+	assert(lun != NULL);
+
+	/* We can remove deferred PDUs safely because they are already flushed. */
+	TAILQ_FOREACH_SAFE(pdu, &conn->snack_pdu_list, tailq, tmp_pdu) {
+		if (lun == pdu->task->scsi.lun) {
+			TAILQ_REMOVE(&conn->snack_pdu_list, pdu, tailq);
+			spdk_iscsi_conn_free_pdu(conn, pdu);
+		}
+	}
+
+	TAILQ_FOREACH(task, &conn->queued_datain_tasks, link) {
+		if (lun == task->scsi.lun) {
+			return false;
+		}
+	}
+
+	/* This check loop works even when connection exits in the middle of LUN hotplug
+	 *  because all PDUs in write_pdu_list are removed in iscsi_conn_free_tasks().
+	 */
+	TAILQ_FOREACH(pdu, &conn->write_pdu_list, tailq) {
+		if (pdu->task && lun == pdu->task->scsi.lun) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static int
+iscsi_conn_remove_lun(void *ctx)
+{
+	struct spdk_iscsi_lun *iscsi_lun = ctx;
+	struct spdk_iscsi_conn *conn = iscsi_lun->conn;
+	struct spdk_scsi_lun *lun = iscsi_lun->lun;
+	int lun_id = spdk_scsi_lun_get_id(lun);
+
+	if (!iscsi_conn_check_tasks_for_lun(conn, lun)) {
+		return -1;
+	}
+	iscsi_conn_close_lun(conn, lun_id);
+	return -1;
+}
 
 static void
-_iscsi_conn_remove_lun(void *_ctx)
+_iscsi_conn_hotremove_lun(void *ctx)
 {
-	struct _iscsi_conn_remove_ctx *ctx = _ctx;
-	struct spdk_iscsi_conn *conn = ctx->conn;
-	struct spdk_scsi_lun *lun = ctx->lun;
-	int lun_id = spdk_scsi_lun_get_id(lun);
-	struct spdk_iscsi_pdu *pdu, *tmp_pdu;
-	struct spdk_iscsi_task *iscsi_task, *tmp_iscsi_task;
-
-	free(ctx);
+	struct spdk_iscsi_lun *iscsi_lun = ctx;
+	struct spdk_iscsi_conn *conn = iscsi_lun->conn;
+	struct spdk_scsi_lun *lun = iscsi_lun->lun;
 
 	assert(spdk_io_channel_get_thread(spdk_io_channel_from_ctx(conn->pg)) ==
 	       spdk_get_thread());
@@ -496,58 +513,59 @@ _iscsi_conn_remove_lun(void *_ctx)
 	}
 
 	spdk_clear_all_transfer_task(conn, lun, NULL);
-	TAILQ_FOREACH_SAFE(pdu, &conn->write_pdu_list, tailq, tmp_pdu) {
-		/* If the pdu's LUN matches the LUN that was removed, free this
-		 * PDU immediately.  If the pdu's LUN is NULL, then we know
-		 * the datain handling code already detected the hot removal,
-		 * so we can free that PDU as well.
-		 */
-		if (pdu->task &&
-		    (lun == pdu->task->scsi.lun || NULL == pdu->task->scsi.lun)) {
-			TAILQ_REMOVE(&conn->write_pdu_list, pdu, tailq);
-			spdk_iscsi_conn_free_pdu(conn, pdu);
-		}
-	}
 
-	TAILQ_FOREACH_SAFE(pdu, &conn->snack_pdu_list, tailq, tmp_pdu) {
-		if (pdu->task && (lun == pdu->task->scsi.lun)) {
-			TAILQ_REMOVE(&conn->snack_pdu_list, pdu, tailq);
-			spdk_iscsi_task_put(pdu->task);
-			spdk_put_pdu(pdu);
-		}
-	}
-
-	TAILQ_FOREACH_SAFE(iscsi_task, &conn->queued_datain_tasks, link, tmp_iscsi_task) {
-		if ((!iscsi_task->is_queued) && (lun == iscsi_task->scsi.lun)) {
-			TAILQ_REMOVE(&conn->queued_datain_tasks, iscsi_task, link);
-			if (iscsi_task->current_datain_offset > 0) {
-				assert(conn->data_in_cnt > 0);
-				conn->data_in_cnt--;
-			}
-			spdk_iscsi_task_put(iscsi_task);
-		}
-	}
-
-	iscsi_conn_close_lun(conn, lun_id);
+	iscsi_lun->remove_poller = spdk_poller_register(iscsi_conn_remove_lun, iscsi_lun,
+				   1000);
 }
 
 static void
-iscsi_conn_remove_lun(struct spdk_scsi_lun *lun, void *remove_ctx)
+iscsi_conn_hotremove_lun(struct spdk_scsi_lun *lun, void *remove_ctx)
 {
 	struct spdk_iscsi_conn *conn = remove_ctx;
-	struct _iscsi_conn_remove_ctx *ctx;
+	int lun_id = spdk_scsi_lun_get_id(lun);
+	struct spdk_iscsi_lun *iscsi_lun;
 
-	ctx = calloc(1, sizeof(*ctx));
-	if (!ctx) {
-		SPDK_ERRLOG("Unable to remove lun from connection\n");
+	iscsi_lun = conn->luns[lun_id];
+	if (iscsi_lun == NULL) {
+		SPDK_ERRLOG("LUN hotplug was notified to the unallocated LUN %d.\n", lun_id);
 		return;
 	}
 
-	ctx->conn = conn;
-	ctx->lun = lun;
-
 	spdk_thread_send_msg(spdk_io_channel_get_thread(spdk_io_channel_from_ctx(conn->pg)),
-			     _iscsi_conn_remove_lun, ctx);
+			     _iscsi_conn_hotremove_lun, iscsi_lun);
+}
+
+static int
+iscsi_conn_open_lun(struct spdk_iscsi_conn *conn, int lun_id,
+		    struct spdk_scsi_lun *lun)
+{
+	int rc;
+	struct spdk_iscsi_lun *iscsi_lun;
+
+	iscsi_lun = calloc(1, sizeof(*iscsi_lun));
+	if (iscsi_lun == NULL) {
+		return -ENOMEM;
+	}
+
+	iscsi_lun->conn = conn;
+	iscsi_lun->lun = lun;
+
+	rc = spdk_scsi_lun_open(lun, iscsi_conn_hotremove_lun, conn, &iscsi_lun->desc);
+	if (rc != 0) {
+		free(iscsi_lun);
+		return rc;
+	}
+
+	rc = spdk_scsi_lun_allocate_io_channel(iscsi_lun->desc);
+	if (rc != 0) {
+		spdk_scsi_lun_close(iscsi_lun->desc);
+		free(iscsi_lun);
+		return rc;
+	}
+
+	conn->luns[lun_id] = iscsi_lun;
+
+	return 0;
 }
 
 static void
@@ -555,7 +573,6 @@ iscsi_conn_open_luns(struct spdk_iscsi_conn *conn)
 {
 	int i, rc;
 	struct spdk_scsi_lun *lun;
-	struct spdk_scsi_lun_desc *desc;
 
 	for (i = 0; i < SPDK_SCSI_DEV_MAX_LUN; i++) {
 		lun = spdk_scsi_dev_get_lun(conn->dev, i);
@@ -563,18 +580,10 @@ iscsi_conn_open_luns(struct spdk_iscsi_conn *conn)
 			continue;
 		}
 
-		rc = spdk_scsi_lun_open(lun, iscsi_conn_remove_lun, conn, &desc);
+		rc = iscsi_conn_open_lun(conn, i, lun);
 		if (rc != 0) {
 			goto error;
 		}
-
-		rc = spdk_scsi_lun_allocate_io_channel(desc);
-		if (rc != 0) {
-			spdk_scsi_lun_close(desc);
-			goto error;
-		}
-
-		conn->open_lun_descs[i] = desc;
 	}
 
 	return;
@@ -593,6 +602,7 @@ iscsi_conn_stop(struct spdk_iscsi_conn *conn)
 
 	assert(conn->state == ISCSI_CONN_STATE_EXITED);
 	assert(conn->data_in_cnt == 0);
+	assert(conn->data_out_cnt == 0);
 
 	if (conn->sess != NULL &&
 	    conn->sess->session_type == SESSION_TYPE_NORMAL &&
@@ -920,6 +930,367 @@ spdk_iscsi_drop_conns(struct spdk_iscsi_conn *conn, const char *conn_match,
 	return 0;
 }
 
+static int
+_iscsi_conn_abort_queued_datain_task(struct spdk_iscsi_conn *conn,
+				     struct spdk_iscsi_task *task)
+{
+	struct spdk_iscsi_task *subtask;
+	uint32_t remaining_size;
+
+	if (conn->data_in_cnt >= MAX_LARGE_DATAIN_PER_CONNECTION) {
+		return -1;
+	}
+
+	assert(task->current_datain_offset <= task->scsi.transfer_len);
+	/* Stop split and abort read I/O for remaining data. */
+	if (task->current_datain_offset < task->scsi.transfer_len) {
+		remaining_size = task->scsi.transfer_len - task->current_datain_offset;
+		subtask = spdk_iscsi_task_get(conn, task, spdk_iscsi_task_cpl);
+		assert(subtask != NULL);
+		subtask->scsi.offset = task->current_datain_offset;
+		subtask->scsi.length = remaining_size;
+		spdk_scsi_task_set_data(&subtask->scsi, NULL, 0);
+		task->current_datain_offset += subtask->scsi.length;
+
+		subtask->scsi.transfer_len = subtask->scsi.length;
+		spdk_scsi_task_process_abort(&subtask->scsi);
+		spdk_iscsi_task_cpl(&subtask->scsi);
+	}
+
+	/* Remove the primary task from the list because all subtasks are submitted
+	 *  or aborted.
+	 */
+	assert(task->current_datain_offset == task->scsi.transfer_len);
+	TAILQ_REMOVE(&conn->queued_datain_tasks, task, link);
+	return 0;
+}
+
+int
+spdk_iscsi_conn_abort_queued_datain_task(struct spdk_iscsi_conn *conn,
+		uint32_t ref_task_tag)
+{
+	struct spdk_iscsi_task *task;
+
+	TAILQ_FOREACH(task, &conn->queued_datain_tasks, link) {
+		if (task->tag == ref_task_tag) {
+			return _iscsi_conn_abort_queued_datain_task(conn, task);
+		}
+	}
+
+	return 0;
+}
+
+int
+spdk_iscsi_conn_abort_queued_datain_tasks(struct spdk_iscsi_conn *conn,
+		struct spdk_scsi_lun *lun,
+		struct spdk_iscsi_pdu *pdu)
+{
+	struct spdk_iscsi_task *task, *task_tmp;
+	struct spdk_iscsi_pdu *pdu_tmp;
+	int rc;
+
+	TAILQ_FOREACH_SAFE(task, &conn->queued_datain_tasks, link, task_tmp) {
+		pdu_tmp = spdk_iscsi_task_get_pdu(task);
+		if ((lun == NULL || lun == task->scsi.lun) &&
+		    (pdu == NULL || (SN32_LT(pdu_tmp->cmd_sn, pdu->cmd_sn)))) {
+			rc = _iscsi_conn_abort_queued_datain_task(conn, task);
+			if (rc != 0) {
+				return rc;
+			}
+		}
+	}
+
+	return 0;
+}
+
+int
+spdk_iscsi_conn_handle_queued_datain_tasks(struct spdk_iscsi_conn *conn)
+{
+	struct spdk_iscsi_task *task;
+
+	while (!TAILQ_EMPTY(&conn->queued_datain_tasks) &&
+	       conn->data_in_cnt < MAX_LARGE_DATAIN_PER_CONNECTION) {
+		task = TAILQ_FIRST(&conn->queued_datain_tasks);
+		assert(task->current_datain_offset <= task->scsi.transfer_len);
+		if (task->current_datain_offset < task->scsi.transfer_len) {
+			struct spdk_iscsi_task *subtask;
+			uint32_t remaining_size = 0;
+
+			remaining_size = task->scsi.transfer_len - task->current_datain_offset;
+			subtask = spdk_iscsi_task_get(conn, task, spdk_iscsi_task_cpl);
+			assert(subtask != NULL);
+			subtask->scsi.offset = task->current_datain_offset;
+			spdk_scsi_task_set_data(&subtask->scsi, NULL, 0);
+
+			if (spdk_scsi_dev_get_lun(conn->dev, task->lun_id) == NULL) {
+				/* Stop submitting split read I/Os for remaining data. */
+				TAILQ_REMOVE(&conn->queued_datain_tasks, task, link);
+				task->current_datain_offset += remaining_size;
+				assert(task->current_datain_offset == task->scsi.transfer_len);
+				subtask->scsi.transfer_len = remaining_size;
+				spdk_scsi_task_process_null_lun(&subtask->scsi);
+				spdk_iscsi_task_cpl(&subtask->scsi);
+				return 0;
+			}
+
+			subtask->scsi.length = spdk_min(SPDK_BDEV_LARGE_BUF_MAX_SIZE, remaining_size);
+			task->current_datain_offset += subtask->scsi.length;
+			spdk_iscsi_queue_task(conn, subtask);
+		}
+		if (task->current_datain_offset == task->scsi.transfer_len) {
+			TAILQ_REMOVE(&conn->queued_datain_tasks, task, link);
+		}
+	}
+	return 0;
+}
+
+void
+spdk_iscsi_task_mgmt_cpl(struct spdk_scsi_task *scsi_task)
+{
+	struct spdk_iscsi_task *task = spdk_iscsi_task_from_scsi_task(scsi_task);
+
+	spdk_iscsi_task_mgmt_response(task->conn, task);
+	spdk_iscsi_task_put(task);
+}
+
+static void
+iscsi_task_copy_to_rsp_scsi_status(struct spdk_iscsi_task *primary,
+				   struct spdk_scsi_task *task)
+{
+	memcpy(primary->rsp_sense_data, task->sense_data, task->sense_data_len);
+	primary->rsp_sense_data_len = task->sense_data_len;
+	primary->rsp_scsi_status = task->status;
+}
+
+static void
+iscsi_task_copy_from_rsp_scsi_status(struct spdk_scsi_task *task,
+				     struct spdk_iscsi_task *primary)
+{
+	memcpy(task->sense_data, primary->rsp_sense_data,
+	       primary->rsp_sense_data_len);
+	task->sense_data_len = primary->rsp_sense_data_len;
+	task->status = primary->rsp_scsi_status;
+}
+
+static void
+process_completed_read_subtask_list(struct spdk_iscsi_conn *conn,
+				    struct spdk_iscsi_task *primary)
+{
+	struct spdk_iscsi_task *subtask, *tmp;
+
+	TAILQ_FOREACH_SAFE(subtask, &primary->subtask_list, subtask_link, tmp) {
+		if (subtask->scsi.offset == primary->bytes_completed) {
+			TAILQ_REMOVE(&primary->subtask_list, subtask, subtask_link);
+			primary->bytes_completed += subtask->scsi.length;
+			spdk_iscsi_task_response(conn, subtask);
+			spdk_iscsi_task_put(subtask);
+		} else {
+			break;
+		}
+	}
+
+	if (primary->bytes_completed == primary->scsi.transfer_len) {
+		spdk_iscsi_task_put(primary);
+	}
+}
+
+static void
+process_read_task_completion(struct spdk_iscsi_conn *conn,
+			     struct spdk_iscsi_task *task,
+			     struct spdk_iscsi_task *primary)
+{
+	struct spdk_iscsi_task *tmp;
+
+	/* If the status of the completed subtask is the first failure,
+	 * copy it to out-of-order subtasks and remember it as the status
+	 * of the command,
+	 *
+	 * Even if the status of the completed task is success,
+	 * there are any failed subtask ever, copy the first failed status
+	 * to it.
+	 */
+	if (task->scsi.status != SPDK_SCSI_STATUS_GOOD) {
+		if (primary->rsp_scsi_status == SPDK_SCSI_STATUS_GOOD) {
+			TAILQ_FOREACH(tmp, &primary->subtask_list, subtask_link) {
+				spdk_scsi_task_copy_status(&tmp->scsi, &task->scsi);
+			}
+			iscsi_task_copy_to_rsp_scsi_status(primary, &task->scsi);
+		}
+	} else if (primary->rsp_scsi_status != SPDK_SCSI_STATUS_GOOD) {
+		iscsi_task_copy_from_rsp_scsi_status(&task->scsi, primary);
+	}
+
+	if (task == primary) {
+		primary->bytes_completed = task->scsi.length;
+		/* For non split read I/O */
+		assert(primary->bytes_completed == task->scsi.transfer_len);
+		spdk_iscsi_task_response(conn, task);
+		spdk_iscsi_task_put(task);
+	} else {
+		if (task->scsi.offset != primary->bytes_completed) {
+			TAILQ_FOREACH(tmp, &primary->subtask_list, subtask_link) {
+				if (task->scsi.offset < tmp->scsi.offset) {
+					TAILQ_INSERT_BEFORE(tmp, task, subtask_link);
+					return;
+				}
+			}
+
+			TAILQ_INSERT_TAIL(&primary->subtask_list, task, subtask_link);
+		} else {
+			TAILQ_INSERT_HEAD(&primary->subtask_list, task, subtask_link);
+			process_completed_read_subtask_list(conn, primary);
+		}
+	}
+}
+
+static void
+process_non_read_task_completion(struct spdk_iscsi_conn *conn,
+				 struct spdk_iscsi_task *task,
+				 struct spdk_iscsi_task *primary)
+{
+	primary->bytes_completed += task->scsi.length;
+
+	/* If the status of the subtask is the first failure, remember it as
+	 * the status of the command and set it to the status of the primary
+	 * task later.
+	 *
+	 * If the first failed task is the primary, two copies can be avoided
+	 * but code simplicity is prioritized.
+	 */
+	if (task->scsi.status == SPDK_SCSI_STATUS_GOOD) {
+		if (task != primary) {
+			primary->scsi.data_transferred += task->scsi.data_transferred;
+		}
+	} else if (primary->rsp_scsi_status == SPDK_SCSI_STATUS_GOOD) {
+		iscsi_task_copy_to_rsp_scsi_status(primary, &task->scsi);
+	}
+
+	if (primary->bytes_completed == primary->scsi.transfer_len) {
+		/*
+		 * Check if this is the last task completed for an iSCSI write
+		 *  that required child subtasks.  If task != primary, we know
+		 *  for sure that it was part of an iSCSI write with child subtasks.
+		 *  The trickier case is when the last task completed was the initial
+		 *  task - in this case the task will have a smaller length than
+		 *  the overall transfer length.
+		 */
+		if (task != primary || task->scsi.length != task->scsi.transfer_len) {
+			/* If LUN is removed in the middle of the iSCSI write sequence,
+			 *  primary might complete the write to the initiator because it is not
+			 *  ensured that the initiator will send all data requested by R2Ts.
+			 *
+			 * We check it and skip the following if primary is completed. (see
+			 *  spdk_clear_all_transfer_task() in iscsi.c.)
+			 */
+			if (primary->is_r2t_active) {
+				spdk_del_transfer_task(conn, primary->tag);
+				if (primary->rsp_scsi_status != SPDK_SCSI_STATUS_GOOD) {
+					iscsi_task_copy_from_rsp_scsi_status(&primary->scsi, primary);
+				}
+				spdk_iscsi_task_response(conn, primary);
+				TAILQ_REMOVE(&conn->active_r2t_tasks, primary, link);
+				primary->is_r2t_active = false;
+				spdk_iscsi_task_put(primary);
+			}
+		} else {
+			spdk_iscsi_task_response(conn, task);
+		}
+	}
+	spdk_iscsi_task_put(task);
+}
+
+void
+spdk_iscsi_task_cpl(struct spdk_scsi_task *scsi_task)
+{
+	struct spdk_iscsi_task *primary;
+	struct spdk_iscsi_task *task = spdk_iscsi_task_from_scsi_task(scsi_task);
+	struct spdk_iscsi_conn *conn = task->conn;
+	struct spdk_iscsi_pdu *pdu = task->pdu;
+
+	spdk_trace_record(TRACE_ISCSI_TASK_DONE, conn->id, 0, (uintptr_t)task, 0);
+
+	task->is_queued = false;
+	primary = spdk_iscsi_task_get_primary(task);
+
+	if (spdk_iscsi_task_is_read(primary)) {
+		process_read_task_completion(conn, task, primary);
+	} else {
+		process_non_read_task_completion(conn, task, primary);
+	}
+	if (!task->parent) {
+		spdk_trace_record(TRACE_ISCSI_PDU_COMPLETED, 0, 0, (uintptr_t)pdu, 0);
+	}
+}
+
+static void
+iscsi_conn_send_nopin(struct spdk_iscsi_conn *conn)
+{
+	struct spdk_iscsi_pdu *rsp_pdu;
+	struct iscsi_bhs_nop_in *rsp;
+	/* Only send nopin if we have logged in and are in a normal session. */
+	if (conn->sess == NULL ||
+	    !conn->full_feature ||
+	    !spdk_iscsi_param_eq_val(conn->sess->params, "SessionType", "Normal")) {
+		return;
+	}
+	SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "send NOPIN isid=%"PRIx64", tsih=%u, cid=%u\n",
+		      conn->sess->isid, conn->sess->tsih, conn->cid);
+	SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "StatSN=%u, ExpCmdSN=%u, MaxCmdSN=%u\n",
+		      conn->StatSN, conn->sess->ExpCmdSN,
+		      conn->sess->MaxCmdSN);
+	rsp_pdu = spdk_get_pdu();
+	rsp = (struct iscsi_bhs_nop_in *) &rsp_pdu->bhs;
+	rsp_pdu->data = NULL;
+	/*
+	 * spdk_get_pdu() memset's the PDU for us, so only fill out the needed
+	 *  fields.
+	 */
+	rsp->opcode = ISCSI_OP_NOPIN;
+	rsp->flags = 0x80;
+	/*
+	 * Technically the to_be32() is not needed here, since
+	 *  to_be32(0xFFFFFFFU) returns 0xFFFFFFFFU.
+	 */
+	to_be32(&rsp->itt, 0xFFFFFFFFU);
+	to_be32(&rsp->ttt, conn->id);
+	to_be32(&rsp->stat_sn, conn->StatSN);
+	to_be32(&rsp->exp_cmd_sn, conn->sess->ExpCmdSN);
+	to_be32(&rsp->max_cmd_sn, conn->sess->MaxCmdSN);
+	spdk_iscsi_conn_write_pdu(conn, rsp_pdu);
+	conn->last_nopin = spdk_get_ticks();
+	conn->nop_outstanding = true;
+}
+
+void
+spdk_iscsi_conn_handle_nop(struct spdk_iscsi_conn *conn)
+{
+	uint64_t	tsc;
+
+	/**
+	  * This function will be executed by nop_poller of iSCSI polling group, so
+	  * we need to check the connection state first, then do the nop interval
+	  * expiration check work.
+	  */
+	if ((conn->state == ISCSI_CONN_STATE_EXITED) ||
+	    (conn->state == ISCSI_CONN_STATE_EXITING)) {
+		return;
+	}
+
+	/* Check for nop interval expiration */
+	tsc = spdk_get_ticks();
+	if (conn->nop_outstanding) {
+		if ((tsc - conn->last_nopin) > conn->timeout) {
+			SPDK_ERRLOG("Timed out waiting for NOP-Out response from initiator\n");
+			SPDK_ERRLOG("  tsc=0x%lx, last_nopin=0x%lx\n", tsc, conn->last_nopin);
+			SPDK_ERRLOG("  initiator=%s, target=%s\n", conn->initiator_name,
+				    conn->target_short_name);
+			conn->state = ISCSI_CONN_STATE_EXITING;
+		}
+	} else if (tsc - conn->last_nopin > conn->nopininterval) {
+		iscsi_conn_send_nopin(conn);
+	}
+}
+
 /**
  * \brief Reads data for the specified iSCSI connection from its TCP socket.
  *
@@ -1009,160 +1380,6 @@ spdk_iscsi_conn_readv_data(struct spdk_iscsi_conn *conn,
 	return SPDK_ISCSI_CONNECTION_FATAL;
 }
 
-void
-spdk_iscsi_task_mgmt_cpl(struct spdk_scsi_task *scsi_task)
-{
-	struct spdk_iscsi_task *task = spdk_iscsi_task_from_scsi_task(scsi_task);
-
-	spdk_iscsi_task_mgmt_response(task->conn, task);
-	spdk_iscsi_task_put(task);
-}
-
-static void
-iscsi_task_copy_to_rsp_scsi_status(struct spdk_iscsi_task *primary,
-				   struct spdk_scsi_task *task)
-{
-	memcpy(primary->rsp_sense_data, task->sense_data, task->sense_data_len);
-	primary->rsp_sense_data_len = task->sense_data_len;
-	primary->rsp_scsi_status = task->status;
-}
-
-static void
-iscsi_task_copy_from_rsp_scsi_status(struct spdk_scsi_task *task,
-				     struct spdk_iscsi_task *primary)
-{
-	memcpy(task->sense_data, primary->rsp_sense_data,
-	       primary->rsp_sense_data_len);
-	task->sense_data_len = primary->rsp_sense_data_len;
-	task->status = primary->rsp_scsi_status;
-}
-
-static void
-process_completed_read_subtask_list(struct spdk_iscsi_conn *conn,
-				    struct spdk_iscsi_task *primary)
-{
-	struct spdk_iscsi_task *subtask, *tmp;
-
-	TAILQ_FOREACH_SAFE(subtask, &primary->subtask_list, subtask_link, tmp) {
-		if (subtask->scsi.offset == primary->bytes_completed) {
-			TAILQ_REMOVE(&primary->subtask_list, subtask, subtask_link);
-			primary->bytes_completed += subtask->scsi.length;
-			spdk_iscsi_task_response(conn, subtask);
-			spdk_iscsi_task_put(subtask);
-		} else {
-			break;
-		}
-	}
-}
-
-static void
-process_read_task_completion(struct spdk_iscsi_conn *conn,
-			     struct spdk_iscsi_task *task,
-			     struct spdk_iscsi_task *primary)
-{
-	struct spdk_iscsi_task *tmp;
-
-	/* If the status of the completed subtask is the first failure,
-	 * copy it to out-of-order subtasks and remember it as the status
-	 * of the command,
-	 *
-	 * Even if the status of the completed task is success,
-	 * there are any failed subtask ever, copy the first failed status
-	 * to it.
-	 */
-	if (task->scsi.status != SPDK_SCSI_STATUS_GOOD) {
-		if (primary->rsp_scsi_status == SPDK_SCSI_STATUS_GOOD) {
-			TAILQ_FOREACH(tmp, &primary->subtask_list, subtask_link) {
-				spdk_scsi_task_copy_status(&tmp->scsi, &task->scsi);
-			}
-			iscsi_task_copy_to_rsp_scsi_status(primary, &task->scsi);
-		}
-	} else if (primary->rsp_scsi_status != SPDK_SCSI_STATUS_GOOD) {
-		iscsi_task_copy_from_rsp_scsi_status(&task->scsi, primary);
-	}
-
-	if ((task != primary) &&
-	    (task->scsi.offset != primary->bytes_completed)) {
-		TAILQ_FOREACH(tmp, &primary->subtask_list, subtask_link) {
-			if (task->scsi.offset < tmp->scsi.offset) {
-				TAILQ_INSERT_BEFORE(tmp, task, subtask_link);
-				return;
-			}
-		}
-
-		TAILQ_INSERT_TAIL(&primary->subtask_list, task, subtask_link);
-		return;
-	}
-
-	primary->bytes_completed += task->scsi.length;
-	spdk_iscsi_task_response(conn, task);
-
-	if ((task != primary) ||
-	    (task->scsi.transfer_len == task->scsi.length)) {
-		spdk_iscsi_task_put(task);
-	}
-	process_completed_read_subtask_list(conn, primary);
-}
-
-void
-spdk_iscsi_task_cpl(struct spdk_scsi_task *scsi_task)
-{
-	struct spdk_iscsi_task *primary;
-	struct spdk_iscsi_task *task = spdk_iscsi_task_from_scsi_task(scsi_task);
-	struct spdk_iscsi_conn *conn = task->conn;
-	struct spdk_iscsi_pdu *pdu = task->pdu;
-
-	spdk_trace_record(TRACE_ISCSI_TASK_DONE, conn->id, 0, (uintptr_t)task, 0);
-
-	task->is_queued = false;
-	primary = spdk_iscsi_task_get_primary(task);
-
-	if (spdk_iscsi_task_is_read(primary)) {
-		process_read_task_completion(conn, task, primary);
-	} else {
-		primary->bytes_completed += task->scsi.length;
-
-		/* If the status of the subtask is the first failure, remember it as
-		 * the status of the command and set it to the status of the primary
-		 * task later.
-		 *
-		 * If the first failed task is the primary, two copies can be avoided
-		 * but code simplicity is prioritized.
-		 */
-		if (task->scsi.status == SPDK_SCSI_STATUS_GOOD) {
-			if (task != primary) {
-				primary->scsi.data_transferred += task->scsi.data_transferred;
-			}
-		} else if (primary->rsp_scsi_status == SPDK_SCSI_STATUS_GOOD) {
-			iscsi_task_copy_to_rsp_scsi_status(primary, &task->scsi);
-		}
-
-		if (primary->bytes_completed == primary->scsi.transfer_len) {
-			spdk_del_transfer_task(conn, primary->tag);
-			if (primary->rsp_scsi_status != SPDK_SCSI_STATUS_GOOD) {
-				iscsi_task_copy_from_rsp_scsi_status(&primary->scsi, primary);
-			}
-			spdk_iscsi_task_response(conn, primary);
-			/*
-			 * Check if this is the last task completed for an iSCSI write
-			 *  that required child subtasks.  If task != primary, we know
-			 *  for sure that it was part of an iSCSI write with child subtasks.
-			 *  The trickier case is when the last task completed was the initial
-			 *  task - in this case the task will have a smaller length than
-			 *  the overall transfer length.
-			 */
-			if (task != primary || task->scsi.length != task->scsi.transfer_len) {
-				TAILQ_REMOVE(&conn->active_r2t_tasks, primary, link);
-				spdk_iscsi_task_put(primary);
-			}
-		}
-		spdk_iscsi_task_put(task);
-	}
-	if (!task->parent) {
-		spdk_trace_record(TRACE_ISCSI_PDU_COMPLETED, 0, 0, (uintptr_t)pdu, 0);
-	}
-}
-
 static int
 iscsi_get_pdu_length(struct spdk_iscsi_pdu *pdu, int header_digest,
 		     int data_digest)
@@ -1193,34 +1410,19 @@ iscsi_get_pdu_length(struct spdk_iscsi_pdu *pdu, int header_digest,
 	return total;
 }
 
-void
-spdk_iscsi_conn_handle_nop(struct spdk_iscsi_conn *conn)
+static bool
+iscsi_is_free_pdu_deferred(struct spdk_iscsi_pdu *pdu)
 {
-	uint64_t	tsc;
-
-	/**
-	  * This function will be executed by nop_poller of iSCSI polling group, so
-	  * we need to check the connection state first, then do the nop interval
-	  * expiration check work.
-	  */
-	if ((conn->state == ISCSI_CONN_STATE_EXITED) ||
-	    (conn->state == ISCSI_CONN_STATE_EXITING)) {
-		return;
+	if (pdu == NULL) {
+		return false;
 	}
 
-	/* Check for nop interval expiration */
-	tsc = spdk_get_ticks();
-	if (conn->nop_outstanding) {
-		if ((tsc - conn->last_nopin) > (conn->timeout  * spdk_get_ticks_hz())) {
-			SPDK_ERRLOG("Timed out waiting for NOP-Out response from initiator\n");
-			SPDK_ERRLOG("  tsc=0x%lx, last_nopin=0x%lx\n", tsc, conn->last_nopin);
-			SPDK_ERRLOG("  initiator=%s, target=%s\n", conn->initiator_name,
-				    conn->target_short_name);
-			conn->state = ISCSI_CONN_STATE_EXITING;
-		}
-	} else if (tsc - conn->last_nopin > conn->nopininterval) {
-		spdk_iscsi_send_nopin(conn);
+	if (pdu->bhs.opcode == ISCSI_OP_R2T ||
+	    pdu->bhs.opcode == ISCSI_OP_SCSI_DATAIN) {
+		return true;
 	}
+
+	return false;
 }
 
 /**
@@ -1321,7 +1523,7 @@ iscsi_conn_flush_pdus_internal(struct spdk_iscsi_conn *conn)
 		TAILQ_REMOVE(&completed_pdus_list, pdu, tailq);
 		if ((conn->full_feature) &&
 		    (conn->sess->ErrorRecoveryLevel >= 1) &&
-		    spdk_iscsi_is_deferred_free_pdu(pdu)) {
+		    iscsi_is_free_pdu_deferred(pdu)) {
 			SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "stat_sn=%d\n",
 				      from_be32(&pdu->bhs.stat_sn));
 			TAILQ_INSERT_TAIL(&conn->snack_pdu_list, pdu,

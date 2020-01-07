@@ -44,6 +44,10 @@ SPDK_LIB_LIST += event_bdev event_copy event_nvmf event_net event_vmd
 SPDK_LIB_LIST += nvmf event log trace conf thread util bdev copy rpc jsonrpc json net sock
 SPDK_LIB_LIST += app_rpc log_rpc bdev_rpc notify
 
+ifeq ($(SPDK_ROOT_DIR)/lib/env_dpdk,$(CONFIG_ENV))
+SPDK_LIB_LIST += env_dpdk_rpc
+endif
+
 ifeq ($(OS),Linux)
 SPDK_LIB_LIST += event_nbd nbd
 endif

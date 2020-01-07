@@ -82,6 +82,14 @@ enum iscsi_pdu_recv_state {
 };
 
 struct spdk_poller;
+struct spdk_iscsi_conn;
+
+struct spdk_iscsi_lun {
+	struct spdk_iscsi_conn		*conn;
+	struct spdk_scsi_lun		*lun;
+	struct spdk_scsi_lun_desc	*desc;
+	struct spdk_poller		*remove_poller;
+};
 
 struct spdk_iscsi_conn {
 	int				id;
@@ -164,7 +172,7 @@ struct spdk_iscsi_conn {
 	uint32_t data_out_cnt;
 	uint32_t data_in_cnt;
 
-	int timeout;
+	uint64_t timeout;
 	uint64_t nopininterval;
 	bool nop_outstanding;
 
@@ -188,10 +196,13 @@ struct spdk_iscsi_conn {
 	TAILQ_HEAD(active_r2t_tasks, spdk_iscsi_task)	active_r2t_tasks;
 	TAILQ_HEAD(queued_datain_tasks, spdk_iscsi_task)	queued_datain_tasks;
 
-	struct spdk_scsi_lun_desc	*open_lun_descs[SPDK_SCSI_DEV_MAX_LUN];
+	struct spdk_iscsi_lun	*luns[SPDK_SCSI_DEV_MAX_LUN];
 };
 
 extern struct spdk_iscsi_conn *g_conns_array;
+
+void spdk_iscsi_task_cpl(struct spdk_scsi_task *scsi_task);
+void spdk_iscsi_task_mgmt_cpl(struct spdk_scsi_task *scsi_task);
 
 int spdk_initialize_iscsi_conns(void);
 void spdk_shutdown_iscsi_conns(void);
@@ -205,6 +216,12 @@ void spdk_iscsi_conn_schedule(struct spdk_iscsi_conn *conn);
 void spdk_iscsi_conn_logout(struct spdk_iscsi_conn *conn);
 int spdk_iscsi_drop_conns(struct spdk_iscsi_conn *conn,
 			  const char *conn_match, int drop_all);
+int spdk_iscsi_conn_handle_queued_datain_tasks(struct spdk_iscsi_conn *conn);
+int spdk_iscsi_conn_abort_queued_datain_task(struct spdk_iscsi_conn *conn,
+		uint32_t ref_task_tag);
+int spdk_iscsi_conn_abort_queued_datain_tasks(struct spdk_iscsi_conn *conn,
+		struct spdk_scsi_lun *lun,
+		struct spdk_iscsi_pdu *pdu);
 
 int spdk_iscsi_conn_read_data(struct spdk_iscsi_conn *conn, int len, void *buf);
 int spdk_iscsi_conn_readv_data(struct spdk_iscsi_conn *conn,

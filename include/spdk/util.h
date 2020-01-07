@@ -44,6 +44,8 @@
 extern "C" {
 #endif
 
+#define SPDK_CACHE_LINE_SIZE 64
+
 #define spdk_min(a,b) (((a)<(b))?(a):(b))
 #define spdk_max(a,b) (((a)>(b))?(a):(b))
 
@@ -91,6 +93,13 @@ spdk_divide_round_up(uint64_t num, uint64_t divisor)
 {
 	return (num + divisor - 1) / divisor;
 }
+
+/**
+ * Copy the data described by the source iovec to the destination iovec.
+ *
+ * \return The number of bytes copied.
+ */
+size_t spdk_iovcpy(struct iovec *siov, size_t siovcnt, struct iovec *diov, size_t diovcnt);
 
 
 /**

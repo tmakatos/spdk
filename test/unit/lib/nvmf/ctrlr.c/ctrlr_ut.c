@@ -221,7 +221,8 @@ test_get_log_page(void)
 	memset(&cmd, 0, sizeof(cmd));
 	memset(&rsp, 0, sizeof(rsp));
 	cmd.nvme_cmd.opc = SPDK_NVME_OPC_GET_LOG_PAGE;
-	cmd.nvme_cmd.cdw10 = SPDK_NVME_LOG_ERROR | (req.length / 4 - 1) << 16;
+	cmd.nvme_cmd.cdw10_bits.get_log_page.lid = SPDK_NVME_LOG_ERROR;
+	cmd.nvme_cmd.cdw10_bits.get_log_page.numdl = (req.length / 4 - 1);
 	CU_ASSERT(spdk_nvmf_ctrlr_get_log_page(&req) == SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE);
 	CU_ASSERT(req.rsp->nvme_cpl.status.sct == SPDK_NVME_SCT_GENERIC);
 	CU_ASSERT(req.rsp->nvme_cpl.status.sc == SPDK_NVME_SC_SUCCESS);
@@ -239,7 +240,8 @@ test_get_log_page(void)
 	memset(&cmd, 0, sizeof(cmd));
 	memset(&rsp, 0, sizeof(rsp));
 	cmd.nvme_cmd.opc = SPDK_NVME_OPC_GET_LOG_PAGE;
-	cmd.nvme_cmd.cdw10 = SPDK_NVME_LOG_ERROR | (req.length / 4 - 1) << 16;
+	cmd.nvme_cmd.cdw10_bits.get_log_page.lid = SPDK_NVME_LOG_ERROR;
+	cmd.nvme_cmd.cdw10_bits.get_log_page.numdl = (req.length / 4 - 1);
 	cmd.nvme_cmd.cdw12 = 2;
 	CU_ASSERT(spdk_nvmf_ctrlr_get_log_page(&req) == SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE);
 	CU_ASSERT(req.rsp->nvme_cpl.status.sct == SPDK_NVME_SCT_GENERIC);
@@ -250,7 +252,8 @@ test_get_log_page(void)
 	memset(&rsp, 0, sizeof(rsp));
 	req.data = NULL;
 	cmd.nvme_cmd.opc = SPDK_NVME_OPC_GET_LOG_PAGE;
-	cmd.nvme_cmd.cdw10 = SPDK_NVME_LOG_ERROR | (req.length / 4 - 1) << 16;
+	cmd.nvme_cmd.cdw10_bits.get_log_page.lid = SPDK_NVME_LOG_ERROR;
+	cmd.nvme_cmd.cdw10_bits.get_log_page.numdl = (req.length / 4 - 1);
 	CU_ASSERT(spdk_nvmf_ctrlr_get_log_page(&req) == SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE);
 	CU_ASSERT(req.rsp->nvme_cpl.status.sct == SPDK_NVME_SCT_GENERIC);
 	CU_ASSERT(req.rsp->nvme_cpl.status.sc == SPDK_NVME_SC_INVALID_FIELD);
@@ -583,19 +586,44 @@ test_connect(void)
 	CU_ASSERT(rsp.connect_rsp.status_code_specific.invalid.ipo == 42);
 	CU_ASSERT(qpair.ctrlr == NULL);
 
-	/* I/O connect to discovery controller keep-alive-timeout should be 0 */
+	/* I/O connect to discovery controller with keep-alive-timeout != 0 */
 	cmd.connect_cmd.qid = 0;
+	cmd.connect_cmd.kato = 120000;
 	memset(&rsp, 0, sizeof(rsp));
 	subsystem.subtype = SPDK_NVMF_SUBTYPE_DISCOVERY;
 	subsystem.state = SPDK_NVMF_SUBSYSTEM_ACTIVE;
 	TAILQ_INSERT_TAIL(&qpair.outstanding, &req, link);
 	rc = spdk_nvmf_ctrlr_connect(&req);
 	poll_threads();
-	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE);
-	CU_ASSERT(rsp.nvme_cpl.status.sct == SPDK_NVME_SCT_GENERIC);
-	CU_ASSERT(rsp.nvme_cpl.status.sc == SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
-	CU_ASSERT(qpair.ctrlr == NULL);
+	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS);
+	CU_ASSERT(nvme_status_success(&rsp.nvme_cpl.status));
+	CU_ASSERT(qpair.ctrlr != NULL);
+	CU_ASSERT(qpair.ctrlr->keep_alive_poller != NULL);
+	spdk_nvmf_ctrlr_stop_keep_alive_timer(qpair.ctrlr);
+	spdk_bit_array_free(&qpair.ctrlr->qpair_mask);
+	free(qpair.ctrlr);
+	qpair.ctrlr = NULL;
+
+	/* I/O connect to discovery controller with keep-alive-timeout == 0.
+	 *  Then, a fixed timeout value is set to keep-alive-timeout.
+	 */
+	cmd.connect_cmd.kato = 0;
+	memset(&rsp, 0, sizeof(rsp));
+	subsystem.subtype = SPDK_NVMF_SUBTYPE_DISCOVERY;
+	subsystem.state = SPDK_NVMF_SUBSYSTEM_ACTIVE;
+	TAILQ_INSERT_TAIL(&qpair.outstanding, &req, link);
+	rc = spdk_nvmf_ctrlr_connect(&req);
+	poll_threads();
+	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS);
+	CU_ASSERT(nvme_status_success(&rsp.nvme_cpl.status));
+	CU_ASSERT(qpair.ctrlr != NULL);
+	CU_ASSERT(qpair.ctrlr->keep_alive_poller != NULL);
+	spdk_nvmf_ctrlr_stop_keep_alive_timer(qpair.ctrlr);
+	spdk_bit_array_free(&qpair.ctrlr->qpair_mask);
+	free(qpair.ctrlr);
+	qpair.ctrlr = NULL;
 	cmd.connect_cmd.qid = 1;
+	cmd.connect_cmd.kato = 120000;
 	subsystem.subtype = SPDK_NVMF_SUBTYPE_NVME;
 
 	/* I/O connect to disabled controller */
@@ -720,7 +748,7 @@ test_get_ns_id_desc_list(void)
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.nvme_cmd.opc = SPDK_NVME_OPC_IDENTIFY;
-	cmd.nvme_cmd.cdw10 = SPDK_NVME_IDENTIFY_NS_ID_DESCRIPTOR_LIST;
+	cmd.nvme_cmd.cdw10_bits.identify.cns = SPDK_NVME_IDENTIFY_NS_ID_DESCRIPTOR_LIST;
 
 	/* Invalid NSID */
 	cmd.nvme_cmd.nsid = 0;
@@ -910,7 +938,7 @@ test_set_get_features(void)
 
 	/* Set SPDK_NVME_FEAT_HOST_RESERVE_PERSIST feature */
 	cmd.nvme_cmd.opc = SPDK_NVME_OPC_SET_FEATURES;
-	cmd.nvme_cmd.cdw11 = 0x1u;
+	cmd.nvme_cmd.cdw11_bits.feat_rsv_persistence.bits.ptpl = 1;
 	ns[0].ptpl_file = "testcfg";
 	rc = spdk_nvmf_ctrlr_set_features_reservation_persistence(&req);
 	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE);
@@ -920,7 +948,7 @@ test_set_get_features(void)
 
 	/* Get SPDK_NVME_FEAT_HOST_RESERVE_PERSIST feature */
 	cmd.nvme_cmd.opc = SPDK_NVME_OPC_GET_FEATURES;
-	cmd.nvme_cmd.cdw10 = SPDK_NVME_FEAT_HOST_RESERVE_PERSIST;
+	cmd.nvme_cmd.cdw10_bits.get_features.fid = SPDK_NVME_FEAT_HOST_RESERVE_PERSIST;
 	rc = spdk_nvmf_ctrlr_get_features_reservation_persistence(&req);
 	CU_ASSERT(rc == SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE);
 	CU_ASSERT(rsp.nvme_cpl.status.sct == SPDK_NVME_SCT_GENERIC);

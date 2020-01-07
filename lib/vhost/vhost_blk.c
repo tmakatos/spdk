@@ -45,6 +45,23 @@
 
 #include "vhost_internal.h"
 
+/* Minimal set of features supported by every SPDK VHOST-BLK device */
+#define SPDK_VHOST_BLK_FEATURES_BASE (SPDK_VHOST_FEATURES | \
+		(1ULL << VIRTIO_BLK_F_SIZE_MAX) | (1ULL << VIRTIO_BLK_F_SEG_MAX) | \
+		(1ULL << VIRTIO_BLK_F_GEOMETRY) | (1ULL << VIRTIO_BLK_F_BLK_SIZE) | \
+		(1ULL << VIRTIO_BLK_F_TOPOLOGY) | (1ULL << VIRTIO_BLK_F_BARRIER)  | \
+		(1ULL << VIRTIO_BLK_F_SCSI)     | (1ULL << VIRTIO_BLK_F_CONFIG_WCE) | \
+		(1ULL << VIRTIO_BLK_F_MQ))
+
+/* Not supported features */
+#define SPDK_VHOST_BLK_DISABLED_FEATURES (SPDK_VHOST_DISABLED_FEATURES | \
+		(1ULL << VIRTIO_BLK_F_GEOMETRY) | (1ULL << VIRTIO_BLK_F_CONFIG_WCE) | \
+		(1ULL << VIRTIO_BLK_F_BARRIER)  | (1ULL << VIRTIO_BLK_F_SCSI))
+
+/* Vhost-blk support protocol features */
+#define SPDK_VHOST_BLK_PROTOCOL_FEATURES ((1ULL << VHOST_USER_PROTOCOL_F_CONFIG) | \
+		(1ULL << VHOST_USER_PROTOCOL_F_INFLIGHT_SHMFD))
+
 struct spdk_vhost_blk_task {
 	struct spdk_bdev_io *bdev_io;
 	struct spdk_vhost_blk_session *bvsession;
@@ -417,6 +434,64 @@ process_blk_request(struct spdk_vhost_blk_task *task,
 }
 
 static void
+submit_inflight_desc(struct spdk_vhost_blk_session *bvsession,
+		     struct spdk_vhost_virtqueue *vq)
+{
+	struct spdk_vhost_blk_dev *bvdev = bvsession->bvdev;
+	struct spdk_vhost_blk_task *task;
+	struct spdk_vhost_session *vsession = &bvsession->vsession;
+	spdk_vhost_resubmit_info *resubmit = vq->vring_inflight.resubmit_inflight;
+	spdk_vhost_resubmit_desc *resubmit_list;
+	int rc;
+	uint16_t req_idx;
+
+	if (spdk_likely(resubmit == NULL || resubmit->resubmit_list == NULL)) {
+		return;
+	}
+
+	resubmit_list = resubmit->resubmit_list;
+	while (resubmit->resubmit_num-- > 0) {
+		req_idx = resubmit_list[resubmit->resubmit_num].index;
+		SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "====== Start processing request idx %"PRIu16"======\n",
+			      req_idx);
+
+		if (spdk_unlikely(req_idx >= vq->vring.size)) {
+			SPDK_ERRLOG("%s: request idx '%"PRIu16"' exceeds virtqueue size (%"PRIu16").\n",
+				    bvdev->vdev.name, req_idx, vq->vring.size);
+			vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
+			continue;
+		}
+
+		task = &((struct spdk_vhost_blk_task *)vq->tasks)[req_idx];
+		if (spdk_unlikely(task->used)) {
+			SPDK_ERRLOG("%s: request with idx '%"PRIu16"' is already pending.\n",
+				    bvdev->vdev.name, req_idx);
+			vhost_vq_used_ring_enqueue(vsession, vq, req_idx, 0);
+			continue;
+		}
+
+		vsession->task_cnt++;
+
+		task->used = true;
+		task->iovcnt = SPDK_COUNTOF(task->iovs);
+		task->status = NULL;
+		task->used_len = 0;
+
+		rc = process_blk_request(task, bvsession, vq);
+		if (rc == 0) {
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "====== Task %p req_idx %d submitted ======\n", task,
+				      req_idx);
+		} else {
+			SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "====== Task %p req_idx %d failed ======\n", task,
+				      req_idx);
+		}
+	}
+
+	free(resubmit_list);
+	resubmit->resubmit_list = NULL;
+}
+
+static void
 process_vq(struct spdk_vhost_blk_session *bvsession, struct spdk_vhost_virtqueue *vq)
 {
 	struct spdk_vhost_blk_task *task;
@@ -424,6 +499,9 @@ process_vq(struct spdk_vhost_blk_session *bvsession, struct spdk_vhost_virtqueue
 	int rc;
 	uint16_t reqs[32];
 	uint16_t reqs_cnt, i;
+	uint16_t vq_idx = vq->vring_idx;
+
+	submit_inflight_desc(bvsession, vq);
 
 	reqs_cnt = vhost_vq_avail_ring_get(vq, reqs, SPDK_COUNTOF(reqs));
 	if (!reqs_cnt) {
@@ -441,6 +519,7 @@ process_vq(struct spdk_vhost_blk_session *bvsession, struct spdk_vhost_virtqueue
 			continue;
 		}
 
+		rte_vhost_set_inflight_desc_split(vsession->vid, vq_idx, reqs[i]);
 		task = &((struct spdk_vhost_blk_task *)vq->tasks)[reqs[i]];
 		if (spdk_unlikely(task->used)) {
 			SPDK_ERRLOG("%s: request with idx '%"PRIu16"' is already pending.\n",
@@ -713,7 +792,7 @@ vhost_blk_start(struct spdk_vhost_session *vsession)
 {
 	struct vhost_poll_group *pg;
 
-	pg = vhost_get_poll_group(vsession->vdev->cpumask);
+	pg = vhost_get_poll_group(&vsession->vdev->cpumask);
 	return vhost_session_send_event(pg, vsession, vhost_blk_start_cb,
 					3, "start session");
 }
@@ -812,7 +891,7 @@ vhost_blk_write_config_json(struct spdk_vhost_dev *vdev, struct spdk_json_write_
 	spdk_json_write_named_object_begin(w, "params");
 	spdk_json_write_named_string(w, "ctrlr", vdev->name);
 	spdk_json_write_named_string(w, "dev_name", spdk_bdev_get_name(bvdev->bdev));
-	spdk_json_write_named_string(w, "cpumask", spdk_cpuset_fmt(vdev->cpumask));
+	spdk_json_write_named_string(w, "cpumask", spdk_cpuset_fmt(&vdev->cpumask));
 	spdk_json_write_named_bool(w, "readonly", bvdev->readonly);
 	spdk_json_write_object_end(w);
 
@@ -887,18 +966,6 @@ vhost_blk_get_config(struct spdk_vhost_dev *vdev, uint8_t *config,
 }
 
 static const struct spdk_vhost_dev_backend vhost_blk_device_backend = {
-	.virtio_features = SPDK_VHOST_FEATURES |
-	(1ULL << VIRTIO_BLK_F_SIZE_MAX) | (1ULL << VIRTIO_BLK_F_SEG_MAX) |
-	(1ULL << VIRTIO_BLK_F_GEOMETRY) | (1ULL << VIRTIO_BLK_F_RO) |
-	(1ULL << VIRTIO_BLK_F_BLK_SIZE) | (1ULL << VIRTIO_BLK_F_TOPOLOGY) |
-	(1ULL << VIRTIO_BLK_F_BARRIER)  | (1ULL << VIRTIO_BLK_F_SCSI) |
-	(1ULL << VIRTIO_BLK_F_FLUSH)    | (1ULL << VIRTIO_BLK_F_CONFIG_WCE) |
-	(1ULL << VIRTIO_BLK_F_MQ)       | (1ULL << VIRTIO_BLK_F_DISCARD) |
-	(1ULL << VIRTIO_BLK_F_WRITE_ZEROES),
-	.disabled_features = SPDK_VHOST_DISABLED_FEATURES | (1ULL << VIRTIO_BLK_F_GEOMETRY) |
-	(1ULL << VIRTIO_BLK_F_RO) | (1ULL << VIRTIO_BLK_F_FLUSH) | (1ULL << VIRTIO_BLK_F_CONFIG_WCE) |
-	(1ULL << VIRTIO_BLK_F_BARRIER) | (1ULL << VIRTIO_BLK_F_SCSI) | (1ULL << VIRTIO_BLK_F_DISCARD) |
-	(1ULL << VIRTIO_BLK_F_WRITE_ZEROES),
 	.session_ctx_size = sizeof(struct spdk_vhost_blk_session) - sizeof(struct spdk_vhost_session),
 	.start_session =  vhost_blk_start,
 	.stop_session = vhost_blk_stop,
@@ -955,8 +1022,8 @@ int
 spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *dev_name, bool readonly)
 {
 	struct spdk_vhost_blk_dev *bvdev = NULL;
+	struct spdk_vhost_dev *vdev;
 	struct spdk_bdev *bdev;
-	uint64_t features = 0;
 	int ret = 0;
 
 	spdk_vhost_lock();
@@ -974,6 +1041,24 @@ spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *dev_
 		goto out;
 	}
 
+	vdev = &bvdev->vdev;
+	vdev->virtio_features = SPDK_VHOST_BLK_FEATURES_BASE;
+	vdev->disabled_features = SPDK_VHOST_BLK_DISABLED_FEATURES;
+	vdev->protocol_features = SPDK_VHOST_BLK_PROTOCOL_FEATURES;
+
+	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
+		vdev->virtio_features |= (1ULL << VIRTIO_BLK_F_DISCARD);
+	}
+	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_WRITE_ZEROES)) {
+		vdev->virtio_features |= (1ULL << VIRTIO_BLK_F_WRITE_ZEROES);
+	}
+	if (readonly) {
+		vdev->virtio_features |= (1ULL << VIRTIO_BLK_F_RO);
+	}
+	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_FLUSH)) {
+		vdev->virtio_features |= (1ULL << VIRTIO_BLK_F_FLUSH);
+	}
+
 	ret = spdk_bdev_open(bdev, true, bdev_remove_cb, bvdev, &bvdev->bdev_desc);
 	if (ret != 0) {
 		SPDK_ERRLOG("%s: could not open bdev '%s', error=%d\n",
@@ -983,34 +1068,9 @@ spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *dev_
 
 	bvdev->bdev = bdev;
 	bvdev->readonly = readonly;
-	ret = vhost_dev_register(&bvdev->vdev, name, cpumask, &vhost_blk_device_backend);
+	ret = vhost_dev_register(vdev, name, cpumask, &vhost_blk_device_backend);
 	if (ret != 0) {
 		spdk_bdev_close(bvdev->bdev_desc);
-		goto out;
-	}
-
-	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
-		features |= (1ULL << VIRTIO_BLK_F_DISCARD);
-	}
-	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_WRITE_ZEROES)) {
-		features |= (1ULL << VIRTIO_BLK_F_WRITE_ZEROES);
-	}
-	if (readonly) {
-		features |= (1ULL << VIRTIO_BLK_F_RO);
-	}
-	if (spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_FLUSH)) {
-		features |= (1ULL << VIRTIO_BLK_F_FLUSH);
-	}
-
-	if (features && rte_vhost_driver_enable_features(bvdev->vdev.path, features)) {
-		SPDK_ERRLOG("%s: failed to enable features 0x%"PRIx64"\n", name, features);
-
-		if (vhost_dev_unregister(&bvdev->vdev) != 0) {
-			SPDK_ERRLOG("%s: failed to remove device\n", name);
-		}
-
-		spdk_bdev_close(bvdev->bdev_desc);
-		ret = -1;
 		goto out;
 	}
 

@@ -135,6 +135,13 @@ if __name__ == "__main__":
     p.add_argument('-d', '--disable', action='store_true', help='Disable context switch monitoring')
     p.set_defaults(func=framework_monitor_context_switch)
 
+    def framework_get_reactors(args):
+        print_dict(rpc.app.framework_get_reactors(args.client))
+
+    p = subparsers.add_parser(
+        'framework_get_reactors', help='Display list of all reactors')
+    p.set_defaults(func=framework_get_reactors)
+
     # bdev
     def bdev_set_options(args):
         rpc.bdev.bdev_set_options(args.client,
@@ -357,7 +364,8 @@ if __name__ == "__main__":
                                        high_priority_weight=args.high_priority_weight,
                                        nvme_adminq_poll_period_us=args.nvme_adminq_poll_period_us,
                                        nvme_ioq_poll_period_us=args.nvme_ioq_poll_period_us,
-                                       io_queue_requests=args.io_queue_requests)
+                                       io_queue_requests=args.io_queue_requests,
+                                       delay_cmd_submit=args.delay_cmd_submit)
 
     p = subparsers.add_parser('bdev_nvme_set_options', aliases=['set_bdev_nvme_options'],
                               help='Set options for the bdev nvme type. This is startup command.')
@@ -381,6 +389,9 @@ if __name__ == "__main__":
                    help='How often to poll I/O queues for completions', type=int)
     p.add_argument('-s', '--io-queue-requests',
                    help='The number of requests allocated for each NVMe I/O queue. Default: 512', type=int)
+    p.add_argument('-d', '--disable-delay-cmd-submit',
+                   help='Disable delaying NVMe command submission, i.e. no batching of multiple commands',
+                   action='store_false', dest='delay_cmd_submit', default=True)
     p.set_defaults(func=bdev_nvme_set_options)
 
     def bdev_nvme_set_hotplug(args):
@@ -452,15 +463,12 @@ if __name__ == "__main__":
 
     def bdev_nvme_cuse_register(args):
         rpc.bdev.bdev_nvme_cuse_register(args.client,
-                                         name=args.name,
-                                         dev_path=args.dev_path)
+                                         name=args.name)
 
     p = subparsers.add_parser('bdev_nvme_cuse_register',
                               help='Register CUSE devices on NVMe controller')
     p.add_argument('-n', '--name',
                    help='Name of the NVMe controller. Example: Nvme0', required=True)
-    p.add_argument('-p', '--dev_path',
-                   help='CUSE dev path including prefix: e.g. spdk/nvme0 will result: /dev/spdk/nvme0n1', required=True)
     p.set_defaults(func=bdev_nvme_cuse_register)
 
     def bdev_nvme_cuse_unregister(args):
@@ -2065,6 +2073,33 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('name', help='Virtio device name. E.g. VirtioUser0')
     p.set_defaults(func=bdev_virtio_detach_controller)
 
+    # OCSSD
+    def bdev_ocssd_create(args):
+        nsid = int(args.nsid) if args.nsid is not None else None
+        print_json(rpc.bdev.bdev_ocssd_create(args.client,
+                                              ctrlr_name=args.ctrlr_name,
+                                              bdev_name=args.name,
+                                              nsid=nsid,
+                                              range=args.range))
+
+    p = subparsers.add_parser('bdev_ocssd_create',
+                              help='Creates zoned bdev on specified Open Channel controller')
+    p.add_argument('-c', '--ctrlr_name', help='Name of the OC NVMe controller', required=True)
+    p.add_argument('-b', '--name', help='Name of the bdev to create', required=True)
+    p.add_argument('-n', '--nsid', help='Namespace ID', required=False)
+    p.add_argument('-r', '--range', help='Parallel unit range (in the form of BEGIN-END (inclusive))',
+                   required=False)
+    p.set_defaults(func=bdev_ocssd_create)
+
+    def bdev_ocssd_delete(args):
+        print_json(rpc.bdev.bdev_ocssd_delete(args.client,
+                                              name=args.name))
+
+    p = subparsers.add_parser('bdev_ocssd_delete',
+                              help='Deletes Open Channel bdev')
+    p.add_argument('name', help='Name of the Open Channel bdev')
+    p.set_defaults(func=bdev_ocssd_delete)
+
     # ioat
     def ioat_scan_copy_engine(args):
         pci_whitelist = []
@@ -2220,6 +2255,13 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         'thread_get_stats', help='Display current statistics of all the threads')
     p.set_defaults(func=thread_get_stats)
 
+    def env_dpdk_get_mem_stats(args):
+        print_dict(rpc.env_dpdk.env_dpdk_get_mem_stats(args.client))
+
+    p = subparsers.add_parser(
+        'env_dpdk_get_mem_stats', help='write the dpdk memory stats to a file.')
+    p.set_defaults(func=env_dpdk_get_mem_stats)
+
     # blobfs
     def blobfs_detect(args):
         print(rpc.blobfs.blobfs_detect(args.client,
@@ -2301,7 +2343,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         try:
             call_rpc_func(args)
         except JSONRPCException as ex:
-            print(ex)
+            print(ex.message)
             exit(1)
     elif sys.stdin.isatty():
         # No arguments and no data piped through stdin

@@ -129,6 +129,15 @@ extern pid_t g_spdk_nvme_pid;
  */
 #define NVME_QUIRK_DELAY_BEFORE_INIT 0x400
 
+/*
+ * Some SSDs exhibit poor performance with the default SPDK NVMe IO queue size.
+ * This quirk will increase the default to 1024 which matches other operating
+ * systems, at the cost of some extra memory usage.  Users can still override
+ * the increased default by changing the spdk_nvme_io_qpair_opts when allocating
+ * a new queue pair.
+ */
+#define NVME_QUIRK_MINIMUM_IO_QUEUE_SIZE 0x800
+
 #define NVME_MAX_ASYNC_EVENTS	(8)
 
 #define NVME_MAX_ADMIN_TIMEOUT_IN_SECS	(30)
@@ -143,6 +152,7 @@ extern pid_t g_spdk_nvme_pid;
  */
 #define DEFAULT_MAX_IO_QUEUES		(1024)
 #define DEFAULT_IO_QUEUE_SIZE		(256)
+#define DEFAULT_IO_QUEUE_SIZE_FOR_QUIRK	(1024) /* Matches Linux kernel driver */
 
 #define DEFAULT_ADMIN_QUEUE_REQUESTS	(32)
 #define DEFAULT_IO_QUEUE_REQUESTS	(512)
@@ -226,7 +236,13 @@ struct nvme_request {
 
 	uint8_t				retries;
 
-	bool				timed_out;
+	uint8_t				timed_out : 1;
+
+	/**
+	 * True if the request is in the queued_req list.
+	 */
+	uint8_t				queued : 1;
+	uint8_t				reserved : 6;
 
 	/**
 	 * Number of children requests still outstanding for this
@@ -356,8 +372,6 @@ struct spdk_nvme_qpair {
 	uint8_t				in_completion_context : 1;
 	uint8_t				delete_after_completion_context: 1;
 
-	uint8_t				transport_qp_is_failed: 1;
-
 	/*
 	 * Set when no deletion notification is needed. For example, the process
 	 * which allocated this qpair exited unexpectedly.
@@ -383,6 +397,8 @@ struct spdk_nvme_qpair {
 	struct spdk_nvme_ctrlr_process	*active_proc;
 
 	void				*req_buf;
+
+	uint8_t				transport_failure_reason: 2;
 };
 
 struct spdk_nvme_ns {
@@ -994,10 +1010,9 @@ nvme_qpair_set_state(struct spdk_nvme_qpair *qpair, enum nvme_qpair_state state)
 	qpair->state = state;
 }
 
-static inline bool
-nvme_qpair_state_equals(struct spdk_nvme_qpair *qpair, enum nvme_qpair_state state)
-{
-	return qpair->state == state;
+static inline enum nvme_qpair_state
+nvme_qpair_get_state(struct spdk_nvme_qpair *qpair) {
+	return qpair->state;
 }
 
 static inline void

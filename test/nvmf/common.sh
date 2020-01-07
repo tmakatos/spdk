@@ -214,7 +214,9 @@ function nvmfappstart()
 function nvmftestfini()
 {
 	nvmfcleanup
-	killprocess $nvmfpid
+	if [ -n "$nvmfpid" ]; then
+		killprocess $nvmfpid
+	fi
 	if [ "$TEST_MODE" == "iso" ]; then
 		$rootdir/scripts/setup.sh reset
 		if [ "$TEST_TRANSPORT" == "rdma" ]; then
@@ -246,10 +248,10 @@ function check_ip_is_soft_roce()
 	IP=$1
 	if hash rxe_cfg; then
 		dev=$(ip -4 -o addr show | grep $IP | cut -d" " -f2)
-		if [ -z $(rxe_cfg | grep $dev | awk '{print $4}' | grep "rxe") ]; then
-			return 1
-		else
+		if (rxe_cfg | grep $dev | awk '{print $4}' | grep -q "rxe"); then
 			return 0
+		else
+			return 1
 		fi
 	else
 		return 1
@@ -261,7 +263,7 @@ function nvme_connect()
 	local init_count
 	init_count=$(nvme list | wc -l)
 
-	if ! nvme connect $@; then return $?; fi
+	if ! nvme connect "$@"; then return $?; fi
 
 	for i in $(seq 1 10); do
 		if [ $(nvme list | wc -l) -gt $init_count ]; then

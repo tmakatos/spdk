@@ -63,7 +63,14 @@ extern "C" {
 /** Asynchronous event type */
 enum spdk_bdev_event_type {
 	SPDK_BDEV_EVENT_REMOVE,
-	SPDK_BDEV_EVENT_RESIZE
+	SPDK_BDEV_EVENT_RESIZE,
+	SPDK_BDEV_EVENT_MEDIA_MANAGEMENT,
+};
+
+/** Media management event details */
+struct spdk_bdev_media_event {
+	uint64_t	offset;
+	uint64_t	num_blocks;
 };
 
 /**
@@ -200,6 +207,14 @@ typedef void (*spdk_bdev_get_device_stat_cb)(struct spdk_bdev *bdev,
 		struct spdk_bdev_io_stat *stat, void *cb_arg, int rc);
 
 /**
+ * Block device channel IO timeout callback
+ *
+ * \param cb_arg Callback argument
+ * \param bdev_io The IO cause the timeout
+ */
+typedef void (*spdk_bdev_io_timeout_cb)(void *cb_arg, struct spdk_bdev_io *bdev_io);
+
+/**
  * Initialize block device modules.
  *
  * \param cb_fn Called when the initialization is complete.
@@ -325,6 +340,27 @@ void spdk_bdev_close(struct spdk_bdev_desc *desc);
  * \return bdev associated with the descriptor
  */
 struct spdk_bdev *spdk_bdev_desc_get_bdev(struct spdk_bdev_desc *desc);
+
+/**
+ * Set a time limit for the timeout IO of the bdev and timeout callback.
+ * We can use this function to enable/disable the timeout handler. If
+ * the timeout_in_sec > 0 then it means to enable the timeout IO handling
+ * or change the time limit. If the timeout_in_sec == 0 it means to
+ * disable the timeout IO handling. If you want to enable or change the
+ * timeout IO handle you need to specify the spdk_bdev_io_timeout_cb it
+ * means the upper user determines what to do if you meet the timeout IO,
+ * for example, you can reset the device or abort the IO.
+ * Note: This function must run in the desc's thread.
+ *
+ * \param desc Block device descriptor.
+ * \param timeout_in_sec Timeout value
+ * \param cb_fn Bdev IO timeout callback
+ * \param cb_arg Callback argument
+ *
+ * \return 0 on success, negated errno on failure.
+ */
+int spdk_bdev_set_timeout(struct spdk_bdev_desc *desc, uint64_t timeout_in_sec,
+			  spdk_bdev_io_timeout_cb cb_fn, void *cb_arg);
 
 /**
  * Check whether the block device supports the I/O type.
@@ -1428,6 +1464,20 @@ void spdk_bdev_histogram_enable(struct spdk_bdev *bdev, spdk_bdev_histogram_stat
 void spdk_bdev_histogram_get(struct spdk_bdev *bdev, struct spdk_histogram_data *histogram,
 			     spdk_bdev_histogram_data_cb cb_fn,
 			     void *cb_arg);
+
+/**
+ * Retrieves media events.  Can only be called from the context of
+ * SPDK_BDEV_EVENT_MEDIA_MANAGEMENT event callback.  These events are sent by
+ * devices exposing raw access to the physical medium (e.g. Open Channel SSD).
+ *
+ * \param bdev_desc Block device descriptor
+ * \param events Array of media mangement event descriptors
+ * \param max_events Size of the events array
+ *
+ * \return number of events retrieved
+ */
+size_t spdk_bdev_get_media_events(struct spdk_bdev_desc *bdev_desc,
+				  struct spdk_bdev_media_event *events, size_t max_events);
 
 #ifdef __cplusplus
 }

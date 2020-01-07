@@ -88,6 +88,7 @@ struct spdk_iscsi_task {
 	uint32_t datain_datasn;
 	uint32_t acked_data_sn; /* next expected datain datasn */
 	uint32_t ttt;
+	bool is_r2t_active;
 
 	uint32_t tag;
 
@@ -162,12 +163,6 @@ spdk_iscsi_task_is_read(struct spdk_iscsi_task *task)
 
 	scsi_req = (struct iscsi_bhs_scsi_req *)spdk_iscsi_task_get_bhs(task);
 	return (scsi_req->read_bit == 1);
-}
-
-static inline uint32_t
-spdk_iscsi_task_get_cmdsn(struct spdk_iscsi_task *task)
-{
-	return spdk_iscsi_task_get_pdu(task)->cmd_sn;
 }
 
 struct spdk_iscsi_task *spdk_iscsi_task_get(struct spdk_iscsi_conn *conn,

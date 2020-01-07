@@ -32,13 +32,48 @@ function rpc_config() {
 	$rpc_py -s $1 bdev_malloc_create 64 512
 }
 
+function rpc_validate_ip() {
+	# Always delete the IP first in case it is there already
+	cmd="$rpc_py -s $1 net_interface_delete_ip_address 1 $MIGRATION_ADDRESS"
+	if $cmd; then
+		echo "Delete existing IP succeeded."
+	else
+		echo "Ignore the failure as IP did not exist."
+	fi
+
+	cmd="$rpc_py -s $1 net_interface_add_ip_address 1 $MIGRATION_ADDRESS"
+	if $cmd; then
+		echo "Add new IP succeeded."
+	else
+		echo "Add new IP failed. Expected to succeed..."
+		exit 1;
+	fi
+	# Add same IP again
+	if $cmd; then
+		echo "Same IP existed. Expected to fail..."
+		exit 1;
+	fi
+
+	cmd="$rpc_py -s $1 net_interface_delete_ip_address 1 $MIGRATION_ADDRESS"
+	if $cmd; then
+		echo "Delete existing IP succeeded."
+	else
+		echo "Delete existing IP failed. Expected to succeed..."
+		exit 1;
+	fi
+	# Delete same IP again
+	if $cmd; then
+		echo "No required IP existed. Expected to fail..."
+		exit 1;
+	fi
+}
+
 function rpc_add_target_node() {
 	$rpc_py -s $1 net_interface_add_ip_address 1 $MIGRATION_ADDRESS
 	$rpc_py -s $1 iscsi_create_portal_group $PORTAL_TAG $MIGRATION_ADDRESS:$ISCSI_PORT
 	$rpc_py -s $1 iscsi_create_target_node target1 target1_alias 'Malloc0:0' $PORTAL_TAG:$INITIATOR_TAG 64 -d
+	$rpc_py -s $1 net_interface_delete_ip_address 1 $MIGRATION_ADDRESS
 }
-
-timing_enter ip_migration
 
 echo "Running ip migration tests"
 for ((i = 0; i < 2; i++)); do
@@ -66,6 +101,7 @@ for ((i = 0; i < 2; i++)); do
 done
 
 rpc_first_addr="/var/tmp/spdk0.sock"
+rpc_validate_ip $rpc_first_addr
 rpc_add_target_node $rpc_first_addr
 
 sleep 1
@@ -92,4 +128,3 @@ iscsicleanup
 $rpc_py -s $rpc_second_addr spdk_kill_instance SIGTERM
 iscsitestfini $1 $2
 report_test_completion "iscsi_ip_migration"
-timing_exit ip_migration

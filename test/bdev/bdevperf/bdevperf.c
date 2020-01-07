@@ -74,7 +74,7 @@ static int g_show_performance_real_time = 0;
 static uint64_t g_show_performance_period_in_usec = 1000000;
 static uint64_t g_show_performance_period_num = 0;
 static uint64_t g_show_performance_ema_period = 0;
-static bool g_run_failed = false;
+static int g_run_rc = 0;
 static bool g_shutdown = false;
 static uint64_t g_shutdown_tsc;
 static bool g_zcopy = true;
@@ -97,7 +97,8 @@ struct io_target {
 	struct spdk_bdev		*bdev;
 	struct spdk_bdev_desc		*bdev_desc;
 	struct spdk_io_channel		*ch;
-	struct io_target		*next;
+	TAILQ_ENTRY(io_target)		link;
+	struct io_target_group		*group;
 	unsigned			lcore;
 	uint64_t			io_completed;
 	uint64_t			prev_io_completed;
@@ -113,8 +114,14 @@ struct io_target {
 	TAILQ_HEAD(, bdevperf_task)	task_list;
 };
 
-struct io_target **g_head;
-uint32_t *g_coremap;
+struct io_target_group {
+	TAILQ_HEAD(, io_target)		targets;
+	uint32_t			lcore;
+	TAILQ_ENTRY(io_target_group)	link;
+};
+
+TAILQ_HEAD(, io_target_group) g_head = TAILQ_HEAD_INITIALIZER(g_head);
+struct io_target_group *g_next_tg;
 static uint32_t g_target_count = 0;
 
 /*
@@ -220,29 +227,27 @@ verify_data(void *wr_buf, int wr_buf_len, void *rd_buf, int rd_buf_len, int bloc
 static int
 blockdev_heads_init(void)
 {
-	uint32_t i, idx = 0;
-	uint32_t core_count = spdk_env_get_core_count();
-
-	g_head = calloc(core_count, sizeof(struct io_target *));
-	if (!g_head) {
-		fprintf(stderr, "Cannot allocate g_head array with size=%u\n",
-			core_count);
-		return -1;
-	}
-
-	g_coremap = calloc(core_count, sizeof(uint32_t));
-	if (!g_coremap) {
-		free(g_head);
-		fprintf(stderr, "Cannot allocate coremap array with size=%u\n",
-			core_count);
-		return -1;
-	}
+	uint32_t i;
+	struct io_target_group *group, *tmp;
 
 	SPDK_ENV_FOREACH_CORE(i) {
-		g_coremap[idx++] = i;
+		group = calloc(1, sizeof(*group));
+		if (!group) {
+			fprintf(stderr, "Cannot allocate io_target_group\n");
+			goto error;
+		}
+		group->lcore = i;
+		TAILQ_INIT(&group->targets);
+		TAILQ_INSERT_TAIL(&g_head, group, link);
 	}
-
 	return 0;
+
+error:
+	TAILQ_FOREACH_SAFE(group, &g_head, link, tmp) {
+		TAILQ_REMOVE(&g_head, group, link);
+		free(group);
+	}
+	return -1;
 }
 
 static void
@@ -264,37 +269,23 @@ bdevperf_free_target(struct io_target *target)
 static void
 bdevperf_free_targets(void)
 {
-	uint32_t i, core_count;
-	struct io_target *target, *next_target;
+	struct io_target_group *group, *tmp_group;
+	struct io_target *target, *tmp_target;
 
-	if (!g_head) {
-		return;
-	}
-
-	core_count = spdk_env_get_core_count();
-	for (i = 0; i < core_count; i++) {
-		target = g_head[i];
-		g_head[i] = NULL;
-		while (target != NULL) {
-			next_target = target->next;
+	TAILQ_FOREACH_SAFE(group, &g_head, link, tmp_group) {
+		TAILQ_REMOVE(&g_head, group, link);
+		TAILQ_FOREACH_SAFE(target, &group->targets, link, tmp_target) {
+			TAILQ_REMOVE(&group->targets, target, link);
 			bdevperf_free_target(target);
-			target = next_target;
 		}
+		free(group);
 	}
 }
 
 static void
-blockdev_heads_destroy(void)
+_target_gone(void *arg1, void *arg2)
 {
-	bdevperf_free_targets();
-	free(g_head);
-	free(g_coremap);
-}
-
-static void
-bdevperf_target_gone(void *arg)
-{
-	struct io_target *target = arg;
+	struct io_target *target = arg1;
 
 	spdk_poller_unregister(&target->run_timer);
 	if (g_reset) {
@@ -304,13 +295,24 @@ bdevperf_target_gone(void *arg)
 	target->is_draining = true;
 }
 
+static void
+bdevperf_target_gone(void *arg)
+{
+	struct io_target *target = arg;
+	struct spdk_event *event;
+
+	event = spdk_event_allocate(target->lcore, _target_gone, target, NULL);
+	spdk_event_call(event);
+}
+
 static int
 bdevperf_construct_target(struct spdk_bdev *bdev)
 {
+	struct io_target_group *group;
 	struct io_target *target;
 	size_t align;
 	int block_size, data_block_size;
-	int rc, index;
+	int rc;
 
 	if (g_unmap && !spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
 		printf("Skipping %s because it does not support unmap\n", spdk_bdev_get_name(bdev));
@@ -380,11 +382,16 @@ bdevperf_construct_target(struct spdk_bdev *bdev)
 	target->reset_timer = NULL;
 	TAILQ_INIT(&target->task_list);
 
-	/* Mapping each created target to lcore */
-	index = g_target_count % spdk_env_get_core_count();
-	target->next = g_head[index];
-	target->lcore = g_coremap[index];
-	g_head[index] = target;
+	/* Mapping each created target to target group */
+	if (g_next_tg == NULL) {
+		g_next_tg = TAILQ_FIRST(&g_head);
+		assert(g_next_tg != NULL);
+	}
+	group = g_next_tg;
+	g_next_tg = TAILQ_NEXT(g_next_tg, link);
+	target->lcore = group->lcore;
+	target->group = group;
+	TAILQ_INSERT_TAIL(&group->targets, target, link);
 	g_target_count++;
 
 	return 0;
@@ -432,12 +439,17 @@ bdevperf_construct_targets(void)
 }
 
 static void
+bdevperf_fini(int rc)
+{
+	bdevperf_free_targets();
+	spdk_app_stop(rc);
+}
+
+static void
 end_run(void *arg1, void *arg2)
 {
 	struct io_target *target = arg1;
-	int rc = 0;
 
-	spdk_put_io_channel(target->ch);
 	spdk_bdev_close(target->bdev_desc);
 	if (--g_target_count == 0) {
 		if (g_show_performance_real_time) {
@@ -450,21 +462,17 @@ end_run(void *arg1, void *arg2)
 		}
 
 		if (g_time_in_usec) {
-			if (!g_run_failed) {
+			if (!g_run_rc) {
 				performance_dump(g_time_in_usec, 0);
 			}
 		} else {
 			printf("Test time less than one microsecond, no performance data will be shown\n");
 		}
 
-		if (g_run_failed) {
-			rc = 1;
-		}
-
 		if (g_request && !g_shutdown) {
-			rpc_perform_tests_cb(rc);
+			rpc_perform_tests_cb(g_run_rc);
 		} else {
-			spdk_app_stop(rc);
+			bdevperf_fini(g_run_rc);
 		}
 	}
 }
@@ -496,7 +504,7 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	if (!success) {
 		if (!g_reset && !g_continue_on_failure) {
 			target->is_draining = true;
-			g_run_failed = true;
+			g_run_rc = -1;
 			printf("task offset: %lu on target bdev=%s fails\n",
 			       task->offset_blocks, target->name);
 		}
@@ -511,7 +519,7 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 				 target->io_size_blocks, md_check)) {
 			printf("Buffer mismatch! Disk Offset: %lu\n", task->offset_blocks);
 			target->is_draining = true;
-			g_run_failed = true;
+			g_run_rc = -1;
 		}
 	}
 
@@ -534,6 +542,7 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	} else {
 		TAILQ_INSERT_TAIL(&target->task_list, task, link);
 		if (target->current_queue_depth == 0) {
+			spdk_put_io_channel(target->ch);
 			complete = spdk_event_allocate(g_master_core, end_run, target, NULL);
 			spdk_event_call(complete);
 		}
@@ -565,7 +574,7 @@ bdevperf_verify_submit_read(void *cb_arg)
 	} else if (rc != 0) {
 		printf("Failed to submit read: %d\n", rc);
 		target->is_draining = true;
-		g_run_failed = true;
+		g_run_rc = rc;
 	}
 }
 
@@ -711,7 +720,7 @@ bdevperf_submit_task(void *arg)
 	} else if (rc != 0) {
 		printf("Failed to submit bdev_io: %d\n", rc);
 		target->is_draining = true;
-		g_run_failed = true;
+		g_run_rc = rc;
 		return;
 	}
 
@@ -728,7 +737,7 @@ bdevperf_zcopy_get_buf_complete(struct spdk_bdev_io *bdev_io, bool success, void
 
 	if (!success) {
 		target->is_draining = true;
-		g_run_failed = true;
+		g_run_rc = -1;
 		return;
 	}
 
@@ -774,12 +783,26 @@ bdevperf_prep_zcopy_write_task(void *arg)
 	target->current_queue_depth++;
 }
 
+static struct bdevperf_task *
+bdevperf_target_get_task(struct io_target *target)
+{
+	struct bdevperf_task *task;
+
+	task = TAILQ_FIRST(&target->task_list);
+	if (!task) {
+		printf("Task allocation failed\n");
+		abort();
+	}
+
+	TAILQ_REMOVE(&target->task_list, task, link);
+	return task;
+}
+
 static __thread unsigned int seed = 0;
 
 static void
-bdevperf_prep_task(struct bdevperf_task *task)
+bdevperf_submit_single(struct io_target *target, struct bdevperf_task *task)
 {
-	struct io_target *target = task->target;
 	uint64_t offset_in_ios;
 
 	if (g_is_random) {
@@ -829,26 +852,13 @@ bdevperf_prep_task(struct bdevperf_task *task)
 }
 
 static void
-bdevperf_submit_single(struct io_target *target, struct bdevperf_task *task)
-{
-	if (!task) {
-		if (!TAILQ_EMPTY(&target->task_list)) {
-			task = TAILQ_FIRST(&target->task_list);
-			TAILQ_REMOVE(&target->task_list, task, link);
-		} else {
-			printf("Task allocation failed\n");
-			abort();
-		}
-	}
-
-	bdevperf_prep_task(task);
-}
-
-static void
 bdevperf_submit_io(struct io_target *target, int queue_depth)
 {
+	struct bdevperf_task *task;
+
 	while (queue_depth-- > 0) {
-		bdevperf_submit_single(target, NULL);
+		task = bdevperf_target_get_task(target);
+		bdevperf_submit_single(target, task);
 	}
 }
 
@@ -878,7 +888,7 @@ reset_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	if (!success) {
 		printf("Reset blockdev=%s failed\n", spdk_bdev_get_name(target->bdev));
 		target->is_draining = true;
-		g_run_failed = true;
+		g_run_rc = -1;
 	}
 
 	TAILQ_INSERT_TAIL(&target->task_list, task, link);
@@ -892,25 +902,19 @@ static int
 reset_target(void *arg)
 {
 	struct io_target *target = arg;
-	struct bdevperf_task	*task = NULL;
+	struct bdevperf_task *task;
 	int rc;
 
 	spdk_poller_unregister(&target->reset_timer);
 
 	/* Do reset. */
-	task = TAILQ_FIRST(&target->task_list);
-	if (!task) {
-		printf("Task allocation failed\n");
-		abort();
-	}
-	TAILQ_REMOVE(&target->task_list, task, link);
-
+	task = bdevperf_target_get_task(target);
 	rc = spdk_bdev_reset(target->bdev_desc, target->ch,
 			     reset_cb, task);
 	if (rc) {
 		printf("Reset failed: %d\n", rc);
 		target->is_draining = true;
-		g_run_failed = true;
+		g_run_rc = -1;
 	}
 
 	return -1;
@@ -919,20 +923,19 @@ reset_target(void *arg)
 static void
 bdevperf_submit_on_core(void *arg1, void *arg2)
 {
-	struct io_target *target = arg1;
+	struct io_target_group *group = arg1;
+	struct io_target *target;
 
 	/* Submit initial I/O for each block device. Each time one
 	 * completes, another will be submitted. */
-	while (target != NULL) {
+	TAILQ_FOREACH(target, &group->targets, link) {
 		target->ch = spdk_bdev_get_io_channel(target->bdev_desc);
 		if (!target->ch) {
 			printf("Skip this device (%s) as IO channel not setup.\n",
 			       spdk_bdev_get_name(target->bdev));
 			g_target_count--;
-			g_run_failed = true;
+			g_run_rc = -1;
 			spdk_bdev_close(target->bdev_desc);
-
-			target = target->next;
 			continue;
 		}
 
@@ -944,7 +947,6 @@ bdevperf_submit_on_core(void *arg1, void *arg2)
 					      10 * 1000000);
 		}
 		bdevperf_submit_io(target, g_queue_depth);
-		target = target->next;
 	}
 }
 
@@ -998,37 +1000,35 @@ get_ema_io_per_second(struct io_target *target, uint64_t ema_period)
 static void
 performance_dump(uint64_t io_time_in_usec, uint64_t ema_period)
 {
-	uint32_t index;
 	unsigned lcore_id;
 	double io_per_second, mb_per_second;
 	double total_io_per_second, total_mb_per_second;
+	struct io_target_group *group;
 	struct io_target *target;
 
 	total_io_per_second = 0;
 	total_mb_per_second = 0;
-	for (index = 0; index < spdk_env_get_core_count(); index++) {
-		target = g_head[index];
-		if (target != NULL) {
-			lcore_id = target->lcore;
+	TAILQ_FOREACH(group, &g_head, link) {
+		if (!TAILQ_EMPTY(&group->targets)) {
+			lcore_id = group->lcore;
 			printf("\r Logical core: %u\n", lcore_id);
 		}
-		while (target != NULL) {
+		TAILQ_FOREACH(target, &group->targets, link) {
 			if (ema_period == 0) {
 				io_per_second = get_cma_io_per_second(target, io_time_in_usec);
 			} else {
 				io_per_second = get_ema_io_per_second(target, ema_period);
 			}
 			mb_per_second = io_per_second * g_io_size / (1024 * 1024);
-			printf("\r %-20s: %10.2f IO/s %10.2f MB/s\n",
+			printf("\r %-20s: %10.2f IOPS %10.2f MiB/s\n",
 			       target->name, io_per_second, mb_per_second);
 			total_io_per_second += io_per_second;
 			total_mb_per_second += mb_per_second;
-			target = target->next;
 		}
 	}
 
 	printf("\r =====================================================\n");
-	printf("\r %-20s: %10.2f IO/s %10.2f MB/s\n",
+	printf("\r %-20s: %10.2f IOPS %10.2f MiB/s\n",
 	       "Total", total_io_per_second, total_mb_per_second);
 	fflush(stdout);
 
@@ -1081,10 +1081,10 @@ static struct bdevperf_task *bdevperf_construct_task_on_target(struct io_target 
 static int
 bdevperf_construct_targets_tasks(void)
 {
-	uint32_t i;
+	struct io_target_group *group;
 	struct io_target *target;
 	struct bdevperf_task *task;
-	int j, task_num = g_queue_depth;
+	int i, task_num = g_queue_depth;
 
 	/*
 	 * Create the task pool after we have enumerated the targets, so that we know
@@ -1096,20 +1096,15 @@ bdevperf_construct_targets_tasks(void)
 	}
 
 	/* Initialize task list for each target */
-	for (i = 0; i < spdk_env_get_core_count(); i++) {
-		target = g_head[i];
-		if (!target) {
-			break;
-		}
-		while (target != NULL) {
-			for (j = 0; j < task_num; j++) {
+	TAILQ_FOREACH(group, &g_head, link) {
+		TAILQ_FOREACH(target, &group->targets, link) {
+			for (i = 0; i < task_num; i++) {
 				task = bdevperf_construct_task_on_target(target);
 				if (task == NULL) {
 					goto ret;
 				}
 				TAILQ_INSERT_TAIL(&target->task_list, task, link);
 			}
-			target = target->next;
 		}
 	}
 
@@ -1266,11 +1261,14 @@ verify_test_params(struct spdk_app_opts *opts)
 static int
 bdevperf_test(void)
 {
-	uint32_t i;
-	struct io_target *target;
+	struct io_target_group *group;
 	struct spdk_event *event;
 	int rc;
-	uint32_t core_count = spdk_min(g_target_count, spdk_env_get_core_count());
+
+	if (g_target_count == 0) {
+		fprintf(stderr, "No valid bdevs found.\n");
+		return -ENODEV;
+	}
 
 	rc = bdevperf_construct_targets_tasks();
 	if (rc) {
@@ -1288,14 +1286,12 @@ bdevperf_test(void)
 	}
 
 	/* Send events to start all I/O */
-	for (i = 0; i < core_count; i++) {
-		target = g_head[i];
-		if (target == NULL) {
-			return -1;
+	TAILQ_FOREACH(group, &g_head, link) {
+		if (!TAILQ_EMPTY(&group->targets)) {
+			event = spdk_event_allocate(group->lcore, bdevperf_submit_on_core,
+						    group, NULL);
+			spdk_event_call(event);
 		}
-		event = spdk_event_allocate(target->lcore, bdevperf_submit_on_core,
-					    target, NULL);
-		spdk_event_call(event);
 	}
 	return 0;
 }
@@ -1307,7 +1303,7 @@ bdevperf_run(void *arg1)
 
 	rc = blockdev_heads_init();
 	if (rc) {
-		spdk_app_stop(1);
+		spdk_app_stop(rc);
 		return;
 	}
 
@@ -1320,15 +1316,9 @@ bdevperf_run(void *arg1)
 
 	bdevperf_construct_targets();
 
-	if (g_target_count == 0) {
-		fprintf(stderr, "No valid bdevs found.\n");
-		spdk_app_stop(1);
-		return;
-	}
-
 	rc = bdevperf_test();
 	if (rc) {
-		spdk_app_stop(1);
+		bdevperf_fini(rc);
 		return;
 	}
 }
@@ -1336,43 +1326,42 @@ bdevperf_run(void *arg1)
 static void
 bdevperf_stop_io_on_core(void *arg1, void *arg2)
 {
-	struct io_target *target = arg1;
+	struct io_target_group *group = arg1;
+	struct io_target *target;
 
 	/* Stop I/O for each block device. */
-	while (target != NULL) {
+	TAILQ_FOREACH(target, &group->targets, link) {
 		end_target(target);
-		target = target->next;
 	}
 }
 
 static void
 spdk_bdevperf_shutdown_cb(void)
 {
-	uint32_t i;
-	struct io_target *target;
+	struct io_target_group *group;
 	struct spdk_event *event;
 
 	g_shutdown = true;
 
 	if (g_target_count == 0) {
+		bdevperf_fini(g_run_rc);
+		return;
+	}
+
+	if (TAILQ_EMPTY(&g_head)) {
 		spdk_app_stop(0);
 		return;
 	}
 
 	g_shutdown_tsc = spdk_get_ticks() - g_shutdown_tsc;
 
-	/* Send events to stop all I/O on each core */
-	for (i = 0; i < spdk_env_get_core_count(); i++) {
-		if (g_head == NULL) {
-			break;
+	/* Send events to stop all I/O on each target group */
+	TAILQ_FOREACH(group, &g_head, link) {
+		if (!TAILQ_EMPTY(&group->targets)) {
+			event = spdk_event_allocate(group->lcore, bdevperf_stop_io_on_core,
+						    group, NULL);
+			spdk_event_call(event);
 		}
-		target = g_head[i];
-		if (target == NULL) {
-			break;
-		}
-		event = spdk_event_allocate(target->lcore, bdevperf_stop_io_on_core,
-					    target, NULL);
-		spdk_event_call(event);
 	}
 }
 
@@ -1421,8 +1410,6 @@ bdevperf_parse_arg(int ch, char *arg)
 		case 'S':
 			g_show_performance_real_time = 1;
 			g_show_performance_period_in_usec = tmp * 1000000;
-			g_show_performance_period_in_usec = spdk_max(g_show_performance_period_in_usec,
-							    g_show_performance_period_in_usec);
 			break;
 		default:
 			return -EINVAL;
@@ -1470,21 +1457,10 @@ rpc_perform_tests(struct spdk_jsonrpc_request *request, const struct spdk_json_v
 	g_request = request;
 
 	bdevperf_construct_targets();
-	if (g_target_count == 0) {
-		g_request = NULL;
-		fprintf(stderr, "No valid bdevs found.\n");
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-						 spdk_strerror(-ENODEV));
-		return;
-	}
 
 	rc = bdevperf_test();
 	if (rc) {
-		g_request = NULL;
-		bdevperf_free_targets();
-		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-						     "Could not perform tests due to error: %s", spdk_strerror(-rc));
-		return;
+		rpc_perform_tests_cb(rc);
 	}
 }
 SPDK_RPC_REGISTER("perform_tests", rpc_perform_tests, SPDK_RPC_RUNTIME)
@@ -1519,11 +1495,7 @@ main(int argc, char **argv)
 	}
 
 	rc = spdk_app_start(&opts, bdevperf_run, NULL);
-	if (rc) {
-		g_run_failed = true;
-	}
 
-	blockdev_heads_destroy();
 	spdk_app_fini();
-	return g_run_failed;
+	return rc;
 }

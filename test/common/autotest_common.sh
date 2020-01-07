@@ -1,6 +1,11 @@
 function xtrace_disable() {
-	PREV_BASH_OPTS="$-"
-	set +x
+	if [ "$XTRACE_DISABLED" != "yes" ]; then
+		PREV_BASH_OPTS="$-"
+		if [[ "$PREV_BASH_OPTS" == *"x"* ]]; then
+			XTRACE_DISABLED="yes"
+		fi
+		set +x
+	fi
 }
 
 xtrace_disable
@@ -18,7 +23,7 @@ function xtrace_enable() {
 # Keep it as alias to avoid xtrace_enable backtrace always pointing to xtrace_restore.
 # xtrace_enable will appear as called directly from the user script, from the same line
 # that "called" xtrace_restore.
-alias xtrace_restore='if [[ "$PREV_BASH_OPTS" == *"x"* ]]; then set -x; xtrace_enable; fi'
+alias xtrace_restore='if [[ "$PREV_BASH_OPTS" == *"x"* ]]; then set -x; XTRACE_DISABLED="no"; PREV_BASH_OPTS=""; xtrace_enable; fi'
 
 : ${RUN_NIGHTLY:=0}
 export RUN_NIGHTLY
@@ -84,22 +89,26 @@ export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1:abort_on_error=1'
 # and known leaks in external executables or libraries from showing up.
 asan_suppression_file="/var/tmp/asan_suppression_file"
 sudo rm -rf "$asan_suppression_file"
-
+cat << EOL >> "$asan_suppression_file"
 # ASAN has some bugs around thread_local variables.  We have a destructor in place
 # to free the thread contexts, but ASAN complains about the leak before those
 # destructors have a chance to run.  So suppress this one specific leak using
 # LSAN_OPTIONS.
-echo "leak:spdk_fs_alloc_thread_ctx" >> "$asan_suppression_file"
+leak:spdk_fs_alloc_thread_ctx
 
 # Suppress known leaks in fio project
-echo "leak:/usr/src/fio/parse.c" >> "$asan_suppression_file"
-echo "leak:/usr/src/fio/iolog.c" >> "$asan_suppression_file"
-echo "leak:/usr/src/fio/init.c" >> "$asan_suppression_file"
-echo "leak:fio_memalign" >> "$asan_suppression_file"
-echo "leak:spdk_fio_io_u_init" >> "$asan_suppression_file"
+leak:/usr/src/fio/parse.c
+leak:/usr/src/fio/iolog.c
+leak:/usr/src/fio/init.c
+leak:fio_memalign
+leak:spdk_fio_io_u_init
 
 # Suppress leaks in libiscsi
-echo "leak:libiscsi.so" >> "$asan_suppression_file"
+leak:libiscsi.so
+EOL
+
+# Suppress leaks in libfuse3
+echo "leak:libfuse3.so" >> "$asan_suppression_file"
 
 export LSAN_OPTIONS=suppressions="$asan_suppression_file"
 
@@ -474,6 +483,10 @@ function killprocess() {
 		# wait for the process regardless if its the dummy sudo one
 		# or the actual app - it should terminate anyway
 		wait $1
+	else
+		# the process is not there anymore
+		echo "Process with pid $1 is not found"
+		exit 1
 	fi
 }
 
@@ -559,19 +572,28 @@ function kill_stub() {
 }
 
 function run_test() {
+	if [ $# -le 1 ]; then
+		echo "Not enough parameters"
+		echo "usage: run_test test_name test_script [script_params]"
+		exit 1
+	fi
+
 	xtrace_disable
-	local test_type
-	test_type="$(echo $1 | tr '[:lower:]' '[:upper:]')"
+	local test_name="$1"
 	shift
+
+	timing_enter $test_name
 	echo "************************************"
-	echo "START TEST $test_type $*"
+	echo "START TEST $test_name"
 	echo "************************************"
 	xtrace_restore
 	time "$@"
 	xtrace_disable
 	echo "************************************"
-	echo "END TEST $test_type $*"
+	echo "END TEST $test_name"
 	echo "************************************"
+
+	timing_exit $test_name
 	xtrace_restore
 }
 
@@ -763,9 +785,11 @@ ramp_time=0
 EOL
 
 	if [ "$workload" == "verify" ]; then
-		echo "verify=sha1" >> $config_file
-		echo "verify_backlog=1024" >> $config_file
-		echo "rw=randwrite" >> $config_file
+		cat <<- EOL >> $config_file
+		verify=sha1
+		verify_backlog=1024
+		rw=randwrite
+		EOL
 
 		# To avoid potential data race issue due to the AIO device
 		# flush mechanism, add the flag to serialize the writes.
@@ -911,14 +935,12 @@ function opal_revert_cleanup {
 	spdk_tgt_pid=$!
 	waitforlisten $spdk_tgt_pid
 
-	# ignore the result
-	set +e
 	# OPAL test only runs on the first NVMe device
 	# So we just revert the first one here
 	bdf=$($rootdir/scripts/gen_nvme.sh --json | jq -r '.config[].params | select(.name=="Nvme0").traddr')
 	$rootdir/scripts/rpc.py bdev_nvme_attach_controller -b "nvme0" -t "pcie" -a $bdf
-	$rootdir/scripts/rpc.py bdev_nvme_opal_revert -b nvme0 -p test
-	set -e
+	# Ignore if this fails.
+	$rootdir/scripts/rpc.py bdev_nvme_opal_revert -b nvme0 -p test || true
 
 	killprocess $spdk_tgt_pid
 }

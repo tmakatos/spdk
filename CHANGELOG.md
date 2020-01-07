@@ -2,6 +2,13 @@
 
 ## v20.01: (Upcoming Release)
 
+### sock
+
+Added spdk_sock_writev_async for performing asynchronous writes to sockets. This call will
+never return EAGAIN, instead queueing internally until the data has all been sent. This can
+simplify many code flows that create pollers to continue attempting to flush writes
+on sockets.
+
 ### isa-l
 
 Updated ISA-L submodule to commit f3993f5c0b6911 which includes implementation and
@@ -19,6 +26,37 @@ sent.
 Added boolean return value for function spdk_fs_set_cache_size to indicate its operation result.
 
 Added `blobfs_set_cache_size` RPC method to set cache size for blobstore filesystem.
+
+### util
+
+`spdk_pipe`, a new utility for buffering data from sockets or files for parsing
+has been added. The public API is available at `include/spdk/pipe.h`.
+
+### nvme
+
+`delayed_pcie_doorbell` parameter in `spdk_nvme_io_qpair_opts` was renamed to `delay_cmd_submit`
+to allow reuse in other transports.
+
+Added RDMA WR batching to NVMf RDMA initiator. Send and receive WRs are chained together
+and posted with a single call to ibv_post_send(receive) in the next call to qpair completion
+processing function. Batching is controlled by 'delay_cmd_submit' qpair option.
+
+### rpc
+
+Added optional 'delay_cmd_submit' parameter to 'bdev_nvme_set_options' RPC method.
+
+An new RPC `framework_get_reactors` has been added to retrieve list of all reactors.
+
+### dpdk
+
+Updated DPDK submodule to DPDK 19.11.
+
+### event
+
+The functions `spdk_reactor_enable_framework_monitor_context_switch()` and
+`spdk_reactor_framework_monitor_context_switch_enabled()` have been changed to
+`spdk_framework_enable_context_switch_monitor()` and
+`spdk_framework_context_switch_monitor_enabled()`, respectively.
 
 ## v19.10:
 

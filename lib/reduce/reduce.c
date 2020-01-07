@@ -67,6 +67,8 @@ SPDK_STATIC_ASSERT(sizeof(SPDK_REDUCE_SIGNATURE) - 1 ==
 
 #define REDUCE_PATH_MAX 4096
 
+#define REDUCE_ZERO_BUF_SIZE 0x100000
+
 /**
  * Describes a persistent memory file used to hold metadata associated with a
  *  compressed volume.
@@ -103,7 +105,7 @@ struct spdk_reduce_vol_request {
 	 *  the decomp engine, they point to a mix of the scratch buffer
 	 *  and user buffer
 	 */
-	struct iovec				decomp_iov[REDUCE_MAX_IOVECS];
+	struct iovec				decomp_iov[REDUCE_MAX_IOVECS + 2];
 	int					decomp_iovcnt;
 
 	/**
@@ -401,7 +403,7 @@ _init_load_cleanup(struct spdk_reduce_vol *vol, struct reduce_init_load_ctx *ctx
 }
 
 static int
-_alloc_zero_buff(struct spdk_reduce_vol *vol)
+_alloc_zero_buff(void)
 {
 	int rc = 0;
 
@@ -410,7 +412,7 @@ _alloc_zero_buff(struct spdk_reduce_vol *vol)
 	 * allocated when another vol init'd or loaded.
 	 */
 	if (g_vol_count++ == 0) {
-		g_zero_buf = spdk_zmalloc(vol->params.chunk_size,
+		g_zero_buf = spdk_zmalloc(REDUCE_ZERO_BUF_SIZE,
 					  64, NULL, SPDK_ENV_LCORE_ID_ANY,
 					  SPDK_MALLOC_DMA);
 		if (g_zero_buf == NULL) {
@@ -433,7 +435,7 @@ _init_write_super_cpl(void *cb_arg, int reduce_errno)
 		return;
 	}
 
-	rc = _alloc_zero_buff(init_ctx->vol);
+	rc = _alloc_zero_buff();
 	if (rc != 0) {
 		init_ctx->cb_fn(init_ctx->cb_arg, NULL, rc);
 		_init_load_cleanup(init_ctx->vol, init_ctx);
@@ -660,6 +662,11 @@ _load_read_super_and_path_cpl(void *cb_arg, int reduce_errno)
 	uint32_t j;
 	int rc;
 
+	rc = _alloc_zero_buff();
+	if (rc) {
+		goto error;
+	}
+
 	if (memcmp(vol->backing_super->signature,
 		   SPDK_REDUCE_SIGNATURE,
 		   sizeof(vol->backing_super->signature)) != 0) {
@@ -734,11 +741,6 @@ _load_read_super_and_path_cpl(void *cb_arg, int reduce_errno)
 				spdk_bit_array_set(vol->allocated_backing_io_units, chunk->io_unit_index[j]);
 			}
 		}
-	}
-
-	rc = _alloc_zero_buff(vol);
-	if (rc) {
-		goto error;
 	}
 
 	load_ctx->cb_fn(load_ctx->cb_arg, vol, 0);
@@ -832,6 +834,7 @@ spdk_reduce_vol_unload(struct spdk_reduce_vol *vol,
 	if (--g_vol_count == 0) {
 		spdk_free(g_zero_buf);
 	}
+	assert(g_vol_count >= 0);
 	_init_load_cleanup(vol, NULL);
 	cb_fn(cb_arg, 0);
 }
@@ -1375,6 +1378,10 @@ _iov_array_is_valid(struct spdk_reduce_vol *vol, struct iovec *iov, int iovcnt,
 {
 	uint64_t size = 0;
 	int i;
+
+	if (iovcnt > REDUCE_MAX_IOVECS) {
+		return false;
+	}
 
 	for (i = 0; i < iovcnt; i++) {
 		size += iov[i].iov_len;

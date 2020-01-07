@@ -7,6 +7,8 @@
 # This script creates a subdirectory called $PWD/<distro> and copies the Vagrantfile
 # into that directory before running 'vagrant up'
 
+set -e
+
 VAGRANT_TARGET="$PWD"
 
 DIR="$( cd "$( dirname $0 )" && pwd )"
@@ -17,13 +19,15 @@ display_help() {
 	echo
 	echo " Usage: ${0##*/} [-b nvme-backing-file] [-n <num-cpus>] [-s <ram-size>] [-x <http-proxy>] [-hvrld] <distro>"
 	echo
-	echo "  distro = <centos7 | ubuntu16 | ubuntu18 | fedora28 | fedora29 | fedora 30 | freebsd11> "
+	echo "  distro = <centos7 | centos8| ubuntu16 | ubuntu18 |"
+	echo "            fedora29 | fedora 30 | fedora 31 | freebsd11 | freebsd12>"
 	echo
 	echo "  -b <nvme-backing-file>          nvme file path with name"
 	echo "                                  type of emulated nvme disk"
 	echo "                                  usage: type <number_of_namespaces> types available: ocssd, nvme"
 	echo "                                  If no -b option is specified then this option defaults to emulating single"
 	echo "                                  NVMe with 1 namespace and assumes path: /var/lib/libvirt/images/nvme_disk.img"
+	echo "  -c                              create all above disk, default 0"
 	echo "  -s <ram-size> in kb             default: ${SPDK_VAGRANT_VMRAM}"
 	echo "  -n <num-cpus> 1 to 4            default: ${SPDK_VAGRANT_VMCPU}"
 	echo "  -x <http-proxy>                 default: \"${SPDK_VAGRANT_HTTP_PROXY}\""
@@ -41,10 +45,10 @@ display_help() {
 	echo
 	echo " Examples:"
 	echo
-	echo "  $0 -x http://user:password@host:port fedora28"
+	echo "  $0 -x http://user:password@host:port fedora30"
 	echo "  $0 -s 2048 -n 2 ubuntu16"
 	echo "  $0 -rv freebsd"
-	echo "  $0 fedora28"
+	echo "  $0 fedora30"
 	echo "  $0 -b /var/lib/libvirt/images/nvme1.img,nvme,1 fedora30"
 	echo "  $0 -b /var/lib/libvirt/images/ocssd.img,ocssd fedora30"
 	echo "  $0 -b /var/lib/libvirt/images/nvme5.img,nvme,5 -b /var/lib/libvirt/images/ocssd.img,ocssd fedora30"
@@ -69,9 +73,10 @@ OPTIND=1
 NVME_DISKS_TYPE=""
 NVME_DISKS_NAMESPACES=""
 NVME_FILE=""
+NVME_AUTO_CREATE=0
 VAGRANTFILE_DIR=""
 
-while getopts ":b:n:s:x:p:vrldh-:" opt; do
+while getopts ":b:n:s:x:p:vcrldh-:" opt; do
 	case "${opt}" in
 		-)
 		case "${OPTARG}" in
@@ -99,6 +104,9 @@ while getopts ":b:n:s:x:p:vrldh-:" opt; do
 		v)
 			VERBOSE=1
 		;;
+		c)
+			NVME_AUTO_CREATE=1
+		;;
 		r)
 			DRY_RUN=1
 		;;
@@ -125,10 +133,13 @@ done
 
 shift "$((OPTIND-1))"   # Discard the options and sentinel --
 
-SPDK_VAGRANT_DISTRO=( "$@" )
+SPDK_VAGRANT_DISTRO="$*"
 
-case "$SPDK_VAGRANT_DISTRO" in
+case "${SPDK_VAGRANT_DISTRO}" in
 	centos7)
+		export SPDK_VAGRANT_DISTRO
+	;;
+	centos8)
 		export SPDK_VAGRANT_DISTRO
 	;;
 	ubuntu16)
@@ -137,16 +148,19 @@ case "$SPDK_VAGRANT_DISTRO" in
 	ubuntu18)
 		export SPDK_VAGRANT_DISTRO
 	;;
-	fedora28)
-		export SPDK_VAGRANT_DISTRO
-	;;
 	fedora29)
 		export SPDK_VAGRANT_DISTRO
 	;;
 	fedora30)
 		export SPDK_VAGRANT_DISTRO
 	;;
+	fedora31)
+		export SPDK_VAGRANT_DISTRO
+	;;
 	freebsd11)
+		export SPDK_VAGRANT_DISTRO
+	;;
+	freebsd12)
 		export SPDK_VAGRANT_DISTRO
 	;;
 	arch-linux)
@@ -166,7 +180,6 @@ fi
 if [ -z "$NVME_FILE" ]; then
 	TMP="/var/lib/libvirt/images/nvme_disk.img"
 	NVME_DISKS_TYPE="nvme"
-	NVME_DISKS_NAMESPACES="1"
 else
 	TMP=""
 	for args in $NVME_FILE; do
@@ -176,10 +189,13 @@ else
 				type="nvme"
 			fi
 			NVME_DISKS_TYPE+="$type,";
-			if [ -z "$namespace" ]; then
+			if [ -z "$namespace" ] && [ -n "$SPDK_QEMU_EMULATOR" ]; then
 				namespace="1"
 			fi
 			NVME_DISKS_NAMESPACES+="$namespace,";
+			if [ ${NVME_AUTO_CREATE} = 1 ]; then
+				$SPDK_DIR/scripts/vagrant/create_nvme_img.sh -t $type -n $path
+			fi
 		done <<< $args
 	done
 fi
@@ -194,6 +210,7 @@ if [ ${VERBOSE} = 1 ]; then
 	echo DRY_RUN=$DRY_RUN
 	echo NVME_FILE=$NVME_FILE
 	echo NVME_DISKS_TYPE=$NVME_DISKS_TYPE
+	echo NVME_AUTO_CREATE=$NVME_AUTO_CREATE
 	echo NVME_DISKS_NAMESPACES=$NVME_DISKS_NAMESPACES
 	echo SPDK_VAGRANT_DISTRO=$SPDK_VAGRANT_DISTRO
 	echo SPDK_VAGRANT_VMCPU=$SPDK_VAGRANT_VMCPU
@@ -245,6 +262,7 @@ if [ ${DRY_RUN} = 1 ]; then
 	printenv SPDK_VAGRANT_HTTP_PROXY
 	printenv SPDK_QEMU_EMULATOR
 	printenv NVME_DISKS_TYPE
+	printenv NVME_AUTO_CREATE
 	printenv NVME_DISKS_NAMESPACES
 	printenv NVME_FILE
 	printenv SPDK_DIR

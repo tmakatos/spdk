@@ -65,7 +65,7 @@ spdk_bdev_get_zone_info(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 	struct spdk_bdev_io *bdev_io;
 	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
 
-	bdev_io = spdk_bdev_get_io(channel);
+	bdev_io = bdev_channel_get_io(channel);
 	if (!bdev_io) {
 		return -ENOMEM;
 	}
@@ -76,9 +76,9 @@ spdk_bdev_get_zone_info(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 	bdev_io->u.zone_mgmt.zone_id = zone_id;
 	bdev_io->u.zone_mgmt.num_zones = num_zones;
 	bdev_io->u.zone_mgmt.buf = info;
-	spdk_bdev_io_init(bdev_io, bdev, cb_arg, cb);
+	bdev_io_init(bdev_io, bdev, cb_arg, cb);
 
-	spdk_bdev_io_submit(bdev_io);
+	bdev_io_submit(bdev_io);
 	return 0;
 }
 
@@ -91,7 +91,7 @@ spdk_bdev_zone_management(struct spdk_bdev_desc *desc, struct spdk_io_channel *c
 	struct spdk_bdev_io *bdev_io;
 	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
 
-	bdev_io = spdk_bdev_get_io(channel);
+	bdev_io = bdev_channel_get_io(channel);
 	if (!bdev_io) {
 		return -ENOMEM;
 	}
@@ -102,9 +102,9 @@ spdk_bdev_zone_management(struct spdk_bdev_desc *desc, struct spdk_io_channel *c
 	bdev_io->u.zone_mgmt.zone_action = action;
 	bdev_io->u.zone_mgmt.zone_id = zone_id;
 	bdev_io->u.zone_mgmt.num_zones = 1;
-	spdk_bdev_io_init(bdev_io, bdev, cb_arg, cb);
+	bdev_io_init(bdev_io, bdev, cb_arg, cb);
 
-	spdk_bdev_io_submit(bdev_io);
+	bdev_io_submit(bdev_io);
 	return 0;
 }
 
@@ -117,7 +117,7 @@ _spdk_bdev_append_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *c
 	struct spdk_bdev_io *bdev_io;
 	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
 
-	bdev_io = spdk_bdev_get_io(channel);
+	bdev_io = bdev_channel_get_io(channel);
 	if (!bdev_io) {
 		return -ENOMEM;
 	}
@@ -132,9 +132,9 @@ _spdk_bdev_append_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *c
 	bdev_io->u.bdev.md_buf = md_buf;
 	bdev_io->u.bdev.num_blocks = num_blocks;
 	bdev_io->u.bdev.offset_blocks = zone_id;
-	spdk_bdev_io_init(bdev_io, bdev, cb_arg, cb);
+	bdev_io_init(bdev_io, bdev, cb_arg, cb);
 
-	spdk_bdev_io_submit(bdev_io);
+	bdev_io_submit(bdev_io);
 	return 0;
 }
 

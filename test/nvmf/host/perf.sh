@@ -10,8 +10,6 @@ MALLOC_BLOCK_SIZE=512
 
 rpc_py="$rootdir/scripts/rpc.py"
 
-timing_enter perf
-
 nvmftestinit
 nvmfappstart "-m 0xF"
 
@@ -74,8 +72,8 @@ if [ $RUN_NIGHTLY -eq 1 ]; then
 		# Test perf as host with different io_size and qd_depth in nightly
 		qd_depth=("1" "128")
 		io_size=("512" "131072")
-		for qd in ${qd_depth[@]}; do
-			for o in ${io_size[@]}; do
+		for qd in "${qd_depth[@]}"; do
+			for o in "${io_size[@]}"; do
 				$rootdir/examples/nvme/perf/perf -q $qd -o $o -w randrw -M 50 -t 10 -r "trtype:$TEST_TRANSPORT adrfam:IPv4 traddr:$NVMF_FIRST_TARGET_IP trsvcid:$NVMF_PORT"
 			done
 		done
@@ -92,4 +90,3 @@ fi
 trap - SIGINT SIGTERM EXIT
 
 nvmftestfini
-timing_exit perf

@@ -1286,15 +1286,13 @@ _bytes_to_blocks(uint32_t block_size, uint64_t offset_bytes, uint64_t *offset_bl
 }
 
 static int
-bdev_scsi_readwrite(struct spdk_scsi_task *task,
+bdev_scsi_readwrite(struct spdk_bdev *bdev, struct spdk_bdev_desc *bdev_desc,
+		    struct spdk_io_channel *bdev_ch, struct spdk_scsi_task *task,
 		    uint64_t lba, uint32_t xfer_len, bool is_read)
 {
-	struct spdk_scsi_lun *lun = task->lun;
-	struct spdk_bdev *bdev = lun->bdev;
-	struct spdk_bdev_desc *bdev_desc = lun->bdev_desc;
-	struct spdk_io_channel *bdev_ch = lun->io_channel;
 	uint64_t bdev_num_blocks, offset_blocks, num_blocks;
 	uint32_t max_xfer_len, block_size;
+	int sk = SPDK_SCSI_SENSE_NO_SENSE, asc = SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE;
 	int rc;
 
 	task->data_transferred = 0;
@@ -1302,21 +1300,15 @@ bdev_scsi_readwrite(struct spdk_scsi_task *task,
 	if (spdk_unlikely(task->dxfer_dir != SPDK_SCSI_DIR_NONE &&
 			  task->dxfer_dir != (is_read ? SPDK_SCSI_DIR_FROM_DEV : SPDK_SCSI_DIR_TO_DEV))) {
 		SPDK_ERRLOG("Incorrect data direction\n");
-		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
-					  SPDK_SCSI_SENSE_NO_SENSE,
-					  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
-					  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
-		return SPDK_SCSI_TASK_COMPLETE;
+		goto check_condition;
 	}
 
 	bdev_num_blocks = spdk_bdev_get_num_blocks(bdev);
 	if (spdk_unlikely(bdev_num_blocks <= lba || bdev_num_blocks - lba < xfer_len)) {
 		SPDK_DEBUGLOG(SPDK_LOG_SCSI, "end of media\n");
-		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
-					  SPDK_SCSI_SENSE_ILLEGAL_REQUEST,
-					  SPDK_SCSI_ASC_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE,
-					  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
-		return SPDK_SCSI_TASK_COMPLETE;
+		sk = SPDK_SCSI_SENSE_ILLEGAL_REQUEST;
+		asc = SPDK_SCSI_ASC_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE;
+		goto check_condition;
 	}
 
 	if (spdk_unlikely(xfer_len == 0)) {
@@ -1331,11 +1323,9 @@ bdev_scsi_readwrite(struct spdk_scsi_task *task,
 	if (spdk_unlikely(xfer_len > max_xfer_len)) {
 		SPDK_ERRLOG("xfer_len %" PRIu32 " > maximum transfer length %" PRIu32 "\n",
 			    xfer_len, max_xfer_len);
-		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
-					  SPDK_SCSI_SENSE_ILLEGAL_REQUEST,
-					  SPDK_SCSI_ASC_INVALID_FIELD_IN_CDB,
-					  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
-		return SPDK_SCSI_TASK_COMPLETE;
+		sk = SPDK_SCSI_SENSE_ILLEGAL_REQUEST;
+		asc = SPDK_SCSI_ASC_INVALID_FIELD_IN_CDB;
+		goto check_condition;
 	}
 
 	if (!is_read) {
@@ -1343,22 +1333,14 @@ bdev_scsi_readwrite(struct spdk_scsi_task *task,
 		if (xfer_len * block_size > task->transfer_len) {
 			SPDK_ERRLOG("xfer_len %" PRIu32 " * block_size %" PRIu32 " > transfer_len %u\n",
 				    xfer_len, block_size, task->transfer_len);
-			spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
-						  SPDK_SCSI_SENSE_NO_SENSE,
-						  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
-						  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
-			return SPDK_SCSI_TASK_COMPLETE;
+			goto check_condition;
 		}
 	}
 
 	if (_bytes_to_blocks(block_size, task->offset, &offset_blocks, task->length, &num_blocks) != 0) {
 		SPDK_ERRLOG("task's offset %" PRIu64 " or length %" PRIu32 " is not block multiple\n",
 			    task->offset, task->length);
-		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
-					  SPDK_SCSI_SENSE_NO_SENSE,
-					  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
-					  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
-		return SPDK_SCSI_TASK_COMPLETE;
+		goto check_condition;
 	}
 
 	offset_blocks += lba;
@@ -1383,15 +1365,16 @@ bdev_scsi_readwrite(struct spdk_scsi_task *task,
 			return SPDK_SCSI_TASK_PENDING;
 		}
 		SPDK_ERRLOG("spdk_bdev_%s_blocks() failed\n", is_read ? "readv" : "writev");
-		spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION,
-					  SPDK_SCSI_SENSE_NO_SENSE,
-					  SPDK_SCSI_ASC_NO_ADDITIONAL_SENSE,
-					  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
-		return SPDK_SCSI_TASK_COMPLETE;
+		goto check_condition;
 	}
 
 	task->data_transferred = task->length;
 	return SPDK_SCSI_TASK_PENDING;
+
+check_condition:
+	spdk_scsi_task_set_status(task, SPDK_SCSI_STATUS_CHECK_CONDITION, sk, asc,
+				  SPDK_SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
+	return SPDK_SCSI_TASK_COMPLETE;
 }
 
 struct spdk_bdev_scsi_unmap_ctx {
@@ -1585,27 +1568,31 @@ bdev_scsi_process_block(struct spdk_scsi_task *task)
 		if (xfer_len == 0) {
 			xfer_len = 256;
 		}
-		return bdev_scsi_readwrite(task, lba, xfer_len,
+		return bdev_scsi_readwrite(bdev, lun->bdev_desc, lun->io_channel,
+					   task, lba, xfer_len,
 					   cdb[0] == SPDK_SBC_READ_6);
 
 	case SPDK_SBC_READ_10:
 	case SPDK_SBC_WRITE_10:
 		lba = from_be32(&cdb[2]);
 		xfer_len = from_be16(&cdb[7]);
-		return bdev_scsi_readwrite(task, lba, xfer_len,
+		return bdev_scsi_readwrite(bdev, lun->bdev_desc, lun->io_channel,
+					   task, lba, xfer_len,
 					   cdb[0] == SPDK_SBC_READ_10);
 
 	case SPDK_SBC_READ_12:
 	case SPDK_SBC_WRITE_12:
 		lba = from_be32(&cdb[2]);
 		xfer_len = from_be32(&cdb[6]);
-		return bdev_scsi_readwrite(task, lba, xfer_len,
+		return bdev_scsi_readwrite(bdev, lun->bdev_desc, lun->io_channel,
+					   task, lba, xfer_len,
 					   cdb[0] == SPDK_SBC_READ_12);
 	case SPDK_SBC_READ_16:
 	case SPDK_SBC_WRITE_16:
 		lba = from_be64(&cdb[2]);
 		xfer_len = from_be32(&cdb[10]);
-		return bdev_scsi_readwrite(task, lba, xfer_len,
+		return bdev_scsi_readwrite(bdev, lun->bdev_desc, lun->io_channel,
+					   task, lba, xfer_len,
 					   cdb[0] == SPDK_SBC_READ_16);
 
 	case SPDK_SBC_READ_CAPACITY_10: {
@@ -2008,15 +1995,19 @@ spdk_bdev_scsi_reset(struct spdk_scsi_task *task)
 }
 
 bool
-spdk_scsi_bdev_get_dif_ctx(struct spdk_bdev *bdev, uint8_t *cdb,
-			   uint32_t data_offset, struct spdk_dif_ctx *dif_ctx)
+spdk_scsi_bdev_get_dif_ctx(struct spdk_bdev *bdev, struct spdk_scsi_task *task,
+			   struct spdk_dif_ctx *dif_ctx)
 {
-	uint32_t ref_tag = 0, dif_check_flags = 0;
+	uint32_t ref_tag = 0, dif_check_flags = 0, data_offset;
+	uint8_t *cdb;
 	int rc;
 
 	if (spdk_likely(spdk_bdev_get_md_size(bdev) == 0)) {
 		return false;
 	}
+
+	cdb = task->cdb;
+	data_offset = task->offset;
 
 	/* We use lower 32 bits of LBA as Reference. Tag */
 	switch (cdb[0]) {

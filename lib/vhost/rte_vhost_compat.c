@@ -47,9 +47,111 @@
 #include "vhost_internal.h"
 
 #include "spdk_internal/vhost_user.h"
+#include "spdk_internal/memory.h"
+
+void
+vhost_session_mem_register(struct rte_vhost_memory *mem)
+{
+	struct rte_vhost_mem_region *region;
+	uint32_t i;
+	uint64_t previous_start = UINT64_MAX;
+
+	for (i = 0; i < mem->nregions; i++) {
+		uint64_t start, end, len;
+		region = &mem->regions[i];
+		start = FLOOR_2MB(region->mmap_addr);
+		end = CEIL_2MB(region->mmap_addr + region->mmap_size);
+		if (start == previous_start) {
+			start += (size_t) VALUE_2MB;
+		}
+		previous_start = start;
+		len = end - start;
+		SPDK_INFOLOG(SPDK_LOG_VHOST, "Registering VM memory for vtophys translation - 0x%jx len:0x%jx\n",
+			     start, len);
+
+		if (spdk_mem_register((void *)start, len) != 0) {
+			SPDK_WARNLOG("Failed to register memory region %"PRIu32". Future vtophys translation might fail.\n",
+				     i);
+			continue;
+		}
+	}
+}
+
+void
+vhost_session_mem_unregister(struct rte_vhost_memory *mem)
+{
+	struct rte_vhost_mem_region *region;
+	uint32_t i;
+	uint64_t previous_start = UINT64_MAX;
+
+	for (i = 0; i < mem->nregions; i++) {
+		uint64_t start, end, len;
+		region = &mem->regions[i];
+		start = FLOOR_2MB(region->mmap_addr);
+		end = CEIL_2MB(region->mmap_addr + region->mmap_size);
+		if (start == previous_start) {
+			start += (size_t) VALUE_2MB;
+		}
+		previous_start = start;
+		len = end - start;
+
+		if (spdk_vtophys((void *) start, NULL) == SPDK_VTOPHYS_ERROR) {
+			continue; /* region has not been registered */
+		}
+
+		if (spdk_mem_unregister((void *)start, len) != 0) {
+			assert(false);
+		}
+	}
+}
+
+static int
+new_connection(int vid)
+{
+	char ifname[PATH_MAX];
+
+	if (rte_vhost_get_ifname(vid, ifname, PATH_MAX) < 0) {
+		SPDK_ERRLOG("Couldn't get a valid ifname for device with vid %d\n", vid);
+		return -1;
+	}
+
+	return vhost_new_connection_cb(vid, ifname);
+}
+
+static int
+start_device(int vid)
+{
+	return vhost_start_device_cb(vid);
+}
+
+static void
+stop_device(int vid)
+{
+	vhost_stop_device_cb(vid);
+}
+
+static void
+destroy_connection(int vid)
+{
+	vhost_destroy_connection_cb(vid);
+}
+
+static const struct vhost_device_ops g_spdk_vhost_ops = {
+	.new_device =  start_device,
+	.destroy_device = stop_device,
+	.new_connection = new_connection,
+	.destroy_connection = destroy_connection,
+#ifdef SPDK_CONFIG_VHOST_INTERNAL_LIB
+	.get_config = vhost_get_config_cb,
+	.set_config = vhost_set_config_cb,
+	.vhost_nvme_admin_passthrough = vhost_nvme_admin_passthrough,
+	.vhost_nvme_set_cq_call = vhost_nvme_set_cq_call,
+	.vhost_nvme_get_cap = vhost_nvme_get_cap,
+	.vhost_nvme_set_bar_mr = vhost_nvme_set_bar_mr,
+#endif
+};
 
 #ifndef SPDK_CONFIG_VHOST_INTERNAL_LIB
-extern const struct vhost_device_ops g_spdk_vhost_ops;
 
 static enum rte_vhost_msg_result
 spdk_extern_vhost_pre_msg_handler(int vid, void *_msg)
@@ -215,26 +317,89 @@ vhost_session_install_rte_compat_hooks(struct spdk_vhost_session *vsession)
 	}
 }
 
-void
-vhost_dev_install_rte_compat_hooks(struct spdk_vhost_dev *vdev)
-{
-	uint64_t protocol_features = 0;
-
-	rte_vhost_driver_get_protocol_features(vdev->path, &protocol_features);
-	protocol_features |= (1ULL << VHOST_USER_PROTOCOL_F_CONFIG);
-	rte_vhost_driver_set_protocol_features(vdev->path, protocol_features);
-}
-
 #else /* SPDK_CONFIG_VHOST_INTERNAL_LIB */
+
 void
 vhost_session_install_rte_compat_hooks(struct spdk_vhost_session *vsession)
 {
 	/* nothing to do. all the changes are already incorporated into rte_vhost */
 }
 
-void
-vhost_dev_install_rte_compat_hooks(struct spdk_vhost_dev *vdev)
-{
-	/* nothing to do */
-}
 #endif
+
+int
+vhost_register_unix_socket(const char *path, const char *ctrl_name,
+			   uint64_t virtio_features, uint64_t disabled_features, uint64_t protocol_features)
+{
+	struct stat file_stat;
+#ifndef SPDK_CONFIG_VHOST_INTERNAL_LIB
+	uint64_t features = 0;
+#endif
+
+	/* Register vhost driver to handle vhost messages. */
+	if (stat(path, &file_stat) != -1) {
+		if (!S_ISSOCK(file_stat.st_mode)) {
+			SPDK_ERRLOG("Cannot create a domain socket at path \"%s\": "
+				    "The file already exists and is not a socket.\n",
+				    path);
+			return -EIO;
+		} else if (unlink(path) != 0) {
+			SPDK_ERRLOG("Cannot create a domain socket at path \"%s\": "
+				    "The socket already exists and failed to unlink.\n",
+				    path);
+			return -EIO;
+		}
+	}
+
+	if (rte_vhost_driver_register(path, 0) != 0) {
+		SPDK_ERRLOG("Could not register controller %s with vhost library\n", ctrl_name);
+		SPDK_ERRLOG("Check if domain socket %s already exists\n", path);
+		return -EIO;
+	}
+	if (rte_vhost_driver_set_features(path, virtio_features) ||
+	    rte_vhost_driver_disable_features(path, disabled_features)) {
+		SPDK_ERRLOG("Couldn't set vhost features for controller %s\n", ctrl_name);
+
+		rte_vhost_driver_unregister(path);
+		return -EIO;
+	}
+
+	if (rte_vhost_driver_callback_register(path, &g_spdk_vhost_ops) != 0) {
+		rte_vhost_driver_unregister(path);
+		SPDK_ERRLOG("Couldn't register callbacks for controller %s\n", ctrl_name);
+		return -EIO;
+	}
+
+#ifndef SPDK_CONFIG_VHOST_INTERNAL_LIB
+	rte_vhost_driver_get_protocol_features(path, &features);
+	features |= protocol_features;
+	rte_vhost_driver_set_protocol_features(path, features);
+#endif
+
+	if (rte_vhost_driver_start(path) != 0) {
+		SPDK_ERRLOG("Failed to start vhost driver for controller %s (%d): %s\n",
+			    ctrl_name, errno, spdk_strerror(errno));
+		rte_vhost_driver_unregister(path);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+int
+vhost_get_mem_table(int vid, struct rte_vhost_memory **mem)
+{
+	return rte_vhost_get_mem_table(vid, mem);
+}
+
+int
+vhost_driver_unregister(const char *path)
+{
+	return rte_vhost_driver_unregister(path);
+}
+
+int
+vhost_get_negotiated_features(int vid, uint64_t *negotiated_features)
+{
+	return rte_vhost_get_negotiated_features(vid, negotiated_features);
+}

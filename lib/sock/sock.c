@@ -178,6 +178,8 @@ spdk_sock_connect(const char *ip, int port)
 		sock = impl->connect(ip, port);
 		if (sock != NULL) {
 			sock->net_impl = impl;
+			TAILQ_INIT(&sock->queued_reqs);
+			TAILQ_INIT(&sock->pending_reqs);
 			return sock;
 		}
 	}
@@ -195,6 +197,8 @@ spdk_sock_listen(const char *ip, int port)
 		sock = impl->listen(ip, port);
 		if (sock != NULL) {
 			sock->net_impl = impl;
+			/* Don't need to initialize the request queues for listen
+			 * sockets. */
 			return sock;
 		}
 	}
@@ -210,30 +214,42 @@ spdk_sock_accept(struct spdk_sock *sock)
 	new_sock = sock->net_impl->accept(sock);
 	if (new_sock != NULL) {
 		new_sock->net_impl = sock->net_impl;
+		TAILQ_INIT(&new_sock->queued_reqs);
+		TAILQ_INIT(&new_sock->pending_reqs);
 	}
 
 	return new_sock;
 }
 
 int
-spdk_sock_close(struct spdk_sock **sock)
+spdk_sock_close(struct spdk_sock **_sock)
 {
+	struct spdk_sock *sock = *_sock;
 	int rc;
 
-	if (*sock == NULL) {
+	if (sock == NULL) {
 		errno = EBADF;
 		return -1;
 	}
 
-	if ((*sock)->cb_fn != NULL) {
+	if (sock->cb_fn != NULL) {
 		/* This sock is still part of a sock_group. */
 		errno = EBUSY;
 		return -1;
 	}
 
-	rc = (*sock)->net_impl->close(*sock);
+	sock->flags.closed = true;
+
+	if (sock->cb_cnt > 0) {
+		/* Let the callback unwind before destroying the socket */
+		return 0;
+	}
+
+	spdk_sock_abort_requests(sock);
+
+	rc = sock->net_impl->close(sock);
 	if (rc == 0) {
-		*sock = NULL;
+		*_sock = NULL;
 	}
 
 	return rc;
@@ -243,6 +259,11 @@ ssize_t
 spdk_sock_recv(struct spdk_sock *sock, void *buf, size_t len)
 {
 	if (sock == NULL) {
+		errno = EBADF;
+		return -1;
+	}
+
+	if (sock->flags.closed) {
 		errno = EBADF;
 		return -1;
 	}
@@ -258,6 +279,11 @@ spdk_sock_readv(struct spdk_sock *sock, struct iovec *iov, int iovcnt)
 		return -1;
 	}
 
+	if (sock->flags.closed) {
+		errno = EBADF;
+		return -1;
+	}
+
 	return sock->net_impl->readv(sock, iov, iovcnt);
 }
 
@@ -269,7 +295,30 @@ spdk_sock_writev(struct spdk_sock *sock, struct iovec *iov, int iovcnt)
 		return -1;
 	}
 
+	if (sock->flags.closed) {
+		errno = EBADF;
+		return -1;
+	}
+
 	return sock->net_impl->writev(sock, iov, iovcnt);
+}
+
+void
+spdk_sock_writev_async(struct spdk_sock *sock, struct spdk_sock_request *req)
+{
+	assert(req->cb_fn != NULL);
+
+	if (sock == NULL) {
+		req->cb_fn(req->cb_arg, -EBADF);
+		return;
+	}
+
+	if (sock->flags.closed) {
+		req->cb_fn(req->cb_arg, -EBADF);
+		return;
+	}
+
+	sock->net_impl->writev_async(sock, req);
 }
 
 int

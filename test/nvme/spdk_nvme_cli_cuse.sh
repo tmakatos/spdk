@@ -5,8 +5,6 @@ rootdir=$(readlink -f $testdir/../..)
 source $rootdir/scripts/common.sh
 source $rootdir/test/common/autotest_common.sh
 
-timing_enter nvme_cli_cuse
-
 NVME_CMD=/usr/local/src/nvme-cli/nvme
 rpc_py=$rootdir/scripts/rpc.py
 
@@ -19,9 +17,13 @@ waitforlisten $spdk_tgt_pid
 bdf=$(iter_pci_class_code 01 08 02 | head -1)
 
 $rpc_py bdev_nvme_attach_controller -b Nvme0 -t PCIe -a ${bdf}
-$rpc_py bdev_nvme_cuse_register -n Nvme0 -p spdk/nvme0
+$rpc_py bdev_nvme_cuse_register -n Nvme0
 
 sleep 5
+
+if [ ! -c /dev/spdk/nvme0 ]; then
+	exit 1
+fi
 
 $rpc_py bdev_get_bdevs
 $rpc_py bdev_nvme_get_controllers
@@ -43,8 +45,30 @@ for ctrlr in $(ls /dev/spdk/nvme?); do
 	${NVME_CMD} reset $ctrlr
 done
 
+if [ ! -c /dev/spdk/nvme0 ]; then
+	exit 1
+fi
+
+$rpc_py bdev_nvme_cuse_unregister -n Nvme0
+sleep 1
+if [ -c /dev/spdk/nvme0 ]; then
+	exit 1
+fi
+
+$rpc_py bdev_nvme_cuse_register -n Nvme0
+sleep 1
+
+if [ ! -c /dev/spdk/nvme0 ]; then
+	exit 1
+fi
+
+$rpc_py bdev_nvme_detach_controller Nvme0
+sleep 1
+if [ -c /dev/spdk/nvme0 ]; then
+	exit 1
+fi
+
 trap - SIGINT SIGTERM EXIT
-kill $spdk_tgt_pid
+killprocess $spdk_tgt_pid
 
 report_test_completion spdk_nvme_cli_cuse
-timing_exit nvme_cli_cuse

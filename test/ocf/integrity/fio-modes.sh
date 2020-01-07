@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
-curdir=$(dirname $(readlink -f "$BASH_SOURCE"))
+curdir=$(dirname $(readlink -f "${BASH_SOURCE[0]}"))
 rootdir=$(readlink -f $curdir/../../..)
 plugindir=$rootdir/examples/bdev/fio_plugin
 
 source $rootdir/test/common/autotest_common.sh
 
 function fio_verify(){
-	fio_bdev $curdir/test.fio --aux-path=/tmp/ --ioengine=spdk_bdev $@
+	fio_bdev $curdir/test.fio --aux-path=/tmp/ --ioengine=spdk_bdev "$@"
 }
 
 function cleanup(){

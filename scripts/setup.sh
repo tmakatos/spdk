@@ -159,15 +159,15 @@ function get_nvme_name_from_bdf {
 
 function get_virtio_names_from_bdf {
 	blk_devs=$(lsblk --nodeps --output NAME)
-	virtio_names=''
+	virtio_names=()
 
 	for dev in $blk_devs; do
 		if readlink "/sys/block/$dev" | grep -q "$1"; then
-			virtio_names="$virtio_names $dev"
+			virtio_names+=("$dev")
 		fi
 	done
 
-	eval "$2='$virtio_names'"
+	eval "$2=( " "${virtio_names[@]}" " )"
 }
 
 function configure_linux_pci {
@@ -224,7 +224,7 @@ function configure_linux_pci {
 		if ! $mount; then
 			linux_bind_driver "$bdf" "$driver_name"
 		else
-			for name in ${blknames[@]}; do
+			for name in "${blknames[@]}"; do
 				pci_dev_echo "$bdf" "Active mountpoints on /dev/$name, so not binding PCI dev"
 			done
 		fi
@@ -264,7 +264,7 @@ function configure_linux_pci {
 			fi
 			blknames=()
 			get_virtio_names_from_bdf "$bdf" blknames
-			for blkname in $blknames; do
+			for blkname in "${blknames[@]}"; do
 				if [ "$(lsblk /dev/$blkname --output MOUNTPOINT -n | wc -w)" != "0" ]; then
 					pci_dev_echo "$bdf" "Active mountpoints on /dev/$blkname, so not binding"
 					continue 2
@@ -612,7 +612,7 @@ function status_linux {
 			vendor=$(cat /sys/bus/pci/devices/$bdf/vendor)
 			blknames=()
 			get_virtio_names_from_bdf "$bdf" blknames
-			echo -e "$bdf\t${vendor#0x}\t${device#0x}\t$node\t\t${driver:--}\t\t$blknames"
+			echo -e "$bdf\t${vendor#0x}\t${device#0x}\t$node\t\t${driver:--}\t\t" "${blknames[@]}"
 		done
 	done
 
@@ -653,8 +653,8 @@ function configure_freebsd_pci {
 		GREP_STR="${GREP_STR}\|chip=0x${dev_id}8086"
 	done < $TMP
 
-	AWK_PROG="{if (count > 0) printf \",\"; printf \"%s:%s:%s\",\$2,\$3,\$4; count++}"
-	echo $AWK_PROG > $TMP
+	AWK_PROG=("{if (count > 0) printf \",\"; printf \"%s:%s:%s\",\$2,\$3,\$4; count++}")
+	echo "${AWK_PROG[*]}" > $TMP
 
 	BDFS=$(pciconf -l | grep "${GREP_STR}" | awk -F: -f $TMP)
 

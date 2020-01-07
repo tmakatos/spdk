@@ -170,7 +170,7 @@ spdk_blob_opts_init(struct spdk_blob_opts *opts)
 void
 spdk_blob_open_opts_init(struct spdk_blob_open_opts *opts)
 {
-	opts->clear_method = BLOB_CLEAR_WITH_UNMAP;
+	opts->clear_method = BLOB_CLEAR_WITH_DEFAULT;
 }
 
 static struct spdk_blob *
@@ -698,10 +698,12 @@ _spdk_blob_serialize_extent_rle(const struct spdk_blob *blob,
 	lba_count = lba_per_cluster;
 	extent_idx = 0;
 	for (i = start_cluster + 1; i < blob->active.num_clusters; i++) {
-		if ((lba + lba_count) == blob->active.clusters[i]) {
+		if ((lba + lba_count) == blob->active.clusters[i] && lba != 0) {
+			/* Run-length encode sequential non-zero LBA */
 			lba_count += lba_per_cluster;
 			continue;
 		} else if (lba == 0 && blob->active.clusters[i] == 0) {
+			/* Run-length encode unallocated clusters */
 			lba_count += lba_per_cluster;
 			continue;
 		}
@@ -1108,11 +1110,17 @@ static void
 spdk_bs_batch_clear_dev(struct spdk_blob_persist_ctx *ctx, spdk_bs_batch_t *batch, uint64_t lba,
 			uint32_t lba_count)
 {
-	if (ctx->blob->clear_method == BLOB_CLEAR_WITH_DEFAULT ||
-	    ctx->blob->clear_method == BLOB_CLEAR_WITH_UNMAP) {
+	switch (ctx->blob->clear_method) {
+	case BLOB_CLEAR_WITH_DEFAULT:
+	case BLOB_CLEAR_WITH_UNMAP:
 		spdk_bs_batch_unmap_dev(batch, lba, lba_count);
-	} else if (ctx->blob->clear_method == BLOB_CLEAR_WITH_WRITE_ZEROES) {
+		break;
+	case BLOB_CLEAR_WITH_WRITE_ZEROES:
 		spdk_bs_batch_write_zeroes_dev(batch, lba, lba_count);
+		break;
+	case BLOB_CLEAR_WITH_NONE:
+	default:
+		break;
 	}
 }
 
@@ -3880,12 +3888,18 @@ spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	/* Clear metadata space */
 	spdk_bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
 
-	if (opts.clear_method == BS_CLEAR_WITH_UNMAP) {
+	switch (opts.clear_method) {
+	case BS_CLEAR_WITH_UNMAP:
 		/* Trim data clusters */
 		spdk_bs_batch_unmap_dev(batch, num_md_lba, ctx->bs->dev->blockcnt - num_md_lba);
-	} else if (opts.clear_method == BS_CLEAR_WITH_WRITE_ZEROES) {
+		break;
+	case BS_CLEAR_WITH_WRITE_ZEROES:
 		/* Write_zeroes to data clusters */
 		spdk_bs_batch_write_zeroes_dev(batch, num_md_lba, ctx->bs->dev->blockcnt - num_md_lba);
+		break;
+	case BS_CLEAR_WITH_NONE:
+	default:
+		break;
 	}
 
 	spdk_bs_batch_close(batch);

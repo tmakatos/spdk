@@ -416,7 +416,7 @@ nvme_qpair_check_enabled(struct spdk_nvme_qpair *qpair)
 	 * from the old transport connection and encourage the application to retry them. We also need
 	 * to submit any queued requests that built up while we were in the connected or enabling state.
 	 */
-	if (nvme_qpair_state_equals(qpair, NVME_QPAIR_CONNECTED) && !qpair->ctrlr->is_resetting) {
+	if (nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTED && !qpair->ctrlr->is_resetting) {
 		nvme_qpair_set_state(qpair, NVME_QPAIR_ENABLING);
 		nvme_qpair_complete_error_reqs(qpair);
 		nvme_transport_qpair_abort_reqs(qpair, 0 /* retry */);
@@ -430,7 +430,7 @@ nvme_qpair_check_enabled(struct spdk_nvme_qpair *qpair)
 		}
 	}
 
-	return nvme_qpair_state_equals(qpair, NVME_QPAIR_ENABLED);
+	return nvme_qpair_get_state(qpair) == NVME_QPAIR_ENABLED;
 }
 
 int32_t
@@ -448,12 +448,8 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		return -ENXIO;
 	}
 
-	if (spdk_unlikely(qpair->transport_qp_is_failed == true)) {
-		return -ENXIO;
-	}
-
 	if (spdk_unlikely(!nvme_qpair_check_enabled(qpair) &&
-			  !nvme_qpair_state_equals(qpair, NVME_QPAIR_CONNECTING))) {
+			  !(nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING))) {
 		/*
 		 * qpair is not enabled, likely because a controller reset is
 		 *  in progress.
@@ -508,6 +504,12 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	}
 
 	return ret;
+}
+
+spdk_nvme_qp_failure_reason
+spdk_nvme_qpair_get_failure_reason(struct spdk_nvme_qpair *qpair)
+{
+	return qpair->transport_failure_reason;
 }
 
 int
@@ -665,9 +667,9 @@ _nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *r
 	 * 2. Always allow fabrics commands through - these get
 	 * the controller out of reset state.
 	 */
-	if (spdk_likely(nvme_qpair_state_equals(qpair, NVME_QPAIR_ENABLED)) ||
+	if (spdk_likely(nvme_qpair_get_state(qpair) == NVME_QPAIR_ENABLED) ||
 	    (req->cmd.opc == SPDK_NVME_OPC_FABRIC &&
-	     nvme_qpair_state_equals(qpair, NVME_QPAIR_CONNECTING))) {
+	     nvme_qpair_get_state(qpair) == NVME_QPAIR_CONNECTING)) {
 		rc = nvme_transport_qpair_submit_request(qpair, req);
 	} else {
 		/* The controller is being reset - queue this request and
@@ -677,6 +679,7 @@ _nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *r
 	}
 
 	if (spdk_likely(rc == 0)) {
+		req->queued = false;
 		return 0;
 	}
 
@@ -688,6 +691,14 @@ error:
 	if (req->parent != NULL) {
 		nvme_request_remove_child(req->parent, req);
 	}
+
+	/* The request is from queued_req list we should trigger the callback from caller */
+	if (spdk_unlikely(req->queued)) {
+		nvme_qpair_manual_complete_request(qpair, req, SPDK_NVME_SCT_GENERIC,
+						   SPDK_NVME_SC_INTERNAL_DEVICE_ERROR, true, true);
+		return rc;
+	}
+
 	nvme_free_request(req);
 
 	return rc;
@@ -705,16 +716,14 @@ nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *re
 		 * through this path.
 		 */
 		STAILQ_INSERT_TAIL(&qpair->queued_req, req, stailq);
+		req->queued = true;
 		return 0;
-	}
-
-	if (spdk_unlikely(qpair->transport_qp_is_failed == true)) {
-		return -ENXIO;
 	}
 
 	rc = _nvme_qpair_submit_request(qpair, req);
 	if (rc == -EAGAIN) {
 		STAILQ_INSERT_TAIL(&qpair->queued_req, req, stailq);
+		req->queued = true;
 		rc = 0;
 	}
 
@@ -732,6 +741,7 @@ nvme_qpair_resubmit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *
 	 * completions and resubmissions.
 	 */
 	assert(req->num_children == 0);
+	assert(req->queued);
 	rc = _nvme_qpair_submit_request(qpair, req);
 	if (spdk_unlikely(rc == -EAGAIN)) {
 		STAILQ_INSERT_HEAD(&qpair->queued_req, req, stailq);

@@ -413,7 +413,6 @@ int spdk_iscsi_auth_group_delete_secret(struct spdk_iscsi_auth_group *group,
 					const char *user);
 void spdk_iscsi_auth_groups_info_json(struct spdk_json_write_ctx *w);
 
-void spdk_iscsi_send_nopin(struct spdk_iscsi_conn *conn);
 void spdk_iscsi_task_response(struct spdk_iscsi_conn *conn,
 			      struct spdk_iscsi_task *task);
 int spdk_iscsi_build_iovs(struct spdk_iscsi_conn *conn, struct iovec *iovs, int iovcnt,
@@ -422,23 +421,12 @@ int spdk_iscsi_handle_incoming_pdus(struct spdk_iscsi_conn *conn);
 void spdk_iscsi_task_mgmt_response(struct spdk_iscsi_conn *conn,
 				   struct spdk_iscsi_task *task);
 
-int spdk_iscsi_conn_params_init(struct iscsi_param **params);
-int spdk_iscsi_sess_params_init(struct iscsi_param **params);
-
 void spdk_free_sess(struct spdk_iscsi_sess *sess);
 void spdk_clear_all_transfer_task(struct spdk_iscsi_conn *conn,
 				  struct spdk_scsi_lun *lun,
 				  struct spdk_iscsi_pdu *pdu);
-void spdk_del_transfer_task(struct spdk_iscsi_conn *conn, uint32_t CmdSN);
-bool spdk_iscsi_is_deferred_free_pdu(struct spdk_iscsi_pdu *pdu);
+bool spdk_del_transfer_task(struct spdk_iscsi_conn *conn, uint32_t CmdSN);
 
-int spdk_iscsi_negotiate_params(struct spdk_iscsi_conn *conn,
-				struct iscsi_param **params_p, uint8_t *data,
-				int alloc_len, int data_len);
-int spdk_iscsi_copy_param2var(struct spdk_iscsi_conn *conn);
-
-void spdk_iscsi_task_cpl(struct spdk_scsi_task *scsi_task);
-void spdk_iscsi_task_mgmt_cpl(struct spdk_scsi_task *scsi_task);
 uint32_t spdk_iscsi_pdu_calc_header_digest(struct spdk_iscsi_pdu *pdu);
 uint32_t spdk_iscsi_pdu_calc_data_digest(struct spdk_iscsi_pdu *pdu);
 
@@ -448,6 +436,7 @@ struct spdk_iscsi_pdu *spdk_get_pdu(void);
 int spdk_iscsi_conn_handle_queued_datain_tasks(struct spdk_iscsi_conn *conn);
 void spdk_iscsi_op_abort_task_set(struct spdk_iscsi_task *task,
 				  uint8_t function);
+void spdk_iscsi_queue_task(struct spdk_iscsi_conn *conn, struct spdk_iscsi_task *task);
 
 static inline uint32_t
 spdk_get_max_immediate_data_size(void)

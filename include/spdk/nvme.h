@@ -1,8 +1,8 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (c) Intel Corporation.
- *   All rights reserved.
+ *   Copyright (c) Intel Corporation. All rights reserved.
+ *   Copyright (c) 2019 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -236,6 +236,21 @@ void spdk_nvme_ctrlr_get_default_ctrlr_opts(struct spdk_nvme_ctrlr_opts *opts,
 		size_t opts_size);
 
 /**
+ * Reason for qpair disconnect at the transport layer.
+ *
+ * NONE implies that the qpair is still connected while UNKNOWN means that the
+ * qpair is disconnected, but the cause was not apparent.
+ */
+enum spdk_nvme_qp_failure_reason {
+	SPDK_NVME_QPAIR_FAILURE_NONE = 0,
+	SPDK_NVME_QPAIR_FAILURE_LOCAL,
+	SPDK_NVME_QPAIR_FAILURE_REMOTE,
+	SPDK_NVME_QPAIR_FAILURE_UNKNOWN,
+};
+
+typedef enum spdk_nvme_qp_failure_reason spdk_nvme_qp_failure_reason;
+
+/**
  * NVMe library transports
  *
  * NOTE: These are mapped directly to the NVMe over Fabrics TRTYPE values, except for PCIe,
@@ -356,6 +371,7 @@ enum spdk_nvme_ctrlr_flags {
 	SPDK_NVME_CTRLR_SGL_SUPPORTED			= 0x1, /**< The SGL is supported */
 	SPDK_NVME_CTRLR_SECURITY_SEND_RECV_SUPPORTED	= 0x2, /**< security send/receive is supported */
 	SPDK_NVME_CTRLR_WRR_SUPPORTED			= 0x4, /**< Weighted Round Robin is supported */
+	SPDK_NVME_CTRLR_COMPARE_AND_WRITE_SUPPORTED	= 0x8, /**< Compare and write fused operations supported */
 };
 
 /**
@@ -1022,14 +1038,22 @@ struct spdk_nvme_io_qpair_opts {
 
 	/**
 	 * When submitting I/O via spdk_nvme_ns_read/write and similar functions,
-	 * don't immediately write the submission queue doorbell. Instead, write
-	 * to the doorbell as necessary inside spdk_nvme_qpair_process_completions().
+	 * don't immediately submit it to hardware. Instead, queue up new commands
+	 * and submit them to the hardware inside spdk_nvme_qpair_process_completions().
 	 *
-	 * This results in better batching of I/O submission and consequently fewer
-	 * MMIO writes to the doorbell, which may increase performance.
+	 * This results in better batching of I/O commands. Often, it is more efficient
+	 * to submit batches of commands to the underlying hardware than each command
+	 * individually.
 	 *
-	 * This only applies to local PCIe devices. */
-	bool delay_pcie_doorbell;
+	 * This only applies to PCIe and RDMA transports.
+	 *
+	 * The flag was originally named delay_pcie_doorbell. To allow backward compatibility
+	 * both names are kept in unnamed union.
+	 */
+	union {
+		bool delay_cmd_submit;
+		bool delay_pcie_doorbell;
+	};
 
 	/**
 	 * These fields allow specifying the memory buffers for the submission and/or
@@ -1110,6 +1134,16 @@ struct spdk_nvme_qpair *spdk_nvme_ctrlr_alloc_io_qpair(struct spdk_nvme_ctrlr *c
  * the application should call spdk_nvme_ctrlr_reset to reset the entire controller.
  */
 int spdk_nvme_ctrlr_reconnect_io_qpair(struct spdk_nvme_qpair *qpair);
+
+/**
+ * Returns the reason the admin qpair for a given controller is disconnected.
+ *
+ * \param ctrlr The controller to check.
+ *
+ * \return a valid spdk_nvme_qp_failure_reason.
+ */
+spdk_nvme_qp_failure_reason spdk_nvme_ctrlr_get_admin_qp_failure_reason(
+	struct spdk_nvme_ctrlr *ctrlr);
 
 /**
  * Free an I/O queue pair that was allocated by spdk_nvme_ctrlr_alloc_io_qpair().
@@ -1256,6 +1290,15 @@ int spdk_nvme_ctrlr_cmd_io_raw_with_md(struct spdk_nvme_ctrlr *ctrlr,
  */
 int32_t spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 		uint32_t max_completions);
+
+/**
+ * Returns the reason the qpair is disconnected.
+ *
+ * \param qpair The qpair to check.
+ *
+ * \return a valid spdk_nvme_qp_failure_reason.
+ */
+spdk_nvme_qp_failure_reason spdk_nvme_qpair_get_failure_reason(struct spdk_nvme_qpair *qpair);
 
 /**
  * Send the given admin command to the NVMe controller.
@@ -2649,11 +2692,10 @@ char *spdk_nvme_cuse_get_ns_name(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid);
  * for the CUSE device to function.
  *
  * \param ctrlr Opaque handle to the NVMe controller.
- * \param dev_path The path at which the device should appear. Ex. /dev/spdk/nvme0n1
  *
  * \return 0 on success. Negated errno on failure.
  */
-int spdk_nvme_cuse_register(struct spdk_nvme_ctrlr *ctrlr, const char *dev_path);
+int spdk_nvme_cuse_register(struct spdk_nvme_ctrlr *ctrlr);
 
 /**
  * Remove a previously created character device (Experimental)

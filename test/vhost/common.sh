@@ -1,5 +1,7 @@
 : ${SPDK_VHOST_VERBOSE=false}
 : ${VHOST_DIR="$HOME/vhost_test"}
+: ${QEMU_BIN="qemu-system-x86_64"}
+: ${QEMU_IMG_BIN="qemu-img"}
 
 TEST_DIR=$(readlink -f $rootdir/..)
 VM_DIR=$VHOST_DIR/vms
@@ -9,7 +11,7 @@ VM_PASSWORD="root"
 #TODO: Move vhost_vm_image.qcow2 into VHOST_DIR on test systems.
 VM_IMAGE=$HOME/vhost_vm_image.qcow2
 
-if ! hash qemu-img qemu-system-x86_64; then
+if ! hash $QEMU_IMG_BIN $QEMU_BIN; then
 	error 'QEMU is not installed on this system. Unable to run vhost tests.'
 	exit 1
 fi
@@ -245,7 +247,7 @@ function vhost_rpc
 	fi
 	shift
 
-	$rootdir/scripts/rpc.py -s $(get_vhost_dir $vhost_name)/rpc.sock $@
+	$rootdir/scripts/rpc.py -s $(get_vhost_dir $vhost_name)/rpc.sock "$@"
 }
 
 ###
@@ -478,10 +480,8 @@ function vm_kill_all()
 #
 function vm_shutdown_all()
 {
-	local shell_restore_x
-	shell_restore_x="$( [[ "$-" =~ x ]] && echo 'set -x' )"
-	# XXX: temporally disable to debug shutdown issue
-	# set +x
+	# XXX: temporarily disable to debug shutdown issue
+	# xtrace_disable
 
 	local vms
 	vms=$(vm_list_all)
@@ -504,7 +504,7 @@ function vm_shutdown_all()
 
 		if [[ $all_vms_down == 1 ]]; then
 			notice "All VMs successfully shut down"
-			$shell_restore_x
+			xtrace_restore
 			return 0
 		fi
 
@@ -514,15 +514,12 @@ function vm_shutdown_all()
 
 	rm -rf $VM_DIR
 
-	$shell_restore_x
-	error "Timeout waiting for some VMs to shutdown"
-	return 1
+	xtrace_restore
 }
 
 function vm_setup()
 {
-	local shell_restore_x
-	shell_restore_x="$( [[ "$-" =~ x ]] && echo 'set -x' )"
+	xtrace_disable
 	local OPTIND optchar vm_num
 
 	local os=""
@@ -584,12 +581,12 @@ function vm_setup()
 			local vm_dir="$VM_DIR/$i"
 			[[ ! -d $vm_dir ]] && break
 		done
-		$shell_restore_x
+		xtrace_restore
 
 		vm_num=$i
 	fi
 
-	if [[ $i -eq 256 ]]; then
+	if [[ $vm_num -eq 256 ]]; then
 		error "no free VM found. do some cleanup (256 VMs created, are you insane?)"
 		return 1
 	fi
@@ -615,7 +612,7 @@ function vm_setup()
 
 	if [[ "$os_mode" == "backing" ]]; then
 		notice "Creating backing file for OS image file: $os"
-		if ! qemu-img create -f qcow2 -b $os $vm_dir/os.qcow2; then
+		if ! $QEMU_IMG_BIN create -f qcow2 -b $os $vm_dir/os.qcow2; then
 			error "Failed to create OS backing file in '$vm_dir/os.qcow2' using '$os'"
 			return 1
 		fi
@@ -648,7 +645,7 @@ function vm_setup()
 	local task_mask=${!qemu_mask_param}
 
 	notice "TASK MASK: $task_mask"
-	local cmd="taskset -a -c $task_mask qemu-system-x86_64 ${eol}"
+	local cmd="taskset -a -c $task_mask $QEMU_BIN ${eol}"
 	local vm_socket_offset=$(( 10000 + 100 * vm_num ))
 
 	local ssh_socket=$(( vm_socket_offset + 0 ))
@@ -681,7 +678,7 @@ function vm_setup()
 		queue_number=$cpu_num
 	fi
 
-	$shell_restore_x
+	xtrace_restore
 
 	local node_num=${!qemu_numa_node_param}
 	local boot_disk_present=false
@@ -854,7 +851,7 @@ function vm_run()
 		vms_to_run="$(vm_list_all)"
 	else
 		shift $((OPTIND-1))
-		for vm in $@; do
+		for vm in "$@"; do
 			vm_num_is_valid $1 || return 1
 			if [[ ! -x $VM_DIR/$vm/run.sh ]]; then
 				error "VM$vm not defined - setup it first"
@@ -911,9 +908,7 @@ function vm_wait_for_boot()
 {
 	assert_number $1
 
-	local shell_restore_x
-	shell_restore_x="$( [[ "$-" =~ x ]] && echo 'set -x' )"
-	set +x
+	xtrace_disable
 
 	local all_booted=false
 	local timeout_time=$1
@@ -927,7 +922,7 @@ function vm_wait_for_boot()
 		local vms_to_check="$VM_DIR/[0-9]*"
 	else
 		local vms_to_check=""
-		for vm in $@; do
+		for vm in "$@"; do
 			vms_to_check+=" $VM_DIR/$vm"
 		done
 	fi
@@ -941,14 +936,14 @@ function vm_wait_for_boot()
 			if ! vm_is_running $vm_num; then
 				warning "VM $vm_num is not running"
 				vm_print_logs $vm_num
-				$shell_restore_x
+				xtrace_restore
 				return 1
 			fi
 
 			if [[ $(date +%s) -gt $timeout_time ]]; then
 				warning "timeout waiting for machines to boot"
 				vm_print_logs $vm_num
-				$shell_restore_x
+				xtrace_restore
 				return 1
 			fi
 			if (( i > 30 )); then
@@ -970,7 +965,7 @@ function vm_wait_for_boot()
 	done
 
 	notice "all VMs ready"
-	$shell_restore_x
+	xtrace_restore
 	return 0
 }
 
@@ -992,7 +987,7 @@ function vm_start_fio_server()
 	done
 
 	shift $(( OPTIND - 1 ))
-	for vm_num in $@; do
+	for vm_num in "$@"; do
 		notice "Starting fio server on VM$vm_num"
 		if [[ $fio_bin != "" ]]; then
 			cat $fio_bin | vm_exec $vm_num 'cat > /root/fio; chmod +x /root/fio'
@@ -1056,7 +1051,7 @@ function run_fio()
 	local vm
 	local run_server_mode=true
 
-	for arg in $@; do
+	for arg in "$@"; do
 		case "$arg" in
 			--job-file=*) local job_file="${arg#*=}" ;;
 			--fio-bin=*) local fio_bin="${arg#*=}" ;;
@@ -1087,7 +1082,7 @@ function run_fio()
 	local job_fname
 	job_fname=$(basename "$job_file")
 	# prepare job file for each VM
-	for vm in ${vms[@]}; do
+	for vm in "${vms[@]}"; do
 		local vm_num=${vm%%:*}
 		local vmdisks=${vm#*:}
 

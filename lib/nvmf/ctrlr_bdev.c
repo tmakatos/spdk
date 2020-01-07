@@ -436,7 +436,7 @@ nvmf_bdev_ctrlr_unmap(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 	uint32_t lba_count;
 	int rc;
 
-	nr = ((cmd->cdw10 & 0x000000ff) + 1);
+	nr = cmd->cdw10_bits.dsm.nr + 1;
 	if (nr * sizeof(struct spdk_nvme_dsm_range) > req->length) {
 		SPDK_ERRLOG("Dataset Management number of ranges > SGL length\n");
 		response->status.sc = SPDK_NVME_SC_DATA_SGL_LENGTH_INVALID;
@@ -498,12 +498,10 @@ int
 spdk_nvmf_bdev_ctrlr_dsm_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 			     struct spdk_io_channel *ch, struct spdk_nvmf_request *req)
 {
-	uint32_t attribute;
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
 
-	attribute = cmd->cdw11 & 0x00000007;
-	if (attribute & SPDK_NVME_DSM_ATTR_DEALLOCATE) {
+	if (cmd->cdw11_bits.dsm.ad) {
 		return nvmf_bdev_ctrlr_unmap(bdev, desc, ch, req, NULL);
 	}
 

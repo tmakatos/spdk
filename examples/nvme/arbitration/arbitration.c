@@ -138,25 +138,6 @@ static struct arb_context g_arbitration = {
 #define USER_SPECIFIED_HIGH_PRIORITY_WEIGHT	32
 #define USER_SPECIFIED_MEDIUM_PRIORITY_WEIGHT	16
 #define USER_SPECIFIED_LOW_PRIORITY_WEIGHT	8
-#define USER_SPECIFIED_ARBITRATION_BURST	7	/* No limit */
-
-/*
- * Description of dword for priority weight and arbitration burst
- * ------------------------------------------------------------------------------
- *     31 : 24      |       23 : 16      |    15 : 08      | 07 : 03  | 02 : 00
- * ------------------------------------------------------------------------------
- * High Prio Weight | Medium Prio Weight | Low Prio Weight | Reserved | Arb Burst
- * ------------------------------------------------------------------------------
- *
- * The priority weights are zero based value.
- */
-#define SPDK_NVME_HIGH_PRIO_WEIGHT_SHIFT	24
-#define SPDK_NVME_MED_PRIO_WEIGHT_SHIFT		16
-#define SPDK_NVME_LOW_PRIO_WEIGHT_SHIFT		8
-#define SPDK_NVME_PRIO_WEIGHT_MASK		0xFF
-#define SPDK_NVME_ARB_BURST_MASK		0x7
-
-#define SPDK_NVME_QPRIO_MAX			(SPDK_NVME_QPRIO_LOW + 1)
 
 static void task_complete(struct arb_task *task);
 
@@ -869,7 +850,7 @@ register_workers(void)
 			qprio++;
 		}
 
-		worker->qprio = qprio % SPDK_NVME_QPRIO_MAX;
+		worker->qprio = qprio & SPDK_NVME_CREATE_IO_SQ_QPRIO_MASK;
 	}
 
 	return 0;
@@ -1001,7 +982,7 @@ get_feature(struct spdk_nvme_ctrlr *ctrlr, uint8_t fid)
 	feature->valid = false;
 
 	cmd.opc = SPDK_NVME_OPC_GET_FEATURES;
-	cmd.cdw10 = fid;
+	cmd.cdw10_bits.get_features.fid = fid;
 
 	return spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0, get_feature_completion, feature);
 }
@@ -1018,26 +999,21 @@ get_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 	}
 
 	if (features[SPDK_NVME_FEAT_ARBITRATION].valid) {
-		uint32_t arb = features[SPDK_NVME_FEAT_ARBITRATION].result;
-		unsigned ab, lpw, mpw, hpw;
-
-		ab = arb & SPDK_NVME_ARB_BURST_MASK;
-		lpw = ((arb >> SPDK_NVME_LOW_PRIO_WEIGHT_SHIFT) & SPDK_NVME_PRIO_WEIGHT_MASK) + 1;
-		mpw = ((arb >> SPDK_NVME_MED_PRIO_WEIGHT_SHIFT) & SPDK_NVME_PRIO_WEIGHT_MASK) + 1;
-		hpw = ((arb >> SPDK_NVME_HIGH_PRIO_WEIGHT_SHIFT) & SPDK_NVME_PRIO_WEIGHT_MASK) + 1;
+		union spdk_nvme_cmd_cdw11 arb;
+		arb.feat_arbitration.raw = features[SPDK_NVME_FEAT_ARBITRATION].result;
 
 		printf("Current Arbitration Configuration\n");
 		printf("===========\n");
 		printf("Arbitration Burst:           ");
-		if (ab == SPDK_NVME_ARB_BURST_MASK) {
+		if (arb.feat_arbitration.bits.ab == SPDK_NVME_ARBITRATION_BURST_UNLIMITED) {
 			printf("no limit\n");
 		} else {
-			printf("%u\n", 1u << ab);
+			printf("%u\n", 1u << arb.feat_arbitration.bits.ab);
 		}
 
-		printf("Low Priority Weight:         %u\n", lpw);
-		printf("Medium Priority Weight:      %u\n", mpw);
-		printf("High Priority Weight:        %u\n", hpw);
+		printf("Low Priority Weight:         %u\n", arb.feat_arbitration.bits.lpw + 1);
+		printf("Medium Priority Weight:      %u\n", arb.feat_arbitration.bits.mpw + 1);
+		printf("High Priority Weight:        %u\n", arb.feat_arbitration.bits.hpw + 1);
 		printf("\n");
 	}
 }
@@ -1063,21 +1039,17 @@ set_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 {
 	int ret;
 	struct spdk_nvme_cmd cmd = {};
-	uint32_t arb = 0;
-	unsigned ab, lpw, mpw, hpw;
 
 	cmd.opc = SPDK_NVME_OPC_SET_FEATURES;
-	cmd.cdw10 = SPDK_NVME_FEAT_ARBITRATION;
+	cmd.cdw10_bits.set_features.fid = SPDK_NVME_FEAT_ARBITRATION;
 
 	g_arbitration.outstanding_commands = 0;
 
 	if (features[SPDK_NVME_FEAT_ARBITRATION].valid) {
-		ab = USER_SPECIFIED_ARBITRATION_BURST & SPDK_NVME_ARB_BURST_MASK;
-		hpw = USER_SPECIFIED_HIGH_PRIORITY_WEIGHT << SPDK_NVME_HIGH_PRIO_WEIGHT_SHIFT;
-		mpw = USER_SPECIFIED_MEDIUM_PRIORITY_WEIGHT << SPDK_NVME_MED_PRIO_WEIGHT_SHIFT;
-		lpw = USER_SPECIFIED_LOW_PRIORITY_WEIGHT << SPDK_NVME_LOW_PRIO_WEIGHT_SHIFT;
-		arb = hpw | mpw | lpw | ab;
-		cmd.cdw11 = arb;
+		cmd.cdw11_bits.feat_arbitration.bits.ab = SPDK_NVME_ARBITRATION_BURST_UNLIMITED;
+		cmd.cdw11_bits.feat_arbitration.bits.lpw = USER_SPECIFIED_LOW_PRIORITY_WEIGHT;
+		cmd.cdw11_bits.feat_arbitration.bits.mpw = USER_SPECIFIED_MEDIUM_PRIORITY_WEIGHT;
+		cmd.cdw11_bits.feat_arbitration.bits.hpw = USER_SPECIFIED_HIGH_PRIORITY_WEIGHT;
 	}
 
 	ret = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0,

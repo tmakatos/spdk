@@ -272,7 +272,8 @@ struct spdk_thread *spdk_thread_get_from_ctx(void *ctx);
 
 /**
  * Perform one iteration worth of processing on the thread. This includes
- * both expired and continuous pollers as well as messages.
+ * both expired and continuous pollers as well as messages. If the thread
+ * has exited, return immediately.
  *
  * \param thread The thread to process
  * \param max_msgs The maximum number of messages that will be processed.
@@ -280,7 +281,7 @@ struct spdk_thread *spdk_thread_get_from_ctx(void *ctx);
  * \param now The current time, in ticks. Optional. If 0 is passed, this
  *            function may call spdk_get_ticks() to get the current time.
  *
- * \return 1 if work was done. 0 if no work was done. -1 if thread has exited.
+ * \return 1 if work was done. 0 if no work was done.
  */
 int spdk_thread_poll(struct spdk_thread *thread, uint32_t max_msgs, uint64_t now);
 
@@ -367,7 +368,7 @@ int spdk_thread_get_stats(struct spdk_thread_stats *stats);
 /**
  * Send a message to the given thread.
  *
- * The message may be sent asynchronously - i.e. spdk_thread_send_msg may return
+ * The message will be sent asynchronously - i.e. spdk_thread_send_msg will always return
  * prior to `fn` being called.
  *
  * \param thread The target thread.
@@ -416,6 +417,26 @@ struct spdk_poller *spdk_poller_register(spdk_poller_fn fn,
  * \param ppoller The poller to unregister.
  */
 void spdk_poller_unregister(struct spdk_poller **ppoller);
+
+/**
+ * Pause a poller on the current thread.
+ *
+ * The poller is not run until it is resumed with spdk_poller_resume().  It is
+ * perfectly fine to pause an already paused poller.
+ *
+ * \param poller The poller to pause.
+ */
+void spdk_poller_pause(struct spdk_poller *poller);
+
+/**
+ * Resume a poller on the current thread.
+ *
+ * Resumes a poller paused with spdk_poller_pause().  It is perfectly fine to
+ * resume an unpaused poller.
+ *
+ * \param poller The poller to resume.
+ */
+void spdk_poller_resume(struct spdk_poller *poller);
 
 /**
  * Register the opaque io_device context as an I/O device.

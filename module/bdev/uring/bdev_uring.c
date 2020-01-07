@@ -47,8 +47,7 @@
 #include "spdk/string.h"
 
 #include "spdk_internal/log.h"
-
-#include <liburing.h>
+#include "spdk_internal/uring.h"
 
 struct bdev_uring_io_channel {
 	struct bdev_uring_group_channel		*group_ch;
@@ -77,6 +76,7 @@ struct bdev_uring {
 static int bdev_uring_init(void);
 static void bdev_uring_fini(void);
 static void uring_free_bdev(struct bdev_uring *uring);
+static void bdev_uring_get_spdk_running_config(FILE *fp);
 static TAILQ_HEAD(, bdev_uring) g_uring_bdev_head;
 
 #define SPDK_URING_QUEUE_DEPTH 512
@@ -92,7 +92,7 @@ static struct spdk_bdev_module uring_if = {
 	.name		= "uring",
 	.module_init	= bdev_uring_init,
 	.module_fini	= bdev_uring_fini,
-	.config_text	= NULL,
+	.config_text	= bdev_uring_get_spdk_running_config,
 	.get_ctx_size	= bdev_uring_get_ctx_size,
 };
 
@@ -249,15 +249,15 @@ bdev_uring_group_poll(void *arg)
 	ret = 0;
 	if (to_submit > 0) {
 		/* If there are I/O to submit, use io_uring_submit here.
-		 * It will automatically call io_uring_enter appropriately. */
+		 * It will automatically call spdk_io_uring_enter appropriately. */
 		ret = io_uring_submit(&group_ch->uring);
 		group_ch->io_pending = 0;
 		group_ch->io_inflight += to_submit;
 	} else if (to_complete > 0) {
 		/* If there are I/O in flight but none to submit, we need to
 		 * call io_uring_enter ourselves. */
-		ret = io_uring_enter(group_ch->uring.ring_fd, 0, 0,
-				     IORING_ENTER_GETEVENTS, NULL);
+		ret = spdk_io_uring_enter(group_ch->uring.ring_fd, 0, 0,
+					  IORING_ENTER_GETEVENTS);
 	}
 
 	if (ret < 0) {
@@ -366,12 +366,45 @@ bdev_uring_get_io_channel(void *ctx)
 	return spdk_get_io_channel(uring);
 }
 
+static int
+bdev_uring_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
+{
+	struct bdev_uring *uring = ctx;
+
+	spdk_json_write_named_object_begin(w, "uring");
+
+	spdk_json_write_named_string(w, "filename", uring->filename);
+
+	spdk_json_write_object_end(w);
+
+	return 0;
+}
+
+static void
+bdev_uring_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *w)
+{
+	struct bdev_uring *uring = bdev->ctxt;
+
+	spdk_json_write_object_begin(w);
+
+	spdk_json_write_named_string(w, "method", "bdev_uring_create");
+
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "name", bdev->name);
+	spdk_json_write_named_uint32(w, "block_size", bdev->blocklen);
+	spdk_json_write_named_string(w, "filename", uring->filename);
+	spdk_json_write_object_end(w);
+
+	spdk_json_write_object_end(w);
+}
 
 static const struct spdk_bdev_fn_table uring_fn_table = {
 	.destruct		= bdev_uring_destruct,
 	.submit_request		= bdev_uring_submit_request,
 	.io_type_supported	= bdev_uring_io_type_supported,
 	.get_io_channel		= bdev_uring_get_io_channel,
+	.dump_info_json		= bdev_uring_dump_info_json,
+	.write_config_json	= bdev_uring_write_json_config,
 };
 
 static void uring_free_bdev(struct bdev_uring *uring)
@@ -607,6 +640,34 @@ static void
 bdev_uring_fini(void)
 {
 	spdk_io_device_unregister(&uring_if, NULL);
+}
+
+static void
+bdev_uring_get_spdk_running_config(FILE *fp)
+{
+	char *file;
+	char *name;
+	uint32_t block_size;
+	struct bdev_uring *uring;
+
+	fprintf(fp,
+		"\n"
+		"# Users must change this section to match the /dev/sdX devices to be\n"
+		"# exported as iSCSI LUNs. The devices are accessed using io_uring.\n"
+		"# The format is:\n"
+		"# URING <file name> <bdev name> [<block size>]\n"
+		"# The file name is the backing device\n"
+		"# The bdev name can be referenced from elsewhere in the configuration file.\n"
+		"# Block size may be omitted to automatically detect the block size of a bdev.\n"
+		"[URING]\n");
+
+	TAILQ_FOREACH(uring, &g_uring_bdev_head, link) {
+		file = uring->filename;
+		name = uring->bdev.name;
+		block_size = uring->bdev.blocklen;
+		fprintf(fp, "  URING %s %s %d\n", file, name, block_size);
+	}
+	fprintf(fp, "\n");
 }
 
 SPDK_LOG_REGISTER_COMPONENT("uring", SPDK_LOG_URING)

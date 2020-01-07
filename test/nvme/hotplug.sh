@@ -10,12 +10,10 @@ if [ -z "${DEPENDENCY_DIR}" ]; then
 fi
 
 function ssh_vm() {
-	local shell_restore_x
-	shell_restore_x="$( [[ "$-" =~ x ]] && echo 'set -x' )"
-	set +x
+	xtrace_disable
 	sshpass -p "$password" ssh -o PubkeyAuthentication=no \
 	-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 10022 root@localhost "$@"
-	$shell_restore_x
+	xtrace_restore
 }
 
 function monitor_cmd() {
@@ -89,8 +87,6 @@ if [ ! -e "$base_img" ]; then
 	exit 0
 fi
 
-timing_enter hotplug
-
 timing_enter start_qemu
 
 qemu-img create -b "$base_img" -f qcow2 "$test_img"
@@ -146,5 +142,3 @@ rm "$test_img"
 
 report_test_completion "nvme_hotplug"
 timing_exit hotplug_test
-
-timing_exit hotplug

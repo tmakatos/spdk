@@ -355,7 +355,8 @@ def bdev_uring_delete(client, name):
 def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, retry_count=None,
                           arbitration_burst=None, low_priority_weight=None,
                           medium_priority_weight=None, high_priority_weight=None,
-                          nvme_adminq_poll_period_us=None, nvme_ioq_poll_period_us=None, io_queue_requests=None):
+                          nvme_adminq_poll_period_us=None, nvme_ioq_poll_period_us=None, io_queue_requests=None,
+                          delay_cmd_submit=None):
     """Set options for the bdev nvme. This is startup command.
 
     Args:
@@ -369,6 +370,7 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, retry
         nvme_adminq_poll_period_us: How often the admin queue is polled for asynchronous events in microseconds (optional)
         nvme_ioq_poll_period_us: How often to poll I/O queues for completions in microseconds (optional)
         io_queue_requests: The number of requests allocated for each NVMe I/O queue. Default: 512 (optional)
+        delay_cmd_submit: Enable delayed NVMe command submission to allow batching of multiple commands (optional)
     """
     params = {}
 
@@ -401,6 +403,9 @@ def bdev_nvme_set_options(client, action_on_timeout=None, timeout_us=None, retry
 
     if io_queue_requests:
         params['io_queue_requests'] = io_queue_requests
+
+    if delay_cmd_submit is not None:
+        params['delay_cmd_submit'] = delay_cmd_submit
 
     return client.call('bdev_nvme_set_options', params)
 
@@ -486,15 +491,13 @@ def bdev_nvme_detach_controller(client, name):
     return client.call('bdev_nvme_detach_controller', params)
 
 
-def bdev_nvme_cuse_register(client, name, dev_path):
+def bdev_nvme_cuse_register(client, name):
     """Register CUSE devices on NVMe controller.
 
     Args:
         name: Name of the operating NVMe controller
-        dev_path: CUSE dev path with dev prefix
     """
-    params = {'name': name,
-              'dev_path': dev_path}
+    params = {'name': name}
 
     return client.call('bdev_nvme_cuse_register', params)
 
@@ -912,6 +915,38 @@ def bdev_ftl_delete(client, name):
     params = {'name': name}
 
     return client.call('bdev_ftl_delete', params)
+
+
+def bdev_ocssd_create(client, ctrlr_name, bdev_name, nsid=None, range=None):
+    """Creates Open Channel zoned bdev on specified Open Channel controller
+
+    Args:
+        ctrlr_name: name of the OC NVMe controller
+        bdev_name: name of the bdev to create
+        nsid: namespace ID
+        range: parallel unit range
+    """
+    params = {'ctrlr_name': ctrlr_name,
+              'bdev_name': bdev_name}
+
+    if nsid is not None:
+        params['nsid'] = nsid
+
+    if range is not None:
+        params['range'] = range
+
+    return client.call('bdev_ocssd_create', params)
+
+
+def bdev_ocssd_delete(client, name):
+    """Deletes Open Channel bdev
+
+    Args:
+        name: name of the bdev
+    """
+    params = {'name': name}
+
+    return client.call('bdev_ocssd_delete', params)
 
 
 @deprecated_alias('get_bdevs')

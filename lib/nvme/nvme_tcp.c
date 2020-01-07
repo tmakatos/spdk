@@ -52,6 +52,7 @@
 #include "spdk_internal/nvme_tcp.h"
 
 #define NVME_TCP_RW_BUFFER_SIZE 131072
+#define NVME_TCP_TIME_OUT_IN_SECONDS 2
 
 #define NVME_TCP_HPDA_DEFAULT			0
 #define NVME_TCP_MAX_R2T_DEFAULT		1
@@ -235,7 +236,7 @@ nvme_tcp_qpair_disconnect(struct spdk_nvme_qpair *qpair)
 	struct nvme_tcp_qpair *tqpair = nvme_tcp_qpair(qpair);
 	struct nvme_tcp_pdu *pdu;
 
-	qpair->transport_qp_is_failed = true;
+	nvme_qpair_set_state(qpair, NVME_QPAIR_DISABLED);
 	spdk_sock_close(&tqpair->sock);
 
 	/* clear the send_queue */
@@ -1511,6 +1512,8 @@ fail:
 	 * we can call nvme_tcp_qpair_disconnect. For other qpairs we need
 	 * to call the generic function which will take the lock for us.
 	 */
+	qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_UNKNOWN;
+
 	if (nvme_qpair_is_admin_queue(qpair)) {
 		nvme_tcp_qpair_disconnect(qpair);
 	} else {
@@ -1524,6 +1527,8 @@ nvme_tcp_qpair_icreq_send(struct nvme_tcp_qpair *tqpair)
 {
 	struct spdk_nvme_tcp_ic_req *ic_req;
 	struct nvme_tcp_pdu *pdu;
+	uint64_t icreq_timeout_tsc;
+	int rc;
 
 	pdu = &tqpair->send_pdu;
 	memset(&tqpair->send_pdu, 0, sizeof(tqpair->send_pdu));
@@ -1541,9 +1546,11 @@ nvme_tcp_qpair_icreq_send(struct nvme_tcp_qpair *tqpair)
 
 	nvme_tcp_qpair_write_pdu(tqpair, pdu, nvme_tcp_send_icreq_complete, tqpair);
 
-	while (tqpair->state == NVME_TCP_QPAIR_STATE_INVALID) {
-		nvme_tcp_qpair_process_completions(&tqpair->qpair, 0);
-	}
+	icreq_timeout_tsc = spdk_get_ticks() + (NVME_TCP_TIME_OUT_IN_SECONDS * spdk_get_ticks_hz());
+	do {
+		rc = nvme_tcp_qpair_process_completions(&tqpair->qpair, 0);
+	} while ((tqpair->state == NVME_TCP_QPAIR_STATE_INVALID) &&
+		 (rc == 0) && (spdk_get_ticks() <= icreq_timeout_tsc));
 
 	if (tqpair->state != NVME_TCP_QPAIR_STATE_RUNNING) {
 		SPDK_ERRLOG("Failed to construct the tqpair=%p via correct icresp\n", tqpair);
@@ -1624,10 +1631,9 @@ nvme_tcp_qpair_connect(struct nvme_tcp_qpair *tqpair)
 		return -1;
 	}
 
-	tqpair->qpair.transport_qp_is_failed = false;
 	rc = nvme_fabric_qpair_connect(&tqpair->qpair, tqpair->num_entries);
 	if (rc < 0) {
-		tqpair->qpair.transport_qp_is_failed = true;
+		nvme_qpair_set_state(&tqpair->qpair, NVME_QPAIR_DISABLED);
 		SPDK_ERRLOG("Failed to send an NVMe-oF Fabric CONNECT command\n");
 		return -1;
 	}

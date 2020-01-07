@@ -185,7 +185,7 @@ get_feature(struct spdk_nvme_ctrlr *ctrlr, uint8_t fid)
 	feature->valid = false;
 
 	cmd.opc = SPDK_NVME_OPC_GET_FEATURES;
-	cmd.cdw10 = fid;
+	cmd.cdw10_bits.get_features.fid = fid;
 
 	return spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0, get_feature_completion, feature);
 }
@@ -1129,6 +1129,8 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	printf("Atomic Write Unit (Normal):  %d\n", cdata->awun + 1);
 	printf("Atomic Write Unit (PFail):   %d\n", cdata->awupf + 1);
 	printf("Atomic Compare & Write Unit: %d\n", cdata->acwu + 1);
+	printf("Fused Compare & Write:       %s\n",
+	       cdata->fuses.compare_and_write ? "Supported" : "Not Supported");
 	printf("Scatter-Gather List\n");
 	printf("  SGL Command Set:           %s\n",
 	       cdata->sgls.supported == SPDK_NVME_SGLS_SUPPORTED ? "Supported" :

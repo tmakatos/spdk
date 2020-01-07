@@ -32,6 +32,7 @@
  */
 
 #include "spdk/env.h"
+#include "bdev_ocssd.h"
 #include "common.h"
 
 struct nvme_bdev_ctrlrs g_nvme_bdev_ctrlrs = TAILQ_HEAD_INITIALIZER(g_nvme_bdev_ctrlrs);
@@ -108,4 +109,71 @@ nvme_bdev_dump_trid_json(struct spdk_nvme_transport_id *trid, struct spdk_json_w
 	if (trid->subnqn[0] != '\0') {
 		spdk_json_write_named_string(w, "subnqn", trid->subnqn);
 	}
+}
+
+static void
+nvme_bdev_unregister_cb(void *io_device)
+{
+	struct nvme_bdev_ctrlr *nvme_bdev_ctrlr = io_device;
+	uint32_t i;
+
+	pthread_mutex_lock(&g_bdev_nvme_mutex);
+	TAILQ_REMOVE(&g_nvme_bdev_ctrlrs, nvme_bdev_ctrlr, tailq);
+	pthread_mutex_unlock(&g_bdev_nvme_mutex);
+	spdk_nvme_detach(nvme_bdev_ctrlr->ctrlr);
+	spdk_poller_unregister(&nvme_bdev_ctrlr->adminq_timer_poller);
+	free(nvme_bdev_ctrlr->name);
+	for (i = 0; i < nvme_bdev_ctrlr->num_ns; i++) {
+		free(nvme_bdev_ctrlr->namespaces[i]);
+	}
+	free(nvme_bdev_ctrlr->namespaces);
+	free(nvme_bdev_ctrlr);
+}
+
+void
+nvme_bdev_ctrlr_destruct(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr)
+{
+	assert(nvme_bdev_ctrlr->destruct);
+	if (nvme_bdev_ctrlr->opal_dev) {
+		if (nvme_bdev_ctrlr->opal_poller != NULL) {
+			spdk_poller_unregister(&nvme_bdev_ctrlr->opal_poller);
+			/* wait until we get the result */
+			while (spdk_opal_revert_poll(nvme_bdev_ctrlr->opal_dev) == -EAGAIN);
+		}
+		spdk_opal_close(nvme_bdev_ctrlr->opal_dev);
+		nvme_bdev_ctrlr->opal_dev = NULL;
+	}
+
+	if (nvme_bdev_ctrlr->ocssd_ctrlr) {
+		bdev_ocssd_fini_ctrlr(nvme_bdev_ctrlr);
+	}
+
+	spdk_io_device_unregister(nvme_bdev_ctrlr, nvme_bdev_unregister_cb);
+}
+
+void
+nvme_bdev_attach_bdev_to_ns(struct nvme_bdev_ns *nvme_ns, struct nvme_bdev *nvme_disk)
+{
+	nvme_ns->ctrlr->ref++;
+
+	TAILQ_INSERT_TAIL(&nvme_ns->bdevs, nvme_disk, tailq);
+}
+
+void
+nvme_bdev_detach_bdev_from_ns(struct nvme_bdev *nvme_disk)
+{
+	struct nvme_bdev_ctrlr *ctrlr = nvme_disk->nvme_ns->ctrlr;
+
+	pthread_mutex_lock(&g_bdev_nvme_mutex);
+	ctrlr->ref--;
+
+	TAILQ_REMOVE(&nvme_disk->nvme_ns->bdevs, nvme_disk, tailq);
+
+	if (ctrlr->ref == 0 && ctrlr->destruct) {
+		pthread_mutex_unlock(&g_bdev_nvme_mutex);
+		nvme_bdev_ctrlr_destruct(ctrlr);
+		return;
+	}
+
+	pthread_mutex_unlock(&g_bdev_nvme_mutex);
 }

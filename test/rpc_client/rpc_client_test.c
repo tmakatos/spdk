@@ -327,18 +327,6 @@ out:
 	return rc;
 }
 
-/* Helper function */
-static int
-_sem_timedwait(sem_t *sem, __time_t sec)
-{
-	struct timespec timeout;
-
-	clock_gettime(CLOCK_REALTIME, &timeout);
-	timeout.tv_sec += sec;
-
-	return sem_timedwait(sem, &timeout);
-}
-
 volatile int g_rpc_server_th_stop;
 static sem_t g_rpc_server_th_listening;
 
@@ -350,6 +338,7 @@ rpc_server_th(void *arg)
 	rc = spdk_rpc_listen(g_rpcsock_addr);
 	if (rc) {
 		fprintf(stderr, "spdk_rpc_listen() failed: %d\n", rc);
+		sem_post(&g_rpc_server_th_listening);
 		goto out;
 	}
 
@@ -365,8 +354,6 @@ out:
 	return (void *)(intptr_t)rc;
 }
 
-static sem_t g_rpc_client_th_done;
-
 static void *
 rpc_client_th(void *arg)
 {
@@ -375,7 +362,7 @@ rpc_client_th(void *arg)
 	int rc;
 
 
-	rc = _sem_timedwait(&g_rpc_server_th_listening, 2);
+	rc = sem_wait(&g_rpc_server_th_listening);
 	if (rc == -1) {
 		fprintf(stderr, "Timeout waiting for server thread to start listening: rc=%d errno=%d\n", rc,
 			errno);
@@ -412,7 +399,6 @@ out:
 		spdk_jsonrpc_client_close(client);
 	}
 
-	sem_post(&g_rpc_client_th_done);
 	return (void *)(intptr_t)rc;
 }
 
@@ -425,7 +411,6 @@ int main(int argc, char **argv)
 	int rc = 0, err_cnt = 0;
 
 	sem_init(&g_rpc_server_th_listening, 0, 0);
-	sem_init(&g_rpc_client_th_done, 0, 0);
 
 	srv_tid_valid = pthread_create(&srv_tid, NULL, rpc_server_th, NULL);
 	if (srv_tid_valid != 0) {
@@ -441,12 +426,6 @@ int main(int argc, char **argv)
 
 out:
 	if (client_tid_valid == 0) {
-		rc = _sem_timedwait(&g_rpc_client_th_done, JOIN_TIMEOUT_S);
-		if (rc) {
-			fprintf(stderr, "failed to join client thread (rc: %d)\n", rc);
-			err_cnt++;
-		}
-
 		rc = pthread_join(client_tid, (void **)&th_rc);
 		if (rc) {
 			fprintf(stderr, "pthread_join() on client thread failed (rc: %d)\n", rc);
@@ -476,7 +455,6 @@ out:
 	}
 
 	sem_destroy(&g_rpc_server_th_listening);
-	sem_destroy(&g_rpc_client_th_done);
 
 	fprintf(stderr, "%s\n", err_cnt == 0 ? "OK" : "FAILED");
 	return err_cnt ? EXIT_FAILURE : 0;
