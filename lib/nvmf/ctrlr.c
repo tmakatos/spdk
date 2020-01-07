@@ -373,7 +373,6 @@ _spdk_nvmf_ctrlr_destruct(void *ctx)
 		TAILQ_REMOVE(&ctrlr->log_head, log, link);
 		free(log);
 	}
-	memset(ctrlr, 0, sizeof *ctrlr);
 	free(ctrlr);
 }
 
