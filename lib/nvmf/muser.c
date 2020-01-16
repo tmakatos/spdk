@@ -98,7 +98,7 @@ enum muser_nvmf_dir {
 struct muser_req;
 struct muser_qpair;
 
-typedef void (*muser_req_end_fn)(struct muser_qpair*, struct muser_req*);
+typedef int (*muser_req_end_fn)(struct muser_qpair*, struct muser_req*);
 
 struct muser_req  {
 	struct spdk_nvmf_request		req;
@@ -189,6 +189,17 @@ hdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
 static uint32_t*
 tdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
 
+static int
+muser_req_free(struct spdk_nvmf_request *req);
+
+static struct muser_req*
+get_muser_req(struct muser_qpair *qpair);
+
+static int
+post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
+                struct io_q *cq, uint32_t cdw0, uint16_t sc,
+                uint16_t sct);
+
 /*
  * XXX We need a way to extract the queue ID from an io_q, which is already
  * available in muser_qpair->qpair.qid. Currently we store the type of the
@@ -242,6 +253,7 @@ struct muser_ctrlr {
 	bool					start; /* start subsys */
 	bool					del_admin_qp; /* del admin qp */
 	sem_t					sem;
+	int					err; /* error code set by handle_admin_q_connect_rsp */
 	struct spdk_nvmf_subsystem		*subsys;
 	struct muser_nvmf_prop_req		prop_req; /* read/write BAR0 */
 
@@ -263,7 +275,20 @@ struct muser_ctrlr {
 
 	/* even indices are SQ, odd indices are CQ */
 	uint32_t				*doorbells;
+
+	/* internal CSTS.CFS register for MUSER fatal errors */
+	uint32_t				cfs : 1;
 };
+
+static void
+fail_ctrlr(struct muser_ctrlr *ctrlr)
+{
+	assert(ctrlr != NULL);
+
+	SPDK_ERRLOG("failing controller\n");
+
+	ctrlr->cfs = 1U;
+}
 
 struct muser_transport {
 	struct spdk_nvmf_transport		transport;
@@ -383,7 +408,9 @@ muser_request_spdk_nvmf_subsystem_resume(struct muser_ctrlr *ctrlr)
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "requesting NVMf subsystem resume\n");
 
 	err= sem_init(&ctrlr->sem, 0, 0);
-	assert(err == 0); /* FIXME */
+	if (err != 0) {
+		return err;
+	}
 	ctrlr->start = true;
 	spdk_wmb();
 	do {
@@ -402,7 +429,7 @@ muser_request_spdk_nvmf_subsystem_resume(struct muser_ctrlr *ctrlr)
 	 * and in handle_admin_q_connect_rsp we can fire the sem semaphore.
 	 */
 
-	return 0;
+	return ctrlr->err ? -1 : 0;
 }
 
 static int
@@ -417,6 +444,7 @@ do_prop_req(struct muser_ctrlr *ctrlr, char *buf, size_t count, loff_t pos,
 	if (err != 0) {
 		return err;
 	}
+	ctrlr->prop_req.ret = 0;
 	ctrlr->prop_req.buf = buf;
 	/* TODO: count must never be more than 8, otherwise we need to split it */
 	ctrlr->prop_req.count = count;
@@ -424,8 +452,10 @@ do_prop_req(struct muser_ctrlr *ctrlr, char *buf, size_t count, loff_t pos,
 	spdk_wmb();
 	ctrlr->prop_req.dir = is_write ? MUSER_NVMF_WRITE : MUSER_NVMF_READ;
 	err = sem_wait(&ctrlr->prop_req.wait);
-	assert(err == 0); /* FIXME */
-	return err;
+	if (err != 0) {
+		return err;
+	}
+	return ctrlr->prop_req.ret;
 }
 
 /*
@@ -442,6 +472,19 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	SPDK_NOTICELOG("\nctrlr: %p, count=%zu, pos=%"PRIX64"\n",
 		       ctrlr, count, pos);
 
+	if (pos == offsetof(struct spdk_nvme_registers, csts) && ctrlr->cfs == 1U) {
+		/*
+		 * FIXME Do the rest of the registers in CSTS need to be
+		 * correctly set?
+		 */
+		union spdk_nvme_csts_register csts = {.bits.cfs = 1U};
+		if (count != sizeof(csts)) {
+			return -EINVAL;
+		}
+		memcpy(buf, &csts, count);
+		return 0;
+	}
+
 	/*
 	 * TODO Do we have to check from this thread whether it's active?  Can
 	 * we blindly forward the read and resume the subsystem if required in
@@ -449,7 +492,9 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	 */
 	if (!muser_spdk_nvmf_subsystem_is_active(ctrlr)) {
 		err = muser_request_spdk_nvmf_subsystem_resume(ctrlr);
-		assert(err == 0); /* FIXME */
+		if (err != 0) {
+			return err;
+		}
 	}
 
 	/*
@@ -476,7 +521,9 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	 * NVMf to respond with the data.
 	 */
 	err = do_prop_req(ctrlr, buf, count, pos, false);
-	assert(err == 0); /* FIXME */
+	if (err != 0) {
+		return err;
+	}
 
 	if (_buf != NULL) {
 		memcpy(_buf,
@@ -484,7 +531,7 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		       _count);
 	}
 
-	return ctrlr->prop_req.ret;
+	return err;
 }
 
 static uint16_t
@@ -644,12 +691,14 @@ map_one(void *prv, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 	ret = lm_addr_to_sg(ctx, addr, len, sg, 1);
 	if (ret != 1) {
 		SPDK_ERRLOG("failed to map 0x%lx-0x%lx\n", addr, addr + len);
+		errno = ret;
 		return NULL;
 	}
 
 	ret = lm_map_sg(ctx, sg, iov, 1);
 	if (ret != 0) {
 		SPDK_ERRLOG("failed to map segment: %d\n", ret);
+		errno = ret;
 		return NULL;
 	}
 
@@ -842,7 +891,9 @@ dptr_remap(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd, size_t size)
 	assert(ctrlr);
 	assert(cmd);
 
-	assert(!cmd->dptr.prp.prp2); /* FIXME */
+	if (cmd->dptr.prp.prp2 != 0) {
+		return -1;
+	}
 
 	if (muser_map_prps(ctrlr, cmd, &iov, size) != 1) {
 		return -1;
@@ -878,28 +929,34 @@ static int
 handle_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 {
 	int err;
-	struct spdk_nvmf_request *req;
 
 	assert(ctrlr != NULL);
 	assert(cmd != NULL);
 
+	/*
+	 * According to the spec: SGLs shall not be used for Admin commands in
+	 * NVMe over PCIe implementations.
+	 * FIXME explicitly fail request with correct status code and status
+	 * code type.
+	 */
 	assert(is_prp(cmd));
 
-	/*
-	 * FIXME why do we specify size sizeof(struct spdk_nvme_cmd)? Check the
-	 * spec.
-	 */
-	err = dptr_remap(ctrlr, cmd, sizeof(struct spdk_nvme_cmd));
-	if (err) {
-		SPDK_ERRLOG("failed to remap DPTR: %d\n", err);
-		return -1;
+	if (cmd->opc != SPDK_NVME_OPC_ASYNC_EVENT_REQUEST) {
+		/*
+		 * TODO why do we specify size sizeof(struct spdk_nvme_cmd)?
+		 * Check the spec.
+		 */
+		err = dptr_remap(ctrlr, cmd, sizeof(struct spdk_nvme_cmd));
+		if (err != 0) {
+			SPDK_ERRLOG("failed to remap DPTR: %d\n", err);
+			return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0,
+			                      SPDK_NVME_SC_INTERNAL_DEVICE_ERROR,
+			                      SPDK_NVME_SCT_GENERIC);
+		}
 	}
 
-	req = get_nvmf_req(ctrlr->qp[0]);
-	assert(req != NULL); /* FIXME */
-
-	/* FIXME have handle_cmd_req to call get_nvmf_req internally */
-	return handle_cmd_req(ctrlr, cmd, req);
+	/* TODO have handle_cmd_req to call get_nvmf_req internally */
+	return handle_cmd_req(ctrlr, cmd, get_nvmf_req(ctrlr->qp[0]));
 }
 
 static void
@@ -932,12 +989,29 @@ handle_identify_rsp(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 }
 
 /*
- * Completes a admin request.
+ * Posts a CQE in the completion queue.
+ *
+ * @ctrlr: the MUSER controller
+ * @cmd: the NVMe command for which the completion is posted
+ * @cq: the completion queue
+ * @cdw0: cdw0 as reported by NVMf (only for SPDK_NVME_OPC_SET_FEATURES and
+ *        SPDK_NVME_OPC_ABORT)
+ * @sc: the NVMe CQE status code
+ * @sct: the NVMe CQE status code type
+ *
+ * TODO Does it make sense for this function to fail? Currently it can do so
+ * in two ways:
+ *   1. lack of CQE: can we make sure there's always space in the CQ by e.g.
+ *      making sure it's the same size as the SQ (assuming it's allowed by the
+ *      NVMe spec)?
+ *   2. triggering IRQ: probably not much we can do here, maybe set the
+ *      controller in error state or send an error in the async event request
+ *      (or both)?
  */
 static int
 post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
-                        struct io_q *cq, struct spdk_nvmf_request *req,
-                        uint16_t sc)
+                struct io_q *cq, uint32_t cdw0, uint16_t sc,
+                uint16_t sct)
 {
 	struct spdk_nvme_cpl *cpl;
 	uint16_t qid;
@@ -964,9 +1038,9 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 		case SPDK_NVME_OPC_IDENTIFY:
 			handle_identify_rsp(ctrlr, cmd);
 			break;
+		case SPDK_NVME_OPC_ABORT: 
 		case SPDK_NVME_OPC_SET_FEATURES:
-			assert(req != NULL);
-			cpl->cdw0 = req->rsp->nvme_cpl.cdw0;
+			cpl->cdw0 = cdw0;
 			break;
 		}
 	}
@@ -977,7 +1051,7 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	cpl->cid = cmd->cid;
 	cpl->status.dnr = 0x0;
 	cpl->status.m = 0x0;
-	cpl->status.sct = 0x0;
+	cpl->status.sct = sct;
 	cpl->status.p = ~cpl->status.p;
 	cpl->status.sc = sc;
 
@@ -1042,17 +1116,19 @@ static void
 muser_nvmf_subsystem_paused(struct spdk_nvmf_subsystem *subsys,
                              void *cb_arg, int status)
 {
-	sem_t *sem = (sem_t*)cb_arg;
+	struct muser_ctrlr *ctrlr = (struct muser_ctrlr*)cb_arg;
 	int err;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "NVMf subsystem=%p paused=%d\n",
 	              subsys, status);
 
-	assert(status == 0); /* FIXME */
-	assert(sem != NULL);
+	assert(ctrlr != NULL);
+	ctrlr->prop_req.ret = status;
 
-	err = sem_post(sem);
-	assert(err == 0); /* FIXME */
+	err = sem_post(&ctrlr->prop_req.wait);
+	if (err != 0) {
+		fail_ctrlr(ctrlr);
+	}
 }
 
 static void
@@ -1154,7 +1230,7 @@ init_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 	}
 	ctrlr->qp[id] = qpair;
 out:
-	if (err) {
+	if (err != 0) {
 		tear_down_qpair(qpair);
 	}
 	return err;
@@ -1175,7 +1251,7 @@ add_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "request add QP%d\n", qid);
 
 	err = init_qp(ctrlr, transport, qsize, qid);
-	if (err) {
+	if (err != 0) {
 		return err;
 	}
 	ctrlr->qp[qid]->cmd = cmd;
@@ -1206,6 +1282,8 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		   struct spdk_nvme_cmd *cmd, const bool is_cq)
 {
 	size_t entry_size;
+	uint16_t sc = SPDK_NVME_SC_SUCCESS;
+	uint16_t sct = SPDK_NVME_SCT_GENERIC;
 	int err = 0;
 
 	/*
@@ -1225,26 +1303,33 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		SPDK_ERRLOG("invalid QID=%d, max=%d\n",
 		            cmd->cdw10_bits.create_io_q.qid,
 			    MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR);
-		return -EINVAL;
+		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
+		goto out;
 	}
 
 	if (lookup_io_q(ctrlr, cmd->cdw10_bits.create_io_q.qid, is_cq)) {
 		SPDK_ERRLOG("%cQ%d already exists\n", is_cq ? 'C' : 'S',
 			    cmd->cdw10_bits.create_io_q.qid);
-
-		/*
-		 * FIXME once this functions fails we seem to endlessly call it,
-		 * check that we queue the relevant completion.
-		 */
-		assert(false);
-
-		return -EEXIST;
+		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
+		goto out;
 	}
 
 	/* TODO break rest of this function into smaller functions */
 	if (is_cq) {
 		entry_size = sizeof(struct spdk_nvme_cpl);
-		assert(cmd->cdw11_bits.create_io_cq.pc == 0x1); /* FIXME */
+		if (cmd->cdw11_bits.create_io_cq.pc != 0x1) {
+			/*
+			 * TODO CAP.CMBS is currently set to zero, however we
+			 * should zero it out explicitly when CAP is read.
+			 * Support for CAP.CMBS is not mentioned in the NVMf
+			 * spec.
+			 */
+			SPDK_ERRLOG("non-PC CQ not supporred\n");
+			sc = SPDK_NVME_SC_INVALID_CONTROLLER_MEM_BUF;
+			goto out;
+		}
 		io_q.ien = cmd->cdw11_bits.create_io_cq.ien;
 		io_q.iv = cmd->cdw11_bits.create_io_cq.iv;
 	} else {
@@ -1252,10 +1337,16 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		if (!lookup_io_q(ctrlr, cmd->cdw11_bits.create_io_sq.cqid, true)) {
 			SPDK_ERRLOG("CQ%d does not exist\n",
 			            cmd->cdw11_bits.create_io_sq.cqid);
-			return -ENOENT;
+			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			sc = SPDK_NVME_SC_COMPLETION_QUEUE_INVALID;
+			goto out;
 		}
 		entry_size = sizeof(struct spdk_nvme_cmd);
-		assert(cmd->cdw11_bits.create_io_sq.pc == 0x1); /* FIXME */
+		if (cmd->cdw11_bits.create_io_sq.pc != 0x1) {
+			SPDK_ERRLOG("non-PC SQ not supported\n");
+			sc = SPDK_NVME_SC_INVALID_CONTROLLER_MEM_BUF;
+			goto out;
+		}
 
 		io_q.cqid = cmd->cdw11_bits.create_io_sq.cqid;
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "CQID=%d\n", io_q.cqid);
@@ -1265,28 +1356,35 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	if (io_q.size > max_queue_size(ctrlr)) {
 		SPDK_ERRLOG("queue too big, want=%d, max=%d\n", io_q.size,
 			    max_queue_size(ctrlr));
-		return -E2BIG;
+		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		sc = SPDK_NVME_SC_MAXIMUM_QUEUE_SIZE_EXCEEDED;
+		goto out;
 	}
 	io_q.addr = map_one(ctrlr->lm_ctx, cmd->dptr.prp.prp1,
 			    io_q.size * entry_size, &io_q.sg, &io_q.iov);
-	if (!io_q.addr) {
-		SPDK_ERRLOG("failed to map I/O queue\n");
-		return -1;
+	if (io_q.addr == NULL) {
+		sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		SPDK_ERRLOG("failed to map I/O queue: %m\n");
+		goto out;
 	}
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
 		             cmd->cdw10_bits.create_io_q.qid, cmd);
-		assert(err == 0); /* FIXME */
+		if (err != 0) {
+			sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			goto out;
+		}
 	}
 
 	/* FIXME shouldn't we do this at completion? */
 	insert_queue(ctrlr, &io_q, is_cq, cmd->cdw10_bits.create_io_q.qid);
 
-	/* For CQ the completion is posted at by handle_connect_rsp. */
-	if (!is_cq) {
-		/* FIXME last arg sc might be a define already? */
-		err = post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, NULL, 0);
+out:
+	/* For CQ the completion is posted by handle_connect_rsp. */
+	if (!is_cq || sc != 0) {
+		/* TODO is sct correct here? */
+		err = post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0, sc, sct);
 	}
 
 	return err;
@@ -1299,27 +1397,25 @@ static int
 handle_del_io_q(struct muser_ctrlr *ctrlr,
 		struct spdk_nvme_cmd *cmd, const bool is_cq)
 {
-	struct io_q *q;
-	uint16_t sc = 0;
+	uint16_t sct = SPDK_NVME_SCT_GENERIC;
+	uint16_t sc = SPDK_NVME_SC_SUCCESS;
 
 	SPDK_NOTICELOG("delete I/O %cQ: QID=%d\n",
 		       is_cq ? 'C' : 'S', cmd->cdw10_bits.delete_io_q.qid);
 
-	q = lookup_io_q(ctrlr, cmd->cdw10_bits.delete_io_q.qid, is_cq);
-	if (q == NULL) {
+	if (lookup_io_q(ctrlr, cmd->cdw10_bits.delete_io_q.qid, is_cq) == NULL) {
 		SPDK_ERRLOG("%cQ%d does not exist\n", is_cq ? 'C' : 'S',
 			    cmd->cdw10_bits.delete_io_q.qid);
+		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
 		goto out;
 	}
 
 	if (is_cq) {
 		/* SQ must have been deleted first */
-		struct io_q *sq = lookup_io_q(ctrlr,
-		                              cmd->cdw10_bits.delete_io_q.qid,
-		                              false);
-		if (sq) {
-			/* FIXME add error message */
+		if (!ctrlr->qp[cmd->cdw10_bits.delete_io_q.qid]->del) {
+			/* TODO add error message */
+			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 			sc = SPDK_NVME_SC_INVALID_QUEUE_DELETION;
 			goto out;
 		}
@@ -1336,7 +1432,18 @@ handle_del_io_q(struct muser_ctrlr *ctrlr,
 	}
 
 out:
-	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, NULL, sc);
+	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0, sc, sct);
+}
+
+/* TODO need to honor the Abort Command Limit field */
+static int
+handle_abort_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
+{
+	assert(ctrlr != NULL);
+
+	/* abort command not yet implemented */
+	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 1,
+	                       SPDK_NVME_SC_SUCCESS, SPDK_NVME_SCT_GENERIC);
 }
 
 /*
@@ -1353,10 +1460,16 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	SPDK_NOTICELOG("handle admin req opc=%#x cid=%d\n", cmd->opc, cmd->cid);
 
 	switch (cmd->opc) {
-	case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST: /* FIXME implement */
-		SPDK_NOTICELOG("FIXME ignore async event request\n");
-		return 0;
 	/* TODO put all cases in order */
+	/* FIXME we pass the async event request to NVMf so if we ever need to
+	 * send an event to the host we won't be able to. We'll have to somehow
+	 * grab this request from NVMf. If we don't forward the request to NVMf
+	 * then NVMf won't be able to issue an async event response if it needs
+	 * to. One way to solve this problem is to keep the request and then
+	 * generate another one for NVMf. If NVMf ever completes it then we copy
+	 * it to the one we kept and complete it.
+	 */
+	case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
 	case SPDK_NVME_OPC_IDENTIFY:
 	case SPDK_NVME_OPC_SET_FEATURES:
 	case SPDK_NVME_OPC_GET_LOG_PAGE:
@@ -1366,46 +1479,39 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	case SPDK_NVME_OPC_CREATE_IO_SQ:
 		return handle_create_io_q(ctrlr, cmd,
 		                          cmd->opc == SPDK_NVME_OPC_CREATE_IO_CQ);
-	/* FIXME need to queue completion response */
 	case SPDK_NVME_OPC_ABORT:
-		SPDK_NOTICELOG("FIXME ignore abort request\n");
-		return 0;
+		return handle_abort_cmd(ctrlr, cmd);
 	case SPDK_NVME_OPC_DELETE_IO_SQ:
 	case SPDK_NVME_OPC_DELETE_IO_CQ:
-		return handle_del_io_q(ctrlr, cmd, cmd->opc == SPDK_NVME_OPC_DELETE_IO_CQ);
-	default:
-		SPDK_ERRLOG("unsupported command 0x%x\n", cmd->opc);
-		return -1;
+		return handle_del_io_q(ctrlr, cmd,
+		                       cmd->opc == SPDK_NVME_OPC_DELETE_IO_CQ);
 	}
-	return -1;
+	SPDK_ERRLOG("invalid command 0x%x\n", cmd->opc);
+	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0,
+	                       SPDK_NVME_SC_INVALID_OPCODE,
+	                       SPDK_NVME_SCT_GENERIC);
 }
 
-static void
+static int
 handle_cmd_rsp(struct muser_qpair *qpair, struct muser_req *req)
 {
-	int err;
-
 	assert(qpair != NULL);
 	assert(req != NULL);
 
-	err = post_completion(qpair->ctrlr, &req->req.cmd->nvme_cmd,
-	                       &qpair->ctrlr->qp[req->req.qpair->qid]->cq,
-	                       &req->req, 0);
-	assert(err == 0); /* FIXME */
+	return post_completion(qpair->ctrlr, &req->req.cmd->nvme_cmd,
+	                      &qpair->ctrlr->qp[req->req.qpair->qid]->cq,
+	                      req->req.rsp->nvme_cpl.cdw0, SPDK_NVME_SC_SUCCESS,
+	                      SPDK_NVME_SCT_GENERIC);
 }
 
 static int
 consume_io_req(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
                struct spdk_nvme_cmd *cmd)
 {
-	struct spdk_nvmf_request *req;
-
 	assert(cmd != NULL);
 	assert(qpair != NULL);
 
-	req = get_nvmf_req(qpair);
-	assert(req != NULL); /* FIXME */
-	return handle_cmd_req(ctrlr, cmd, req);
+	return handle_cmd_req(ctrlr, cmd, get_nvmf_req(qpair));
 }
 
 /*
@@ -1424,7 +1530,22 @@ consume_req(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
 	return consume_io_req(ctrlr, qpair, cmd);
 }
 
-/* XXX SPDK thread */
+/*
+ * XXX SPDK thread context
+ *
+ * TODO Lots of functions called by consume_req can post completions or fail
+ * the controller. We can do better by doing it here, in one place. We need to
+ * be able to differentiate between (a) fatal errors (where we must call
+ * fail_ctrlr and stop precessing requests) and (b) cases where we must post a
+ * completion (either because there is an error specific to that request or
+ * because that request does not need forwarding to NVMf). So we need to
+ * unambiguously encode the following information in the return value:
+ * (1) -errno (32 bits),
+ * (2) success (1 bit -- don't post a completion and continue processing
+ *     requests), and
+ * (3) post a completion with specified status code and status code type
+ *     (8+3 bits) type and continue processing requsts.
+ */
 static int
 consume_reqs(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
 	     struct muser_qpair *qpair)
@@ -1504,7 +1625,15 @@ handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
 	/* convert byte offset to array index */
 	pos >>= 2;
 
-	/* FIXME need to make sure index is within bounds */
+	if (pos > MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * 2) {
+		/*
+		 * FIXME need to emit a "Write to Invalid Doorbell Register"
+		 * asynchronous event
+		 */
+		SPDK_ERRLOG("bad doorbell index %#lx\n", pos);
+		return -EINVAL;
+	}
+
 	if (is_write) {
 		ctrlr->doorbells[pos] = *buf;
 		spdk_wmb();
@@ -1564,7 +1693,9 @@ handle_cc_write(struct muser_ctrlr *ctrlr, uint8_t *buf,
 		cc->bits.en = 1;
 		cc->bits.shn = SPDK_NVME_SHN_NORMAL;
 		err = do_prop_req(ctrlr, buf, count, pos, true);
-		assert(err == 0); /* FIXME */
+		if (err != 0) {
+			return err;
+		}
 		SPDK_NOTICELOG("controller shut down\n");
 		/* FIXME we shouldn't expect it to shutdown immediately */
 		if (ctrlr->qp[0]->qpair.ctrlr->vcprop.csts.bits.shst != SPDK_NVME_SHST_COMPLETE) {
@@ -1587,14 +1718,18 @@ handle_cc_write(struct muser_ctrlr *ctrlr, uint8_t *buf,
 		 * and then set CC.EN to 1.
 		 */
 		err = muser_request_spdk_nvmf_subsystem_resume(ctrlr);
-		assert(err == 0); /* FIXME */
+		if (err != 0) {
+			return err;
+		}
 	} else if (cc->bits.en == 0 &&
 		   ctrlr->qp[0]->qpair.ctrlr->vcprop.cc.bits.en == 0) {
 			return 0;
 	}
 
 	err = do_prop_req(ctrlr, buf, count, pos, true);
-	assert(err == 0); /* FIXME */
+	if (err != 0) {
+		return err;
+	}
 
 	if (cc->bits.en == 0 && ctrlr->qp[0] != NULL) {
 		/* need to delete admin queues, however destroy_qp must be
@@ -1603,10 +1738,12 @@ handle_cc_write(struct muser_ctrlr *ctrlr, uint8_t *buf,
 		 * deleting the admin queue?
 		 */
 		err = sem_init(&ctrlr->sem, 0, 0);
-		assert(err == 0); /* FIXME */
+		if (err != 0) {
+			return err;
+		}
 		ctrlr->del_admin_qp = true;
-		err = sem_wait(&ctrlr->sem);
-		assert(err == 0); /* FIXME */
+		/* deleting the admin QP doesn't fail */
+		return sem_wait(&ctrlr->sem);
 	}
 
 	return 0;
@@ -1873,7 +2010,6 @@ handle_pxcap_write(struct muser_ctrlr *ctrlr, char * const buf, size_t count,
 			break;
 	}
 	if (err != 0) {
-		assert(false); /* FIXME */
 		return err;
 	}
 	return count;
@@ -1916,7 +2052,6 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 	if (ctrlr->doorbells == NULL) {
 		SPDK_ERRLOG("failed to allocate device memory: %m\n");
 	}
-	assert(ctrlr->doorbells != NULL); /* FIXME */
 out:
 	return (unsigned long)ctrlr->doorbells;
 }
@@ -2085,13 +2220,19 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	muser_ctrlr->prop_req.muser_req.req.cmd = &muser_ctrlr->prop_req.cmd;
 
 	err = sem_init(&muser_ctrlr->sem, 0, 0);
-	assert(err == 0); /* FIXME */
+	if (err != 0) {
+		goto err_free_dev;
+	}
 
 	err = muser_snprintf_subnqn(muser_ctrlr, subnqn);
-	assert(err == 0); /* FIXME */
+	if (err != 0) {
+		goto err_free_dev;
+	}
 	muser_ctrlr->subsys = spdk_nvmf_tgt_find_subsystem(transport->tgt,
 	                                                   subnqn);
-	assert(muser_ctrlr->subsys != NULL); /* FIXME */
+	if (muser_ctrlr->subsys == NULL) {
+		goto err_free_dev;
+	}
 
 	/*
 	 * Admin QP setup: in order to read NVMe registers from SPDK we must
@@ -2268,7 +2409,7 @@ muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 	free(muser_group);
 }
 
-static void
+static int
 handle_connect_rsp(struct muser_qpair *qpair, struct muser_req *req);
 
 /*
@@ -2293,9 +2434,10 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "add QP%d=%p(%p) to poll_group=%p\n",
 	              muser_qpair->qpair.qid, muser_qpair, qpair, muser_group);
 
-	/* FIXME get_nvmf_req? */
-	muser_req = TAILQ_FIRST(&muser_qpair->reqs);
-	TAILQ_REMOVE(&muser_qpair->reqs, muser_req, link);
+	muser_req = get_muser_req(muser_qpair);
+	if (muser_req == NULL) {
+		return -1;
+	}
 
 	req = &muser_req->req;
 	req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
@@ -2307,15 +2449,19 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 
 	req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
 	req->data = calloc(1, req->length);
-	assert(req->data != NULL); /* FIXME */
+	if (req->data == NULL) {
+		err = -1;
+		goto out;
+	}
 
 	data = (struct spdk_nvmf_fabric_connect_data *)req->data;
 	/* data->hostid = { 0 } */
 
 	data->cntlid = !spdk_nvmf_qpair_is_admin_queue(&muser_qpair->qpair) ? muser_ctrlr->cntlid : 0xffff;
 	err = muser_snprintf_subnqn(muser_ctrlr, data->subnqn);
-	assert(err == 0); /* FIXME */
-	/* data->hostnqn = { 0 } */
+	if (err != 0) {
+		goto out;
+	}
 
 	/*
 	 * TODO If spdk_nvmf_request_exec is guaranteed to synchronously add
@@ -2327,8 +2473,12 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 		       qpair->qid, data->cntlid);
 
 	spdk_nvmf_request_exec(req);
-
-	return 0;
+out:
+	if (err != 0) {
+		free(req->data);
+		muser_req_free(req);
+	}
+	return err;
 }
 
 static int
@@ -2346,21 +2496,23 @@ muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	return 0;
 }
 
-static void
+static int
 handle_admin_q_connect_rsp(struct spdk_nvmf_request *req,
                            struct muser_qpair *muser_qpair)
 {
-	int err;
-
 	assert(req != NULL);
 	assert(muser_qpair != NULL);
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "fabric connect command completed\n");
-	if (req->rsp->connect_rsp.status_code_specific.success.cntlid != 0) {
+	muser_qpair->ctrlr->err = spdk_nvme_cpl_is_error(&req->rsp->nvme_cpl);
+	if (!muser_qpair->ctrlr->err && req->rsp->connect_rsp.status_code_specific.success.cntlid != 0) {
 		muser_qpair->ctrlr->cntlid = req->rsp->connect_rsp.status_code_specific.success.cntlid;
 	}
-	err = sem_post(&muser_qpair->ctrlr->sem);
-	assert(err == 0); /* FIXME */
+	/*
+	 * Unblocks muser_request_spdk_nvmf_subsystem_resume, add_qp called
+	 * by muser_listen does not wait for this semaphore.
+	 */
+	return sem_post(&muser_qpair->ctrlr->sem);
 }
 
 /*
@@ -2368,7 +2520,7 @@ handle_admin_q_connect_rsp(struct spdk_nvmf_request *req,
  * submit path. add_qp is the only entry point that results in this callback
  * executed.
  */
-static void
+static int
 handle_connect_rsp(struct muser_qpair *qpair, struct muser_req *req)
 {
 	int err = 0;
@@ -2376,24 +2528,34 @@ handle_connect_rsp(struct muser_qpair *qpair, struct muser_req *req)
 	assert(qpair != NULL);
 	assert(req != NULL);
 
-	/* FIXME */
-	assert(!spdk_nvme_cpl_is_error(&req->req.rsp->nvme_cpl));
+	/*
+	 * We can't use spdk_nvmf_qpair_is_admin_queue (instead of checking
+	 * req->req.cmd->connect_cmd.qid) because qpair is always the admin
+	 * qpair.
+	 */
 
 	if (req->req.cmd->connect_cmd.qid == 0) {
-		handle_admin_q_connect_rsp(&req->req, qpair);
+		err = handle_admin_q_connect_rsp(&req->req, qpair);
+		if (err != 0) {
+			goto out;
+		}
 	}
 
 	TAILQ_INSERT_TAIL(&qpair->ctrlr->muser_group->qps, qpair, link);
 
 	if (req->req.cmd->connect_cmd.qid != 0) {
-		/* FIXME last arg must be error status from NVMf */
 		err = post_completion(qpair->ctrlr, &req->req.cmd->nvme_cmd,
-	        	                   &qpair->ctrlr->qp[0]->cq, NULL, 0);
+	        	              &qpair->ctrlr->qp[0]->cq, 0,
+		                      req->req.rsp->nvme_cpl.status.sc,
+		                      req->req.rsp->nvme_cpl.status.sct);
+		if (err != 0) {
+			goto out;
+		}
 	}
-
-	assert(err == 0); /* FIXME */
+out:
 	free(req->req.data);
 	req->req.data = NULL;
+	return err;
 }
 
 static int
@@ -2417,6 +2579,17 @@ map_admin_queues(struct muser_ctrlr *ctrlr)
 }
 
 static bool
+spdk_nvmf_subsystem_should_stop(union spdk_nvme_cc_register *cc,
+                                 struct spdk_nvmf_ctrlr	*ctrlr)
+{
+	assert(cc != NULL);
+	assert(ctrlr != NULL);
+
+	return cc->bits.en == 0 && cc->bits.shn == 0 &&
+	       ctrlr->vcprop.csts.bits.shst == SPDK_NVME_SHST_NORMAL;
+}
+
+static bool
 handle_cc_write_end(struct muser_ctrlr *ctrlr)
 {
 	union spdk_nvme_cc_register *cc;
@@ -2429,18 +2602,20 @@ handle_cc_write_end(struct muser_ctrlr *ctrlr)
 	cc = (union spdk_nvme_cc_register*)ctrlr->prop_req.buf;
 
 	/* spdk_nvmf_subsystem_stop must be executed from SPDK thread context */
-	if (cc->bits.en == 0 && cc->bits.shn == 0 &&
-	    ctrlr->qp[0]->qpair.ctrlr->vcprop.csts.bits.shst == SPDK_NVME_SHST_NORMAL) {
+	if (spdk_nvmf_subsystem_should_stop(cc, ctrlr->qp[0]->qpair.ctrlr)) {
+		/* TODO s/pausing/stopping */
 		SPDK_NOTICELOG("pausing NVMf subsystem\n");
 		ctrlr->prop_req.dir = MUSER_NVMF_INVALID;
 		err = spdk_nvmf_subsystem_stop(ctrlr->subsys,
 	                        muser_nvmf_subsystem_paused,
-	                        &ctrlr->prop_req.wait);
-		assert(err == 0); /* FIXME */
+	                        ctrlr);
+		if (err != 0) {
+			ctrlr->prop_req.ret = err;
+			return true;
+		}
 		return false;
 	} else if (cc->bits.en == 1 && cc->bits.shn == 0) {
-		err = map_admin_queues(ctrlr);
-		assert(err == 0); /* FIXME */
+		ctrlr->prop_req.ret = map_admin_queues(ctrlr);
 	}
 	return true;
 }
@@ -2470,10 +2645,10 @@ handle_prop_get_rsp(struct muser_ctrlr *ctrlr, struct muser_req *req)
 	       ctrlr->prop_req.count);
 }
 
-static void
+static int
 handle_prop_rsp(struct muser_qpair *qpair, struct muser_req *req)
 {
-	int err;
+	int err = 0;
 	bool fire = true;
 
 	assert(qpair != NULL);
@@ -2498,10 +2673,9 @@ handle_prop_rsp(struct muser_qpair *qpair, struct muser_req *req)
 		 * spdk_nvmf_request_exec is synchronous.
 		 */
 		qpair->ctrlr->prop_req.dir = MUSER_NVMF_INVALID;
-
 		err = sem_post(&qpair->ctrlr->prop_req.wait);
-		assert(err == 0); /* FIXME */
 	}
+	return err;
 }
 
 static void
@@ -2516,7 +2690,9 @@ muser_req_done(struct spdk_nvmf_request *req)
 	qpair = SPDK_CONTAINEROF(muser_req->req.qpair, struct muser_qpair, qpair);
 
 	if (muser_req->end_fn != NULL) {
-		muser_req->end_fn(qpair, muser_req);
+		if (muser_req->end_fn(qpair, muser_req) != 0) {
+			fail_ctrlr(qpair->ctrlr);
+		}
 	}
 
 	TAILQ_INSERT_TAIL(&qpair->reqs, muser_req, link);
@@ -2561,16 +2737,37 @@ muser_close_qpair(struct spdk_nvmf_qpair *qpair)
 	destroy_qp(muser_qpair->ctrlr, qpair->qid);
 }
 
-static struct spdk_nvmf_request*
-get_nvmf_req(struct muser_qpair *qpair)
+/**
+ * Returns a preallocated spdk_nvmf_request or NULL if there isn't one available.
+ *
+ * TODO Since there are as many preallocated requests as slots in the queue, we
+ * could avoid checking for empty list (assuming that this function is called
+ * responsively), however we use spdk_nvmf_request for passing property requests
+ * and we're not sure how many more. It's probably just one.
+ */
+static struct muser_req*
+get_muser_req(struct muser_qpair *qpair)
 {
 	struct muser_req *req;
 
 	assert(qpair != NULL);
-	assert(!TAILQ_EMPTY(&qpair->reqs));
+
+	if (TAILQ_EMPTY(&qpair->reqs)) {
+		return NULL;
+	}
 
 	req = TAILQ_FIRST(&qpair->reqs);
 	TAILQ_REMOVE(&qpair->reqs, req, link);
+	return req;
+}
+
+static struct spdk_nvmf_request*
+get_nvmf_req(struct muser_qpair *qpair)
+{
+	struct muser_req *req = get_muser_req(qpair);
+	if (req == NULL) {
+		return NULL;
+	}
 	return &req->req;
 }
 
@@ -2580,14 +2777,23 @@ nlb(struct spdk_nvme_cmd *cmd)
 	return 0x0000ffff & cmd->cdw12;
 }
 
+/*
+ * Handles an I/O command.
+ *
+ * Returns 0 on success and -errno on failure. Sets @submit on whether or not
+ * the request must be forwarded to NVMf.
+ */
 static int
-handle_cmd_io_req(struct muser_ctrlr * ctrlr, struct spdk_nvmf_request *req)
+handle_cmd_io_req(struct muser_ctrlr * ctrlr, struct spdk_nvmf_request *req,
+		  bool *submit)
 {
-	int err;
+	int err = 0;
 	bool remap = true;
+	uint16_t sc;
 
 	assert(ctrlr != NULL);
 	assert(req != NULL);
+	assert(submit != NULL);
 
 	switch (req->cmd->nvme_cmd.opc) {
 		case SPDK_NVME_OPC_FLUSH:
@@ -2603,23 +2809,33 @@ handle_cmd_io_req(struct muser_ctrlr * ctrlr, struct spdk_nvmf_request *req)
 		default:
 			SPDK_ERRLOG("SQ%d invalid I/O request type 0x%x\n",
 			            req->qpair->qid, req->cmd->nvme_cmd.opc);
-			return -EINVAL;
+			err = -EINVAL;
+			sc = SPDK_NVME_SC_INVALID_OPCODE;
+			goto out;
 	}
 
 	req->data = NULL;
 	if (remap) {
 		assert(is_prp(&req->cmd->nvme_cmd));
 		req->length = (nlb(&req->cmd->nvme_cmd) + 1) << 9;
-		/* FIXME prp address is still GPA, do we need to fix it? */
 		err = muser_map_prps(ctrlr, &req->cmd->nvme_cmd, req->iov,
 		                     req->length);
 		if (err < 0) {
 			SPDK_ERRLOG("failed to map PRP: %d\n", err);
-			/* FIXME need to explicitly fail request */
-			return err;
+			sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+			goto out;
 		}
 		req->iovcnt = err;
+		err = 0;
 	}
+out:
+	if (err != 0) {
+		*submit = false;
+		return post_completion(ctrlr, &req->cmd->nvme_cmd,
+		                       &ctrlr->qp[req->qpair->qid]->cq, 0, sc,
+		                       SPDK_NVME_SCT_GENERIC);
+	}
+	*submit = true;
 	return 0;
 }
 
@@ -2633,7 +2849,16 @@ handle_cmd_req(struct muser_ctrlr * ctrlr, struct spdk_nvme_cmd * cmd,
 
 	assert(ctrlr != NULL);
 	assert(cmd != NULL);
-	assert(req != NULL);
+
+	/*
+	 * FIXME this means that there are not free requests available,
+	 * returning -1 will fail the controller. Theoretically this error can
+	 * be avoided completely by ensuring we have as many requests as slots
+	 * in the SQ, plus one for the the property request.
+	 */
+	if (req == NULL) {
+		return -1;
+	}
 
 	req->cmd->nvme_cmd = *cmd;
 	if (spdk_nvmf_qpair_is_admin_queue(req->qpair)) {
@@ -2641,8 +2866,11 @@ handle_cmd_req(struct muser_ctrlr * ctrlr, struct spdk_nvme_cmd * cmd,
 		req->length = 1 << 12;
 		req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << ctrlr->cc.bits.mps);
 	} else {
-		err = handle_cmd_io_req(ctrlr, req);
-		assert(err == 0); /* FIXME */
+		bool submit;
+		err = handle_cmd_io_req(ctrlr, req, &submit);
+		if (err != 0 || !submit) {
+			return err;
+		}
 	}
 
 	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
@@ -2662,18 +2890,30 @@ muser_nvmf_subsystem_resumed(struct spdk_nvmf_subsystem *subsys, void *cb_arg,
 	int err;
 	struct spdk_nvmf_transport *transport;
 
-	assert(status == 0); /* FIXME */
 	assert(ctrlr != NULL);
+
+	if (status != 0) {
+		ctrlr->err = status;
+		return;
+	}
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "NVMf subsystem resumed\n");
 
 	transport = spdk_nvmf_tgt_get_transport(subsys->tgt,
 	                                        SPDK_NVME_TRANSPORT_MUSER);
-
-	assert(transport != NULL); /* FIXME */
+	if (transport == NULL) {
+		ctrlr->err = -1;
+		return;
+	}
 
 	err = add_qp(ctrlr, transport, MUSER_DEFAULT_AQ_DEPTH, 0, NULL);
-	assert(err == 0); /* FIXME */
+	if (err != 0) {
+		ctrlr->err = err;
+		err = sem_post(&ctrlr->sem);
+		if (err != 0) {
+			fail_ctrlr(ctrlr);
+		}
+	}
 }
 
 static int
@@ -2697,7 +2937,9 @@ handle_prop_req(struct muser_ctrlr *ctrlr)
 	assert(ctrlr != NULL);
 
 	req = get_nvmf_req(ctrlr->qp[0]);
-	assert(req != NULL); /* FIXME */
+	if (req == NULL) {
+		return -1;
+	}
 	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
 
 	muser_req->end_fn = handle_prop_rsp;
@@ -2733,17 +2975,21 @@ poll_qpair(struct muser_poll_group *group, struct muser_qpair *qpair)
 
 	new_tail = *tdbl(ctrlr, &qpair->sq);
 	if (sq_head(qpair) != new_tail) {
-		handle_sq_tdbl_write(ctrlr, new_tail, qpair);
+		int err = handle_sq_tdbl_write(ctrlr, new_tail, qpair);
+		if (err != 0) {
+			fail_ctrlr(ctrlr);
+			return;
+		}
 	}
 }
 
-static void
+static int
 check_ctrlr(struct muser_ctrlr *ctrlr)
 {
 	int err = 0;
 
 	if (ctrlr == NULL) {
-		return;
+		return 0;
 	}
 
 	/*
@@ -2778,7 +3024,7 @@ check_ctrlr(struct muser_ctrlr *ctrlr)
 		err = handle_prop_req(ctrlr);
 	}
 
-	assert(err == 0); /* FIXME */
+	return err;
 }
 
 /*
@@ -2793,6 +3039,7 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct muser_poll_group *muser_group;
 	struct muser_qpair *muser_qpair, *tmp;
+	int err;
 
 	assert(group != NULL);
 
@@ -2800,7 +3047,11 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 
-	check_ctrlr(muser_group->ctrlr);
+	err = check_ctrlr(muser_group->ctrlr);
+	if (err != 0) {
+		fail_ctrlr(muser_group->ctrlr);
+		return err;
+	}
 
 	TAILQ_FOREACH_SAFE(muser_qpair, &muser_group->qps, link, tmp) {
 
