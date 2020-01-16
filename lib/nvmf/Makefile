@@ -38,11 +38,12 @@ SO_VER := 4
 SO_MINOR := 0
 
 C_SRCS = ctrlr.c ctrlr_discovery.c ctrlr_bdev.c \
-	 subsystem.c nvmf.c nvmf_rpc.c transport.c tcp.c
+	 subsystem.c nvmf.c nvmf_rpc.c transport.c tcp.c \
+	 muser.c
 
 C_SRCS-$(CONFIG_RDMA) += rdma.c
 LIBNAME = nvmf
-LOCAL_SYS_LIBS = -luuid
+LOCAL_SYS_LIBS = -luuid -lmuser
 
 ifeq ($(CONFIG_FC),y)
 C_SRCS += fc.c fc_ls.c
