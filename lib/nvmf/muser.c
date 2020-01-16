@@ -476,6 +476,11 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	SPDK_NOTICELOG("\nctrlr: %p, count=%zu, pos=%"PRIX64"\n",
 		       ctrlr, count, pos);
 
+	if (pos >= DOORBELLS) {
+		return handle_dbl_access(ctrlr, (uint32_t*)buf, count, 
+		                         pos, false);
+	}
+
 	if (pos == offsetof(struct spdk_nvme_registers, csts) && ctrlr->cfs == 1U) {
 		/*
 		 * FIXME Do the rest of the registers in CSTS need to be
@@ -513,11 +518,6 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 			count = 8;
 			buf = alloca(count);
 		}
-	}
-
-	if (pos >= DOORBELLS) {
-		return handle_dbl_access(ctrlr, (uint32_t*)buf, count, 
-		                         pos, false);
 	}
 
 	/*
