@@ -415,7 +415,11 @@ muser_request_spdk_nvmf_subsystem_resume(struct muser_ctrlr *ctrlr)
 	spdk_wmb();
 	do {
 		err = sem_wait(&ctrlr->sem);
-	} while (err != 0 && errno != EINTR);
+	} while (err != 0 && errno == EINTR);
+
+	if (err != 0) {
+		return err;
+	}
 
 	/*
 	 * If it was stopped then there won't be an admin QP, we need to add it
