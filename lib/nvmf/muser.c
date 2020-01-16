@@ -764,7 +764,7 @@ asq_map(struct muser_ctrlr *ctrlr)
 	q.cqid = 0;
 	q.addr = map_one(ctrlr->lm_ctx, ctrlr->asq,
 			 q.size * sizeof(struct spdk_nvme_cmd), NULL, NULL);
-	if (!q.addr) {
+	if (q.addr == NULL) {
 		return -1;
 	}
 	insert_queue(ctrlr, &q, false, 0);
@@ -894,8 +894,8 @@ dptr_remap(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd, size_t size)
 {
 	struct iovec iov;
 
-	assert(ctrlr);
-	assert(cmd);
+	assert(ctrlr != NULL);
+	assert(cmd != NULL);
 
 	if (cmd->dptr.prp.prp2 != 0) {
 		return -1;
