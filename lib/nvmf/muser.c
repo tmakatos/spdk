@@ -144,7 +144,7 @@ struct io_q {
 	struct iovec iov;
 
 	/*
-	 * FIXME move to parent struct muser_qpair? There's already qsize
+	 * TODO move to parent struct muser_qpair? There's already qsize
 	 * there.
 	 */
 	uint32_t size;
@@ -229,11 +229,11 @@ struct muser_ctrlr {
 	lm_ctx_t				*lm_ctx;
 	lm_pci_config_space_t			*pci_config_space;
 
-	/* FIXME why do we need this? */
+	/* Needed for adding/removing queue pairs in various callbacks. */
 	struct muser_poll_group			*muser_group;
 
 	/*
-	 * FIXME variables that are checked by poll_group_poll to see whether
+	 * TODO variables that are checked by poll_group_poll to see whether
 	 * commands need to be executed, in addition to checking the doorbells.
 	 * We now have 3 such different commands so we should introduce a queue,
 	 * or if we're going to have a single outstanding command we should
@@ -443,9 +443,9 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 		       ctrlr, count, pos);
 
 	/*
-	 * FIXME why wo we have to check from this thread whether it's active?
-	 * Can we blindly forward the read and resume the subsystem if required
-	 * in the SPDK thread context?
+	 * TODO Do we have to check from this thread whether it's active?  Can
+	 * we blindly forward the read and resume the subsystem if required in
+	 * the SPDK thread context?
 	 */
 	if (!muser_spdk_nvmf_subsystem_is_active(ctrlr)) {
 		err = muser_request_spdk_nvmf_subsystem_resume(ctrlr);
@@ -868,9 +868,12 @@ handle_cmd_req(struct muser_ctrlr * ctrlr, struct spdk_nvme_cmd * cmd,
                struct spdk_nvmf_request * req);
 
 
-/* XXX SPDK thread */
-/* FIXME looks very similar to consume_io_req, maybe convert this function to
- * something like 'prepare admin req' and then call consume_io_req? */
+/*
+ * TODO looks very similar to consume_io_req, maybe convert this function to
+ * something like 'prepare admin req' and then call consume_io_req?
+ *
+ * XXX SPDK thread context
+ */
 static int
 handle_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 {
@@ -1071,7 +1074,7 @@ tear_down_qpair(struct muser_qpair *qpair)
 }
 
 /*
- * FIXME we can immediately remove the QP from the list because this function
+ * TODO we can immediately remove the QP from the list because this function
  * is now executed by the SPDK thread.
  */
 static void
@@ -1090,7 +1093,7 @@ destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid)
 	              qid, qpair, ctrlr->muser_group);
 
 	/*
-	 * FIXME Is it possible for the pointer to be accessed while we're
+	 * TODO Is it possible for the pointer to be accessed while we're
 	 * tearing down the queue?
 	 */
 	destroy_io_qp(qpair);
@@ -1099,6 +1102,7 @@ destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid)
 	ctrlr->qp[qid] = NULL;
 }
 
+/* This function can only fail because of memory allocation errors. */
 static int
 init_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
         const uint16_t qsize, const uint16_t id)
@@ -1156,7 +1160,11 @@ out:
 	return err;
 }
 
-/* XXX SPDK thread */
+/* XXX SPDK thread context */
+/*
+ * TODO adding/removing a QP is complicated, consider moving into a separate
+ * file, e.g. start_stop_queue.c
+ */
 static int
 add_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
        const uint16_t qsize, const uint16_t qid, struct spdk_nvme_cmd *cmd)
@@ -1188,8 +1196,10 @@ add_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 }
 
 /*
- * XXX SPDK thread
- * Creates a completion or sumbission I/O queue.
+ * Creates a completion or sumbission I/O queue. Returns 0 on success, -errno
+ * on error.
+ *
+ * XXX SPDK thread context.
  */
 static int
 handle_create_io_q(struct muser_ctrlr *ctrlr,
@@ -1315,12 +1325,12 @@ handle_del_io_q(struct muser_ctrlr *ctrlr,
 		}
 	} else {
 		/*
-		 * FIXME this doesn't actually delete the I/O, we can't do that
-		 * anyway because we can't do that in NVMf. We're merely telling
-		 * the poll_group_poll function to skip checking this queue. The
-		 * only workflow this works is when CC.EN is set to 0 and we're
-		 * stopping the subsystem, so we know the relevant callbacks to
-		 * destroy the queues will be called.
+		 * FIXME this doesn't actually delete the I/O queue, we can't
+		 * do that anyway because NVMf doesn't support it. We're merely
+		 * telling the poll_group_poll function to skip checking this
+		 * queue. The only workflow this works is when CC.EN is set to
+		 * 0 and we're stopping the subsystem, so we know that the
+		 * relevant callbacks to destroy the queues will be called.
 		 */
 		ctrlr->qp[cmd->cdw10_bits.delete_io_q.qid]->del = true;
 	}
@@ -1330,9 +1340,9 @@ out:
 }
 
 /*
- * XXX SPDK thread
- *
  * Returns 0 on success and -errno on error.
+ *
+ * XXX SPDK thread context
  */
 static int
 consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
@@ -1398,9 +1408,10 @@ consume_io_req(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
 	return handle_cmd_req(ctrlr, cmd, req);
 }
 
-/* XXX SPDK thread
- *
+/*
  * Returns 0 on success and -errno on error.
+ *
+ * XXX SPDK thread context
  */
 static int
 consume_req(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
@@ -1424,9 +1435,7 @@ consume_reqs(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
 	assert(qpair != NULL);
 
 	/*
-	 * FIXME can queue size change arbitrarily? Shall we operate on a copy ?
-	 *
-	 * FIXME operating on an SQ is pretty much the same for admin and I/O
+	 * TODO operating on an SQ is pretty much the same for admin and I/O
 	 * queues. All we need is a callback to replace consume_req,
 	 * depending on the type of the queue.
 	 *
@@ -1444,8 +1453,6 @@ consume_reqs(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
 
 		err = consume_req(ctrlr, qpair, cmd);
 		if (err != 0) {
-			/* FIXME how should we proceed now? */
-			SPDK_ERRLOG("failed to process request\n");
 			return err;
 		}
 	}
@@ -1453,6 +1460,7 @@ consume_reqs(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
 }
 
 /*
+ * TODO consume_reqs is redundant, move its body in handle_sq_tdbl_write
  * XXX SPDK thread context
  */
 static ssize_t
@@ -1468,6 +1476,10 @@ handle_sq_tdbl_write(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
  * Handles a write at offset 0x1000 or more.
  *
  * DSTRD is set to fixed value 0 for NVMf.
+ *
+ * TODO this function won't be called when sparse mapping is used, however it
+ * might be used when we dynamically switch off polling, so I'll leave it here
+ * for now.
  */
 static int
 handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
@@ -1504,12 +1516,15 @@ handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
 }
 
 /*
- * FIXME Is there any benefit in forwarding the write to the SPDK thread and
+ * TODO Is there any benefit in forwarding the write to the SPDK thread and
  * handling it there? This way we can optionally make writes posted, which may
  * or may not be a good thing. Also, if we handle writes at the the SPDK thread
  * we won't be able to synchronously wait, we'll have to execute everything in
  * callbacks and schedule the next piece of work from the callback handlers,
  * and this sounds more difficult to implement.
+ *
+ * TODO Does it make sense to try to cleanup (e.g. undo subsys stop) in case of
+ * error?
  */
 static int
 handle_cc_write(struct muser_ctrlr *ctrlr, uint8_t *buf,
@@ -1525,7 +1540,7 @@ handle_cc_write(struct muser_ctrlr *ctrlr, uint8_t *buf,
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "write CC=%#x\n", cc->raw);
 
 	/*
-	 * FIXME is it OK to access the controller registers like this without
+	 * TODO is it OK to access the controller registers like this without
 	 * a proper property request?
 	 */
 
@@ -1539,7 +1554,7 @@ handle_cc_write(struct muser_ctrlr *ctrlr, uint8_t *buf,
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "CC.EN 1 -> 0\n");
 
 		/*
-		 * FIXME We send two requests to the SPDK thread, one after
+		 * TODO We send two requests to the SPDK thread, one after
 		 * after another, synchronously waiting for them to complete.
 		 * Is it better to have the SPDK thread issue the second
 		 * request?
@@ -1557,7 +1572,7 @@ handle_cc_write(struct muser_ctrlr *ctrlr, uint8_t *buf,
 		        return -1;
 		}
 
-		/* FIXME Shouldn't CSTS.SHST be set by NVMf? */
+		/* TODO Shouldn't CSTS.SHST be set by NVMf? */
 		ctrlr->qp[0]->qpair.ctrlr->vcprop.csts.bits.shst = 0;
 		cc->bits.en = 0;
 		cc->bits.shn = 0;
@@ -1567,8 +1582,8 @@ handle_cc_write(struct muser_ctrlr *ctrlr, uint8_t *buf,
 		   ctrlr->qp[0]->qpair.ctrlr->vcprop.cc.bits.en == 0 &&
 		   !muser_spdk_nvmf_subsystem_is_active(ctrlr)) {
 		/*
-		 * FIXME CC.EN == 0 does not necessarily mean that NVMf subsys
-		 * is inactive.  We must first tell the NVMf subsystem to resume
+		 * CC.EN == 0 does not necessarily mean that NVMf subsys is
+		 * inactive.  We must first tell the NVMf subsystem to resume
 		 * and then set CC.EN to 1.
 		 */
 		err = muser_request_spdk_nvmf_subsystem_resume(ctrlr);
@@ -1582,9 +1597,9 @@ handle_cc_write(struct muser_ctrlr *ctrlr, uint8_t *buf,
 	assert(err == 0); /* FIXME */
 
 	if (cc->bits.en == 0 && ctrlr->qp[0] != NULL) {
-		/* FIXME need to delete admin queues, however destroy_qp must be
+		/* need to delete admin queues, however destroy_qp must be
 		 * called at SPDK thread context.
-		 * FIXME is this really needed? Don't we get a callback for
+		 * TODO is this really needed? Don't we get a callback for
 		 * deleting the admin queue?
 		 */
 		err = sem_init(&ctrlr->sem, 0, 0);
@@ -1630,7 +1645,7 @@ access_bar_fn(void *pvt, char *buf, size_t count, loff_t offset,
 	ssize_t ret;
 
 	/*
-	 * FIXME it doesn't make sense to have separate functions for the BAR0,
+	 * TODO it doesn't make sense to have separate functions for the BAR0,
 	 * since a lot of the code is common, e.g. figuring out which doorbell
 	 * is accessed. Merge.
 	 */
@@ -2083,7 +2098,17 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	 * send NVMe requests to it, and SPDK expects them to be associated with
 	 * a QP. Therefore we have to create the admin QP very early.
 	 */
-	/* FIXME queuedepth must come from NVMf */
+	/*
+	 * FIXME adding a queue is asynchronous: as soon as this function
+	 * returns muser_accept will add it. Eventually handle_connect_rsp will
+	 * be executed and it's there where we can check for potential errors
+	 * returned by NVMf. This code assumes that creating the admin queue
+	 * succeeds, which is wrong. We can't synchronously wait for NVMf to
+	 * serve the connect request in order to get the return value because
+	 * there's only one thread. Do we really have to create the admin queue
+	 * here? Maybe we should continue with the addition of the MUSER
+	 * controller (everything after add_qp) in handle_connect_rsp?
+	 */
 	err = add_qp(muser_ctrlr, transport, MUSER_DEFAULT_AQ_DEPTH, 0, NULL);
 	if (err) {
 		goto err_free_dev;
@@ -2168,7 +2193,11 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 	return -1;
 }
 
-/* FIXME when does this get executed? */
+/*
+ * Executed periodically.
+ *
+ * XXX SPDK thread context.
+ */
 static void
 muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn,
              void *cb_arg)
@@ -2243,8 +2272,7 @@ static void
 handle_connect_rsp(struct muser_qpair *qpair, struct muser_req *req);
 
 /*
- * FIXME how does this function know when to execute? Clearly it does not
- * execute periodically. Is this cb_fn called by muser_accept?
+ * Called by spdk_nvmf_transport_poll_group_add.
  */
 static int
 muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
@@ -2290,7 +2318,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	/* data->hostnqn = { 0 } */
 
 	/*
-	 * FIXME If spdk_nvmf_request_exec is guaranteed to synchronously add
+	 * TODO If spdk_nvmf_request_exec is guaranteed to synchronously add
 	 * the QP then there's no reason to use completion callbacks.
 	 */
 	muser_req->end_fn = handle_connect_rsp;
@@ -2309,7 +2337,7 @@ muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 {
 	struct muser_qpair *muser_qpair;
 
-	/* FIXME maybe this is where we should delete the I/O queue? */
+	/* TODO maybe this is where we should delete the I/O queue? */
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "remove NVMf QP%d=%p from NVMf poll_group=%p\n",
 	              qpair->qid, qpair, group);
 
@@ -2337,7 +2365,8 @@ handle_admin_q_connect_rsp(struct spdk_nvmf_request *req,
 
 /*
  * Only for CQ, which preceeds SQ creation. SQ is immediately completed in the
- * submit path.
+ * submit path. add_qp is the only entry point that results in this callback
+ * executed.
  */
 static void
 handle_connect_rsp(struct muser_qpair *qpair, struct muser_req *req)
@@ -2459,7 +2488,7 @@ handle_prop_rsp(struct muser_qpair *qpair, struct muser_req *req)
 
 	if (fire) {
 		/*
-		 * FIXME this assume that spdk_nvmf_request_exec will call this
+		 * FIXME this assumes that spdk_nvmf_request_exec will call this
 		 * callback before it actually returns. This is important
 		 * because if we don't clear it then muser_poll_group_poll will
 		 * pick up the same request again. The reason we don't clear it
@@ -2497,7 +2526,7 @@ static int
 muser_req_free(struct spdk_nvmf_request *req)
 {
 	/*
-	 * FIXME why do we call muser_req_done both from muser_req_complete and
+	 * TODO why do we call muser_req_done both from muser_req_complete and
 	 * from muser_req_free? Aren't they both always called? (first complete
 	 * and then done?)
 	 */
@@ -2525,7 +2554,7 @@ muser_close_qpair(struct spdk_nvmf_qpair *qpair)
 
 	assert(qpair != NULL);
 
-	/* FIXME when is this called? */
+	/* TODO when is this called? */
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "close QP%d\n", qpair->qid);
 
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
@@ -2608,7 +2637,6 @@ handle_cmd_req(struct muser_ctrlr * ctrlr, struct spdk_nvme_cmd * cmd,
 
 	req->cmd->nvme_cmd = *cmd;
 	if (spdk_nvmf_qpair_is_admin_queue(req->qpair)) {
-		/* FIXME in which case is muser_qpair->cmd == NULL? */
 		req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
 		req->length = 1 << 12;
 		req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << ctrlr->cc.bits.mps);
@@ -2625,6 +2653,7 @@ handle_cmd_req(struct muser_ctrlr * ctrlr, struct spdk_nvme_cmd * cmd,
 	return 0;
 }
 
+/* TODO s/resume/start */
 static void
 muser_nvmf_subsystem_resumed(struct spdk_nvmf_subsystem *subsys, void *cb_arg,
                             int status)
@@ -2718,13 +2747,13 @@ check_ctrlr(struct muser_ctrlr *ctrlr)
 	}
 
 	/*
-	 * FIXME apart from polling the doorbells, ther are other
+	 * TODO apart from polling the doorbells, ther are other
 	 * operations we need to execute for the other thread (e.g.
 	 * write NVMe registers). Maybe it's best to introduce a queue?
 	 */
 
 	/*
-	 * FIXME not sure what is the relationship between subsys and
+	 * TODO not sure what is the relationship between subsys and
 	 * ctrlr.
 	 */
 	if (ctrlr->start) {
