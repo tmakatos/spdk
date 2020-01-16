@@ -511,7 +511,9 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	 * time. NVMf doesn't like this.
 	 */
 	if (is_nvme_cap(pos)) {
-		assert(count == 4 || count == 8); /* FIXME */
+		if (count != 4 && count != 8) {
+			return -EINVAL;
+		}
 		if (count == 4) {
 			_buf = buf;
 			_count = count;
