@@ -33,7 +33,6 @@
 #include <muser/muser.h>
 #include <muser/caps/pm.h>
 #include <muser/caps/px.h>
-#include <muser/caps/msi.h>
 #include <muser/caps/msix.h>
 
 #include "spdk/barrier.h"
@@ -248,7 +247,6 @@ struct muser_ctrlr {
 
 	/* PCI capabilities */
 	struct pmcap				pmcap;
-	struct msicap				msicap;
 	struct msixcap				msixcap;
 	struct pxcap				pxcap;
 
@@ -1710,10 +1708,6 @@ handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc * const mxc)
 	}
 
 	if (mxc->mxe != ctrlr->msixcap.mxc.mxe) {
-		/*
-		 * FIXME need to check that MSI enable bit is set to 0 before
-		 * enabling MSI-X.
-		 */
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s MSI-X\n",
 		              mxc->mxe ? "enable" : "disable");
 		ctrlr->msixcap.mxc.mxe = mxc->mxe;
@@ -1762,163 +1756,6 @@ msixcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
 	}
 
 	memcpy(buf, ((char*)&ctrlr->msixcap) + offset, count);
-
-	return count;
-}
-
-static int
-handle_msicap_mc_write(struct muser_ctrlr * const ctrlr, const struct mc * const mc)
-{
-	assert(ctrlr != NULL);
-	assert(mc != NULL);
-
-	if (mc->msie != ctrlr->msicap.mc.msie) {
-		ctrlr->msicap.mc.msie = mc->msie;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MSI %s\n",
-		              mc->msie ? "enable" : "disable");
-	}
-
-	if (mc->mmc != ctrlr->msicap.mc.mmc) {
-		SPDK_ERRLOG("invalid write %#x to RO register MMC (%#x)\n",
-		            mc->mmc, ctrlr->msicap.mc.mmc);
-	}
-
-	if (mc->mme != ctrlr->msicap.mc.mme) {
-		ctrlr->msicap.mc.mme = mc->mme;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MME set to %#x\n",
-		              ctrlr->msicap.mc.mme);
-	}
-
-	if (mc->c64 != ctrlr->msicap.mc.c64) {
-		SPDK_ERRLOG("invalid write %#x to RO register C64 (%#x)\n",
-		            mc->c64, ctrlr->msicap.mc.c64);
-	}
-
-	if (mc->pvm != ctrlr->msicap.mc.pvm) {
-		SPDK_ERRLOG("invalid write %#x to RO register PVM (%#x)\n",
-		            mc->pvm, ctrlr->msicap.mc.pvm);
-	}
-
-	if (mc->res1) {
-		SPDK_ERRLOG("invalid write %#x to RO reserved\n", mc->res1);
-	}
-
-	return 0;
-}
-
-static int
-handle_msicap_md_write(struct muser_ctrlr *ctrlr, const uint16_t data)
-{
-	assert(ctrlr != NULL);
-
-	ctrlr->msicap.md = data;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MD.DATA=%#x\n", ctrlr->msicap.md);
-	return 0;
-}
-
-static int
-handle_msicap_ma_write(struct muser_ctrlr *ctrlr, const struct ma * const ma)
-{
-	assert(ctrlr != NULL);
-	assert(ma != NULL);
-
-	if (ma->res1) {
-		SPDK_ERRLOG("bad write to ma\n");
-		return -EINVAL;
-	}
-	ctrlr->msicap.ma.addr = ma->addr;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MA.ADDR=%#x\n", ctrlr->msicap.ma.addr);
-	return 0;
-}
-
-static int
-handle_msicap_mua_write(struct muser_ctrlr *ctrlr, const uint32_t uaddr)
-{
-	assert(ctrlr != NULL);
-
-	ctrlr->msicap.mua = uaddr;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MUA.UADDR=%#x\n", ctrlr->msicap.mua);
-	return 0;
-}
-
-static int
-handle_msicap_mmask_write(struct muser_ctrlr *ctrlr, const uint32_t mask)
-{
-	assert(ctrlr != NULL);
-
-	ctrlr->msicap.mmask = mask;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MMASK.MASK=%#x\n", ctrlr->msicap.mmask);
-	return 0;
-}
-
-static int
-handle_msicap_mpend_write(struct muser_ctrlr *ctrlr, const uint32_t pend)
-{
-	assert(ctrlr != NULL);
-
-	ctrlr->msicap.mpend = pend;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MPEND.PEND=%#x\n", ctrlr->msicap.mpend);
-	return 0;
-}
-
-static int
-handle_msicap_write_2_bytes(struct muser_ctrlr *c, char * const b, loff_t o)
-{
-	switch (o) {
-		case offsetof(struct msicap, mc):
-			return handle_msicap_mc_write(c, (struct mc*)b);
-		case offsetof(struct msicap, md):
-			return handle_msicap_md_write(c, *(uint16_t*)b);
-
-	}
-	return -EINVAL;
-}
-
-static int
-handle_msicap_write_4_bytes(struct muser_ctrlr *c, char * const b, loff_t o)
-{
-	switch (o) {
-		case offsetof(struct msicap, ma):
-			return handle_msicap_ma_write(c, (struct ma*)b);
-		case offsetof(struct msicap, mua):
-			return handle_msicap_mua_write(c, *(uint32_t*)b);
-		case offsetof(struct msicap, mmask):
-			return handle_msicap_mmask_write(c, *(uint32_t*)b);
-		case offsetof(struct msicap, mpend):
-			return handle_msicap_mpend_write(c, *(uint32_t*)b);
-	}
-	return -EINVAL;
-}
-
-static int
-handle_msicap_write(struct muser_ctrlr *ctrlr, char * const buf, size_t count,
-                    loff_t offset)
-{
-	assert(ctrlr != NULL);
-
-	switch (count) {
-		case 2:
-			return handle_msicap_write_2_bytes(ctrlr, buf, offset);
-		case 4:
-			return handle_msicap_write_4_bytes(ctrlr, buf, offset);
-	}
-	return -EINVAL;
-}
-
-static ssize_t
-msicap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
-              loff_t offset, const bool is_write)
-{
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
-
-	if (is_write) {
-		int err = handle_msicap_write(ctrlr, buf, count, offset);
-		if (err != 0) {
-			return err;
-		}
-	} else {
-		memcpy(buf, ((char*)&ctrlr->msicap) + offset, count);
-	}
 
 	return count;
 }
@@ -2099,8 +1936,7 @@ nvme_log(void *pvt, char const *msg)
 }
 
 static void
-nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr,
-                   bool en_msi, bool en_msix)
+nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 {
 	static const lm_cap_t pm = {.id = PCI_CAP_ID_PM,
                                     .size = sizeof(struct pmcap),
@@ -2108,6 +1944,9 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr,
 	static const lm_cap_t px = {.id = PCI_CAP_ID_EXP,
 	                            .size = sizeof(struct pxcap),
 	                            .fn = pxcap_access};
+	static const lm_cap_t msix = {.id = PCI_CAP_ID_MSIX,
+	                              .size = sizeof(struct msixcap),
+	                              .fn = msixcap_access};
 
 	assert(dev_info != NULL);
 	assert(muser_ctrlr != NULL);
@@ -2132,21 +1971,8 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr,
 
 	dev_info->caps[dev_info->nr_caps++] = pm;
 
-	if (en_msi) {
-		static const lm_cap_t msi = {.id = PCI_CAP_ID_MSI,
-		                             .size = sizeof(struct msicap),
-		                             .fn = msicap_access};
-		dev_info->pci_info.irq_count[LM_DEV_MSI_IRQ_IDX] = 1 << NVME_IRQ_MSI_NUM;
-		dev_info->caps[dev_info->nr_caps++] = msi;
-	}
-
-	if (en_msix) {
-		static const lm_cap_t msix = {.id = PCI_CAP_ID_MSIX,
-		                              .size = sizeof(struct msixcap),
-		                              .fn = msixcap_access};
-		dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
-		dev_info->caps[dev_info->nr_caps++] = msix;
-	}
+	dev_info->pci_info.irq_count[LM_DEV_MSIX_IRQ_IDX] = NVME_IRQ_MSIX_NUM;
+	dev_info->caps[dev_info->nr_caps++] = msix;
 
 	dev_info->caps[dev_info->nr_caps++] = px;
 
@@ -2218,7 +2044,6 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	struct muser_ctrlr *muser_ctrlr;
 	lm_dev_info_t dev_info = { 0 };
 	int err;
-	const bool en_msi = false, en_msix = true;
 	uint8_t	subnqn[SPDK_NVME_NQN_FIELD_SIZE];
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
@@ -2270,7 +2095,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	 */
 
 	/* LM setup */
-	nvme_dev_info_fill(&dev_info, muser_ctrlr, en_msi, en_msix);
+	nvme_dev_info_fill(&dev_info, muser_ctrlr);
 
 	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
 	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
@@ -2280,25 +2105,18 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	/* PM */
 	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
 
-	/* MSI */
-	if (en_msi) {	
-		muser_ctrlr->msicap.mc.mmc = 0x1;
-		muser_ctrlr->msicap.mc.c64 = 0x1;
-	}
-
-	/* MSI-X */
-	if (en_msix) {
-		/*
-		 * TODO for now we put table BIR and PBA BIR in BAR4 because
-		 * it's just easier, otherwise in order to put it in BAR0 we'd
-		 * have to figure out where exactly doorbells end.
-		 */
-		muser_ctrlr->msixcap.mxc.ts = 0x3;
-		muser_ctrlr->msixcap.mtab.tbir = 0x4;
-		muser_ctrlr->msixcap.mtab.to = 0x0;
-		muser_ctrlr->msixcap.mpba.pbir = 0x5;
-		muser_ctrlr->msixcap.mpba.pbao = 0x0;
-	}
+	/*
+	 * MSI-X
+	 *
+	 * TODO for now we put table BIR and PBA BIR in BAR4 because
+	 * it's just easier, otherwise in order to put it in BAR0 we'd
+	 * have to figure out where exactly doorbells end.
+	 */
+	muser_ctrlr->msixcap.mxc.ts = 0x3;
+	muser_ctrlr->msixcap.mtab.tbir = 0x4;
+	muser_ctrlr->msixcap.mtab.to = 0x0;
+	muser_ctrlr->msixcap.mpba.pbir = 0x5;
+	muser_ctrlr->msixcap.mpba.pbao = 0x0;
 
 	/* EXP */
 	muser_ctrlr->pxcap.pxcaps.ver = 0x2;
