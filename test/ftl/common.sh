@@ -5,6 +5,16 @@ function get_chunk_size() {
 		grep 'Logical blks per chunk' | sed 's/[^0-9]//g'
 }
 
+function get_num_group() {
+	$rootdir/examples/nvme/identify/identify -r "trtype:PCIe traddr:$1" |
+		grep 'Groups' | sed 's/[^0-9]//g'
+}
+
+function get_num_pu() {
+	$rootdir/examples/nvme/identify/identify -r "trtype:PCIe traddr:$1" |
+		grep 'PUs' | sed 's/[^0-9]//g'
+}
+
 function has_separate_md() {
 	local md_type
 	md_type=$($rootdir/examples/nvme/identify/identify -r "trtype:PCIe traddr:$1" | \
@@ -35,4 +45,9 @@ function create_nv_cache_bdev() {
 	local nvc_bdev
 	nvc_bdev=$($rootdir/scripts/rpc.py bdev_nvme_attach_controller -b $name -t PCIe -a $cache_bdf)
 	$rootdir/scripts/rpc.py bdev_split_create $nvc_bdev -s $size 1
+}
+
+function gen_ftl_nvme_conf() {
+	echo "[Nvme]"
+	echo "  AdminPollRate 100"
 }

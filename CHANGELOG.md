@@ -2,12 +2,32 @@
 
 ## v20.01: (Upcoming Release)
 
+### ftl
+
+All NVMe dependencies were removed from ftl library.
+From now ftl library is using bdev_zone API.
+bdev_ftl becomes virtual bdev.
+
+`ctrlr` and `trid` fields in `spdk_ftl_dev_init_opts` structure  were replaced by
+`base_bdev_desc`.
+
+`bdev_ftl_create` RPC method `trtype` and `traddr` parameters were replaced by `base_bdev`
+parameter.
+
+`spdk_ftl_module_init` and `spdk_ftl_module_fini` functions were removed.
+
+`spdk_ftl_punit_range` and `ftl_module_init_opts` structures were removed.
+
 ### sock
 
 Added spdk_sock_writev_async for performing asynchronous writes to sockets. This call will
 never return EAGAIN, instead queueing internally until the data has all been sent. This can
 simplify many code flows that create pollers to continue attempting to flush writes
 on sockets.
+
+Added `impl_name` parameter in spdk_sock_listen and spdk_sock_connect functions. Users may now
+specify the sock layer implementation they'd prefer to use. Valid implementations are currently
+"vpp" and "posix" and NULL, where NULL results in the previous behavior of the functions.
 
 ### isa-l
 
@@ -27,6 +47,21 @@ Added boolean return value for function spdk_fs_set_cache_size to indicate its o
 
 Added `blobfs_set_cache_size` RPC method to set cache size for blobstore filesystem.
 
+### nvmf
+
+Add SockPriority option in [Transport] section, this can be used for NVMe-oF target
+on TCP transport to set sock priority for the incomming TCP connections.
+
+The NVMe-oF target now supports plugging out of tree NVMe-oF transports. In order
+to facilitate this feature, several small API changes have been made:
+
+The `spdk_nvme_transport_id` struct now contains a trstring member used to identify the transport.
+`spdk_nvmf_tgt_get_transport`, `spdk_nvmf_transport_opts_init`, and `spdk_nvmf_transport_create` all have been
+modified to take a string.
+A function table, `spdk_nvmf_transport_ops`, and macro, `SPDK_NVMF_TRANSPORT_REGISTER`, have been added which
+enable registering out of tree transports.
+
+
 ### util
 
 `spdk_pipe`, a new utility for buffering data from sockets or files for parsing
@@ -40,6 +75,14 @@ to allow reuse in other transports.
 Added RDMA WR batching to NVMf RDMA initiator. Send and receive WRs are chained together
 and posted with a single call to ibv_post_send(receive) in the next call to qpair completion
 processing function. Batching is controlled by 'delay_cmd_submit' qpair option.
+
+The NVMe-oF initiator now supports plugging out of tree NVMe-oF transports. In order
+to facilitate this feature, several small API changes have been made:
+
+The `spdk_nvme_transport_id` struct now contains a trstring member used to identify the transport.
+A new function, `spdk_nvme_transport_available_by_name`, has been added.
+A function table, `spdk_nvme_transport_ops`, and macro, `SPDK_NVME_TRANSPORT_REGISTER`, have been added which
+enable registering out of tree transports.
 
 ### rpc
 

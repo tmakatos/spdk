@@ -371,7 +371,6 @@ spdk_nvmf_write_subsystem_config_json(struct spdk_json_write_ctx *w,
 	struct spdk_nvmf_ns_opts ns_opts;
 	uint32_t max_namespaces;
 	char uuid_str[SPDK_UUID_STRING_LEN];
-	const char *trtype;
 	const char *adrfam;
 
 	if (spdk_nvmf_subsystem_get_type(subsystem) != SPDK_NVMF_SUBTYPE_NVME) {
@@ -404,7 +403,6 @@ spdk_nvmf_write_subsystem_config_json(struct spdk_json_write_ctx *w,
 	     listener = spdk_nvmf_subsystem_get_next_listener(subsystem, listener)) {
 		trid = spdk_nvmf_listener_get_trid(listener);
 
-		trtype = spdk_nvme_transport_id_trtype_str(trid->trtype);
 		adrfam = spdk_nvme_transport_id_adrfam_str(trid->adrfam);
 
 		spdk_json_write_object_begin(w);
@@ -418,7 +416,7 @@ spdk_nvmf_write_subsystem_config_json(struct spdk_json_write_ctx *w,
 		/*     "listen_address" : { */
 		spdk_json_write_named_object_begin(w, "listen_address");
 
-		spdk_json_write_named_string(w, "trtype", trtype);
+		spdk_json_write_named_string(w, "trtype", trid->trstring);
 		if (adrfam) {
 			spdk_json_write_named_string(w, "adrfam", adrfam);
 		}
@@ -552,7 +550,7 @@ spdk_nvmf_tgt_listen(struct spdk_nvmf_tgt *tgt,
 	const char *trtype;
 	int rc;
 
-	transport = spdk_nvmf_tgt_get_transport(tgt, trid->trtype);
+	transport = spdk_nvmf_tgt_get_transport(tgt, trid->trstring);
 	if (!transport) {
 		trtype = spdk_nvme_transport_id_trtype_str(trid->trtype);
 		if (trtype != NULL) {
@@ -565,16 +563,12 @@ spdk_nvmf_tgt_listen(struct spdk_nvmf_tgt *tgt,
 		return;
 	}
 
-	rc = spdk_nvmf_transport_listen(transport, trid);
+	rc = spdk_nvmf_transport_listen(transport, trid, cb_fn, cb_arg);
 	if (rc < 0) {
 		SPDK_ERRLOG("Unable to listen on address '%s'\n", trid->traddr);
 		cb_fn(cb_arg, rc);
 		return;
 	}
-
-	tgt->discovery_genctr++;
-
-	cb_fn(cb_arg, 0);
 }
 
 struct spdk_nvmf_tgt_add_transport_ctx {
@@ -613,7 +607,7 @@ void spdk_nvmf_tgt_add_transport(struct spdk_nvmf_tgt *tgt,
 {
 	struct spdk_nvmf_tgt_add_transport_ctx *ctx;
 
-	if (spdk_nvmf_tgt_get_transport(tgt, transport->ops->type)) {
+	if (spdk_nvmf_tgt_get_transport(tgt, transport->ops->name)) {
 		cb_fn(cb_arg, -EEXIST);
 		return; /* transport already created */
 	}
@@ -663,16 +657,15 @@ spdk_nvmf_tgt_find_subsystem(struct spdk_nvmf_tgt *tgt, const char *subnqn)
 }
 
 struct spdk_nvmf_transport *
-spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt, enum spdk_nvme_transport_type type)
+spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt, const char *transport_name)
 {
 	struct spdk_nvmf_transport *transport;
 
 	TAILQ_FOREACH(transport, &tgt->transports, link) {
-		if (transport->ops->type == type) {
+		if (!strncasecmp(transport->ops->name, transport_name, SPDK_NVMF_TRSTRING_MAX_LEN)) {
 			return transport;
 		}
 	}
-
 	return NULL;
 }
 

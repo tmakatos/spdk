@@ -1924,8 +1924,12 @@ nvmf_fc_destroy(struct spdk_nvmf_transport *transport)
 
 static int
 nvmf_fc_listen(struct spdk_nvmf_transport *transport,
-	       const struct spdk_nvme_transport_id *trid)
+	       const struct spdk_nvme_transport_id *trid,
+	       spdk_nvmf_tgt_listen_done_fn cb_fn,
+	       void *cb_arg)
 {
+	cb_fn(cb_arg, 0);
+
 	return 0;
 }
 
@@ -2140,6 +2144,7 @@ nvmf_fc_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 }
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_fc = {
+	.name = "FC",
 	.type = (enum spdk_nvme_transport_type) SPDK_NVMF_TRTYPE_FC,
 	.opts_init = nvmf_fc_opts_init,
 	.create = nvmf_fc_create,
@@ -3949,5 +3954,6 @@ done:
 	return err;
 }
 
+SPDK_NVMF_TRANSPORT_REGISTER(fc, &spdk_nvmf_transport_fc);
 SPDK_LOG_REGISTER_COMPONENT("nvmf_fc_adm_api", SPDK_LOG_NVMF_FC_ADM_API);
 SPDK_LOG_REGISTER_COMPONENT("nvmf_fc", SPDK_LOG_NVMF_FC)

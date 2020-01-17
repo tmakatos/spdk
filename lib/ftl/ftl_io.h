@@ -38,7 +38,7 @@
 #include "spdk/nvme.h"
 #include "spdk/ftl.h"
 
-#include "ftl_ppa.h"
+#include "ftl_addr.h"
 #include "ftl_trace.h"
 
 struct spdk_ftl_dev;
@@ -62,15 +62,15 @@ enum ftl_io_flags {
 	FTL_IO_PAD		= (1 << 3),
 	/* The IO operates on metadata */
 	FTL_IO_MD		= (1 << 4),
-	/* Using PPA instead of LBA */
-	FTL_IO_PPA_MODE		= (1 << 5),
+	/* Using physical instead of logical address */
+	FTL_IO_PHYSICAL_MODE	= (1 << 5),
 	/* Indicates that IO contains noncontiguous LBAs */
 	FTL_IO_VECTOR_LBA	= (1 << 6),
 	/* Indicates that IO is being retried */
 	FTL_IO_RETRY		= (1 << 7),
 	/* The IO is directed to non-volatile cache */
 	FTL_IO_CACHE		= (1 << 8),
-	/* Indicates that PPA should be taken from IO struct, */
+	/* Indicates that physical address should be taken from IO struct, */
 	/* not assigned by wptr, only works if wptr is also in direct mode */
 	FTL_IO_DIRECT_ACCESS	= (1 << 9),
 	/* Bypass the non-volatile cache */
@@ -108,7 +108,7 @@ struct ftl_io_init_opts {
 	struct ftl_band				*band;
 
 	/* Number of logical blocks */
-	size_t                                  lbk_cnt;
+	size_t                                  num_blocks;
 
 	/* Data */
 	void                                    *data;
@@ -130,6 +130,8 @@ struct ftl_io_channel {
 	size_t					elem_size;
 	/* IO pool */
 	struct spdk_mempool			*io_pool;
+	/* Underlying device IO channel */
+	struct spdk_io_channel			*base_ioch;
 	/* Persistent cache IO channel */
 	struct spdk_io_channel			*cache_ioch;
 };
@@ -150,14 +152,14 @@ struct ftl_io {
 		uint64_t			single;
 	} lba;
 
-	/* First PPA */
-	struct ftl_ppa				ppa;
+	/* First block address */
+	struct ftl_addr				addr;
 
-	/* Number of processed lbks */
+	/* Number of processed blocks */
 	size_t					pos;
 
-	/* Number of lbks */
-	size_t					lbk_cnt;
+	/* Number of blocks */
+	size_t					num_blocks;
 
 #define FTL_IO_MAX_IOVEC 64
 	struct iovec				iov[FTL_IO_MAX_IOVEC];
@@ -171,7 +173,7 @@ struct ftl_io {
 	/* Position within the iovec */
 	size_t					iov_pos;
 
-	/* Offset within the iovec (in lbks) */
+	/* Offset within the iovec (in blocks) */
 	size_t					iov_off;
 
 	/* RWB entry (valid only for RWB-based IO) */
@@ -235,22 +237,22 @@ struct ftl_md_io {
 };
 
 static inline bool
-ftl_io_mode_ppa(const struct ftl_io *io)
+ftl_io_mode_physical(const struct ftl_io *io)
 {
-	return io->flags & FTL_IO_PPA_MODE;
+	return io->flags & FTL_IO_PHYSICAL_MODE;
 }
 
 static inline bool
-ftl_io_mode_lba(const struct ftl_io *io)
+ftl_io_mode_logical(const struct ftl_io *io)
 {
-	return !ftl_io_mode_ppa(io);
+	return !ftl_io_mode_physical(io);
 }
 
 static inline bool
 ftl_io_done(const struct ftl_io *io)
 {
 	return io->req_cnt == 0 &&
-	       io->pos == io->lbk_cnt &&
+	       io->pos == io->num_blocks &&
 	       !(io->flags & FTL_IO_RETRY);
 }
 
@@ -267,19 +269,20 @@ void ftl_io_dec_req(struct ftl_io *io);
 struct iovec *ftl_io_iovec(struct ftl_io *io);
 uint64_t ftl_io_current_lba(const struct ftl_io *io);
 uint64_t ftl_io_get_lba(const struct ftl_io *io, size_t offset);
-void ftl_io_advance(struct ftl_io *io, size_t lbk_cnt);
-size_t ftl_iovec_num_lbks(struct iovec *iov, size_t iov_cnt);
+void ftl_io_advance(struct ftl_io *io, size_t num_blocks);
+size_t ftl_iovec_num_blocks(struct iovec *iov, size_t iov_cnt);
 void *ftl_io_iovec_addr(struct ftl_io *io);
 size_t ftl_io_iovec_len_left(struct ftl_io *io);
-struct ftl_io *ftl_io_rwb_init(struct spdk_ftl_dev *dev, struct ftl_band *band,
+struct ftl_io *ftl_io_rwb_init(struct spdk_ftl_dev *dev, struct ftl_addr addr,
+			       struct ftl_band *band,
 			       struct ftl_rwb_batch *entry, ftl_io_fn cb);
-struct ftl_io *ftl_io_erase_init(struct ftl_band *band, size_t lbk_cnt, ftl_io_fn cb);
-struct ftl_io *ftl_io_user_init(struct spdk_io_channel *ioch, uint64_t lba, size_t lbk_cnt,
+struct ftl_io *ftl_io_erase_init(struct ftl_band *band, size_t num_blocks, ftl_io_fn cb);
+struct ftl_io *ftl_io_user_init(struct spdk_io_channel *ioch, uint64_t lba, size_t num_blocks,
 				struct iovec *iov, size_t iov_cnt, spdk_ftl_fn cb_fn,
 				void *cb_arg, int type);
 void *ftl_io_get_md(const struct ftl_io *io);
 void ftl_io_complete(struct ftl_io *io);
-void ftl_io_shrink_iovec(struct ftl_io *io, size_t lbk_cnt);
+void ftl_io_shrink_iovec(struct ftl_io *io, size_t num_blocks);
 void ftl_io_process_error(struct ftl_io *io, const struct spdk_nvme_cpl *status);
 void ftl_io_reset(struct ftl_io *io);
 void ftl_io_call_foreach_child(struct ftl_io *io, int (*callback)(struct ftl_io *));

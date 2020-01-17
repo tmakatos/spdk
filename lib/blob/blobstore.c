@@ -41,6 +41,7 @@
 #include "spdk/bit_array.h"
 #include "spdk/likely.h"
 #include "spdk/util.h"
+#include "spdk/string.h"
 
 #include "spdk_internal/assert.h"
 #include "spdk_internal/log.h"
@@ -350,7 +351,7 @@ _spdk_blob_mark_clean(struct spdk_blob *blob)
 		if (!clusters) {
 			return -ENOMEM;
 		}
-		memcpy(clusters, blob->active.clusters, blob->active.num_clusters * sizeof(*clusters));
+		memcpy(clusters, blob->active.clusters, blob->active.num_clusters * sizeof(*blob->active.clusters));
 	}
 
 	if (blob->active.num_pages) {
@@ -360,7 +361,7 @@ _spdk_blob_mark_clean(struct spdk_blob *blob)
 			free(clusters);
 			return -ENOMEM;
 		}
-		memcpy(pages, blob->active.pages, blob->active.num_pages * sizeof(*pages));
+		memcpy(pages, blob->active.pages, blob->active.num_pages * sizeof(*blob->active.pages));
 	}
 
 	free(blob->clean.clusters);
@@ -501,7 +502,7 @@ _spdk_blob_parse_page(const struct spdk_blob_md_page *page, struct spdk_blob *bl
 			if (cluster_count == 0) {
 				return -EINVAL;
 			}
-			tmp = realloc(blob->active.clusters, cluster_count * sizeof(uint64_t));
+			tmp = realloc(blob->active.clusters, cluster_count * sizeof(*blob->active.clusters));
 			if (tmp == NULL) {
 				return -ENOMEM;
 			}
@@ -921,7 +922,9 @@ _spdk_blob_load_final(void *cb_arg, int bserrno)
 	struct spdk_blob_load_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
 
-	_spdk_blob_mark_clean(blob);
+	if (bserrno == 0) {
+		_spdk_blob_mark_clean(blob);
+	}
 
 	ctx->cb_fn(ctx->seq, ctx->cb_arg, bserrno);
 
@@ -936,105 +939,33 @@ _spdk_blob_load_snapshot_cpl(void *cb_arg, struct spdk_blob *snapshot, int bserr
 	struct spdk_blob_load_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
 
-	if (bserrno != 0) {
-		goto error;
+	if (bserrno == 0) {
+		blob->back_bs_dev = spdk_bs_create_blob_bs_dev(snapshot);
+		if (blob->back_bs_dev == NULL) {
+			bserrno = -ENOMEM;
+		}
 	}
-
-	blob->back_bs_dev = spdk_bs_create_blob_bs_dev(snapshot);
-
-	if (blob->back_bs_dev == NULL) {
-		bserrno = -ENOMEM;
-		goto error;
+	if (bserrno != 0) {
+		SPDK_ERRLOG("Snapshot fail\n");
 	}
 
 	_spdk_blob_load_final(ctx, bserrno);
-	return;
-
-error:
-	SPDK_ERRLOG("Snapshot fail\n");
-	_spdk_blob_free(blob);
-	ctx->cb_fn(ctx->seq, NULL, bserrno);
-	spdk_free(ctx->pages);
-	free(ctx);
 }
 
 static void
-_spdk_blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+_spdk_blob_load_backing_dev(void *cb_arg)
 {
 	struct spdk_blob_load_ctx	*ctx = cb_arg;
 	struct spdk_blob		*blob = ctx->blob;
-	struct spdk_blob_md_page	*page;
 	const void			*value;
 	size_t				len;
 	int				rc;
-	uint32_t			crc;
-
-	if (bserrno) {
-		SPDK_ERRLOG("Metadata page read failed: %d\n", bserrno);
-		_spdk_blob_free(blob);
-		ctx->cb_fn(seq, NULL, bserrno);
-		spdk_free(ctx->pages);
-		free(ctx);
-		return;
-	}
-
-	page = &ctx->pages[ctx->num_pages - 1];
-	crc = _spdk_blob_md_page_calc_crc(page);
-	if (crc != page->crc) {
-		SPDK_ERRLOG("Metadata page %d crc mismatch\n", ctx->num_pages);
-		_spdk_blob_free(blob);
-		ctx->cb_fn(seq, NULL, -EINVAL);
-		spdk_free(ctx->pages);
-		free(ctx);
-		return;
-	}
-
-	if (page->next != SPDK_INVALID_MD_PAGE) {
-		uint32_t next_page = page->next;
-		uint64_t next_lba = _spdk_bs_page_to_lba(blob->bs, blob->bs->md_start + next_page);
-		uint64_t max_md_lba = _spdk_bs_page_to_lba(blob->bs, blob->bs->md_start + blob->bs->md_len);
-
-		if (next_lba >= max_md_lba) {
-			assert(false);
-		}
-
-		/* Read the next page */
-		ctx->num_pages++;
-		ctx->pages = spdk_realloc(ctx->pages, (sizeof(*page) * ctx->num_pages),
-					  sizeof(*page));
-		if (ctx->pages == NULL) {
-			ctx->cb_fn(seq, ctx->cb_arg, -ENOMEM);
-			free(ctx);
-			return;
-		}
-
-		spdk_bs_sequence_read_dev(seq, &ctx->pages[ctx->num_pages - 1],
-					  next_lba,
-					  _spdk_bs_byte_to_lba(blob->bs, sizeof(*page)),
-					  _spdk_blob_load_cpl, ctx);
-		return;
-	}
-
-	/* Parse the pages */
-	rc = _spdk_blob_parse(ctx->pages, ctx->num_pages, blob);
-	if (rc) {
-		_spdk_blob_free(blob);
-		ctx->cb_fn(seq, NULL, rc);
-		spdk_free(ctx->pages);
-		free(ctx);
-		return;
-	}
-	ctx->seq = seq;
-
 
 	if (spdk_blob_is_thin_provisioned(blob)) {
 		rc = _spdk_blob_get_xattr_value(blob, BLOB_SNAPSHOT, &value, &len, true);
 		if (rc == 0) {
 			if (len != sizeof(spdk_blob_id)) {
-				_spdk_blob_free(blob);
-				ctx->cb_fn(seq, NULL, -EINVAL);
-				spdk_free(ctx->pages);
-				free(ctx);
+				_spdk_blob_load_final(ctx, -EINVAL);
 				return;
 			}
 			/* open snapshot blob and continue in the callback function */
@@ -1050,7 +981,60 @@ _spdk_blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 		/* standard blob */
 		blob->back_bs_dev = NULL;
 	}
-	_spdk_blob_load_final(ctx, bserrno);
+	_spdk_blob_load_final(ctx, 0);
+}
+
+static void
+_spdk_blob_load_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
+{
+	struct spdk_blob_load_ctx	*ctx = cb_arg;
+	struct spdk_blob		*blob = ctx->blob;
+	struct spdk_blob_md_page	*page;
+	int				rc;
+	uint32_t			crc;
+
+	if (bserrno) {
+		SPDK_ERRLOG("Metadata page read failed: %d\n", bserrno);
+		_spdk_blob_load_final(ctx, bserrno);
+		return;
+	}
+
+	page = &ctx->pages[ctx->num_pages - 1];
+	crc = _spdk_blob_md_page_calc_crc(page);
+	if (crc != page->crc) {
+		SPDK_ERRLOG("Metadata page %d crc mismatch\n", ctx->num_pages);
+		_spdk_blob_load_final(ctx, -EINVAL);
+		return;
+	}
+
+	if (page->next != SPDK_INVALID_MD_PAGE) {
+		uint32_t next_page = page->next;
+		uint64_t next_lba = _spdk_bs_md_page_to_lba(blob->bs, next_page);
+
+		/* Read the next page */
+		ctx->num_pages++;
+		ctx->pages = spdk_realloc(ctx->pages, (sizeof(*page) * ctx->num_pages),
+					  sizeof(*page));
+		if (ctx->pages == NULL) {
+			_spdk_blob_load_final(ctx, -ENOMEM);
+			return;
+		}
+
+		spdk_bs_sequence_read_dev(seq, &ctx->pages[ctx->num_pages - 1],
+					  next_lba,
+					  _spdk_bs_byte_to_lba(blob->bs, sizeof(*page)),
+					  _spdk_blob_load_cpl, ctx);
+		return;
+	}
+
+	/* Parse the pages */
+	rc = _spdk_blob_parse(ctx->pages, ctx->num_pages, blob);
+	if (rc) {
+		_spdk_blob_load_final(ctx, rc);
+		return;
+	}
+
+	_spdk_blob_load_backing_dev(ctx);
 }
 
 /* Load a blob from disk given a blobid */
@@ -1083,9 +1067,10 @@ _spdk_blob_load(spdk_bs_sequence_t *seq, struct spdk_blob *blob,
 	ctx->num_pages = 1;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
+	ctx->seq = seq;
 
 	page_num = _spdk_bs_blobid_to_page(blob->id);
-	lba = _spdk_bs_page_to_lba(blob->bs, bs->md_start + page_num);
+	lba = _spdk_bs_md_page_to_lba(blob->bs, page_num);
 
 	blob->state = SPDK_BLOB_STATE_LOADING;
 
@@ -1169,7 +1154,7 @@ _spdk_blob_persist_clear_clusters_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int
 		void *tmp;
 
 		/* scan-build really can't figure reallocs, workaround it */
-		tmp = realloc(blob->active.clusters, sizeof(uint64_t) * blob->active.num_clusters);
+		tmp = realloc(blob->active.clusters, sizeof(*blob->active.clusters) * blob->active.num_clusters);
 		assert(tmp != NULL);
 		blob->active.clusters = tmp;
 #endif
@@ -1280,7 +1265,7 @@ _spdk_blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 	 * so any pages in the clean list must be zeroed.
 	 */
 	for (i = 1; i < blob->clean.num_pages; i++) {
-		lba = _spdk_bs_page_to_lba(bs, bs->md_start + blob->clean.pages[i]);
+		lba = _spdk_bs_md_page_to_lba(bs, blob->clean.pages[i]);
 
 		spdk_bs_batch_write_zeroes_dev(batch, lba, lba_count);
 	}
@@ -1291,7 +1276,7 @@ _spdk_blob_persist_zero_pages(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno
 
 		/* The first page in the metadata goes where the blobid indicates */
 		page_num = _spdk_bs_blobid_to_page(blob->id);
-		lba = _spdk_bs_page_to_lba(bs, bs->md_start + page_num);
+		lba = _spdk_bs_md_page_to_lba(bs, page_num);
 
 		spdk_bs_batch_write_zeroes_dev(batch, lba, lba_count);
 	}
@@ -1319,7 +1304,7 @@ _spdk_blob_persist_write_page_root(spdk_bs_sequence_t *seq, void *cb_arg, int bs
 
 	page = &ctx->pages[0];
 	/* The first page in the metadata goes where the blobid indicates */
-	lba = _spdk_bs_page_to_lba(bs, bs->md_start + _spdk_bs_blobid_to_page(blob->id));
+	lba = _spdk_bs_md_page_to_lba(bs, _spdk_bs_blobid_to_page(blob->id));
 
 	spdk_bs_sequence_write_dev(seq, page, lba, lba_count,
 				   _spdk_blob_persist_zero_pages, ctx);
@@ -1352,7 +1337,7 @@ _spdk_blob_persist_write_page_chain(spdk_bs_sequence_t *seq, void *cb_arg, int b
 		page = &ctx->pages[i];
 		assert(page->sequence_num == i);
 
-		lba = _spdk_bs_page_to_lba(bs, bs->md_start + blob->active.pages[i]);
+		lba = _spdk_bs_md_page_to_lba(bs, blob->active.pages[i]);
 
 		spdk_bs_batch_write_dev(batch, page, lba, lba_count);
 	}
@@ -1408,12 +1393,12 @@ _spdk_blob_resize(struct spdk_blob *blob, uint64_t sz)
 		/* Expand the cluster array if necessary.
 		 * We only shrink the array when persisting.
 		 */
-		tmp = realloc(blob->active.clusters, sizeof(uint64_t) * sz);
+		tmp = realloc(blob->active.clusters, sizeof(*blob->active.clusters) * sz);
 		if (sz > 0 && tmp == NULL) {
 			return -ENOMEM;
 		}
 		memset(tmp + blob->active.cluster_array_size, 0,
-		       sizeof(uint64_t) * (sz - blob->active.cluster_array_size));
+		       sizeof(*blob->active.clusters) * (sz - blob->active.cluster_array_size));
 		blob->active.clusters = tmp;
 		blob->active.cluster_array_size = sz;
 	}
@@ -3204,7 +3189,7 @@ _spdk_bs_load_replay_cur_md_page(spdk_bs_sequence_t *seq, void *cb_arg)
 	uint64_t lba;
 
 	assert(ctx->cur_page < ctx->super->md_len);
-	lba = _spdk_bs_page_to_lba(ctx->bs, ctx->super->md_start + ctx->cur_page);
+	lba = _spdk_bs_md_page_to_lba(ctx->bs, ctx->cur_page);
 	spdk_bs_sequence_read_dev(seq, ctx->page, lba,
 				  _spdk_bs_byte_to_lba(ctx->bs, SPDK_BS_PAGE_SIZE),
 				  _spdk_bs_load_replay_md_cpl, ctx);
@@ -4653,10 +4638,9 @@ _spdk_bs_snapshot_newblob_open_cpl(void *cb_arg, struct spdk_blob *_blob, int bs
 	}
 
 	ctx->new.blob = newblob;
-
-	/* Zero out newblob cluster map */
-	memset(newblob->active.clusters, 0,
-	       newblob->active.num_clusters * sizeof(newblob->active.clusters));
+	assert(spdk_blob_is_thin_provisioned(newblob));
+	assert(spdk_mem_all_zero(newblob->active.clusters,
+				 newblob->active.num_clusters * sizeof(*newblob->active.clusters)));
 
 	_spdk_blob_freeze_io(origblob, _spdk_bs_snapshot_freeze_cpl, ctx);
 }
@@ -5681,8 +5665,8 @@ _spdk_bs_open_blob_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 {
 	struct spdk_blob *blob = cb_arg;
 
-	/* If the blob have crc error, we just return NULL. */
-	if (blob == NULL) {
+	if (bserrno != 0) {
+		_spdk_blob_free(blob);
 		seq->cpl.u.blob_handle.blob = NULL;
 		spdk_bs_sequence_finish(seq, bserrno);
 		return;

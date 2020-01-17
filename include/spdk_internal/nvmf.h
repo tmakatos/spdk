@@ -31,40 +31,23 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef FTL_ANM_H
-#define FTL_ANM_H
+#ifndef SPDK_NVMF_INTERNAL_H_
+#define SPDK_NVMF_INTERNAL_H_
 
-#include "spdk/thread.h"
-#include "ftl_ppa.h"
+#include "spdk/stdinc.h"
+#include "spdk/nvmf.h"
 
-struct ftl_nvme_ctrlr;
-struct ftl_anm_event;
-struct spdk_ftl_dev;
+typedef enum _spdk_nvmf_request_exec_status {
+	SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE,
+	SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS,
+} spdk_nvmf_request_exec_status;
 
-typedef void (*ftl_anm_fn)(struct ftl_anm_event *event);
+int spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr,
+				   struct spdk_nvme_ctrlr_data *cdata);
 
-enum ftl_anm_range {
-	FTL_ANM_RANGE_LBK,
-	FTL_ANM_RANGE_CHK,
-	FTL_ANM_RANGE_PU,
-	FTL_ANM_RANGE_MAX,
-};
+int spdk_nvmf_ctrlr_identify_ns(struct spdk_nvmf_ctrlr *ctrlr,
+				struct spdk_nvme_cmd *cmd,
+				struct spdk_nvme_cpl *rsp,
+				struct spdk_nvme_ns_data *nsdata);
 
-struct ftl_anm_event {
-	/* Owner device */
-	struct spdk_ftl_dev		*dev;
-
-	/* Start PPA */
-	struct ftl_ppa			ppa;
-
-	/* Number of logical blocks */
-	size_t				num_lbks;
-};
-
-int	ftl_anm_init(struct spdk_thread *thread, spdk_ftl_fn cb, void *cb_arg);
-int	ftl_anm_free(spdk_ftl_fn cb, void *cb_arg);
-int	ftl_anm_register_device(struct spdk_ftl_dev *dev, ftl_anm_fn fn);
-int	ftl_anm_unregister_device(struct spdk_ftl_dev *dev, spdk_ftl_fn cb);
-void	ftl_anm_event_complete(struct ftl_anm_event *event);
-
-#endif /* FTL_ANM_H */
+#endif /* SPDK_NVMF_INTERNAL_H_ */

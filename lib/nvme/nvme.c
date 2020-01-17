@@ -1,8 +1,8 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (c) Intel Corporation.
- *   All rights reserved.
+ *   Copyright (c) Intel Corporation. All rights reserved.
+ *   Copyright (c) 2020 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -103,7 +103,9 @@ nvme_completion_poll_cb(void *arg, const struct spdk_nvme_cpl *cpl)
  * \param status completion status
  * \param robust_mutex optional robust mutex to lock while polling qpair
  *
- * \return 0 if command completed without error, negative errno on failure
+ * \return 0 if command completed without error,
+ * -EIO if command completed with error,
+ * -ECANCELED if command is not completed due to transport/device error
  *
  * The command to wait upon must be submitted with nvme_completion_poll_cb as the callback
  * and status as the callback argument.
@@ -116,20 +118,23 @@ spdk_nvme_wait_for_completion_robust_lock(
 {
 	memset(&status->cpl, 0, sizeof(status->cpl));
 	status->done = false;
+	int rc;
 
 	while (status->done == false) {
 		if (robust_mutex) {
 			nvme_robust_mutex_lock(robust_mutex);
 		}
 
-		if (spdk_nvme_qpair_process_completions(qpair, 0) < 0) {
-			status->done = true;
-			status->cpl.status.sct = SPDK_NVME_SCT_GENERIC;
-			status->cpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
-		}
+		rc = spdk_nvme_qpair_process_completions(qpair, 0);
 
 		if (robust_mutex) {
 			nvme_robust_mutex_unlock(robust_mutex);
+		}
+
+		if (rc < 0) {
+			status->cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			status->cpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
+			return -ECANCELED;
 		}
 	}
 
@@ -143,12 +148,27 @@ spdk_nvme_wait_for_completion(struct spdk_nvme_qpair *qpair,
 	return spdk_nvme_wait_for_completion_robust_lock(qpair, status, NULL);
 }
 
+/**
+ * Poll qpair for completions until a command completes.
+ *
+ * \param qpair queue to poll
+ * \param status completion status
+ * \param timeout_in_secs optional timeout
+ *
+ * \return 0 if command completed without error,
+ * -EIO if command completed with error,
+ * -ECANCELED if command is not completed due to transport/device error or time expired
+ *
+ * The command to wait upon must be submitted with nvme_completion_poll_cb as the callback
+ * and status as the callback argument.
+ */
 int
 spdk_nvme_wait_for_completion_timeout(struct spdk_nvme_qpair *qpair,
 				      struct nvme_completion_poll_status *status,
 				      uint64_t timeout_in_secs)
 {
 	uint64_t timeout_tsc = 0;
+	int rc = 0;
 
 	memset(&status->cpl, 0, sizeof(status->cpl));
 	status->done = false;
@@ -157,14 +177,20 @@ spdk_nvme_wait_for_completion_timeout(struct spdk_nvme_qpair *qpair,
 	}
 
 	while (status->done == false) {
-		spdk_nvme_qpair_process_completions(qpair, 0);
+		rc = spdk_nvme_qpair_process_completions(qpair, 0);
+
+		if (rc < 0) {
+			status->cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			status->cpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;
+			break;
+		}
 		if (timeout_tsc && spdk_get_ticks() > timeout_tsc) {
 			break;
 		}
 	}
 
-	if (status->done == false) {
-		return -EIO;
+	if (status->done == false || rc < 0) {
+		return -ECANCELED;
 	}
 
 	return spdk_nvme_cpl_is_error(&status->cpl) ? -EIO : 0;
@@ -558,7 +584,7 @@ spdk_nvme_probe_internal(struct spdk_nvme_probe_ctx *probe_ctx,
 	int rc;
 	struct spdk_nvme_ctrlr *ctrlr, *ctrlr_tmp;
 
-	if (!spdk_nvme_transport_available(probe_ctx->trid.trtype)) {
+	if (!spdk_nvme_transport_available_by_name(probe_ctx->trid.trstring)) {
 		SPDK_ERRLOG("NVMe trtype %u not available\n", probe_ctx->trid.trtype);
 		return -1;
 	}
@@ -637,7 +663,7 @@ spdk_nvme_probe(const struct spdk_nvme_transport_id *trid, void *cb_ctx,
 
 	if (trid == NULL) {
 		memset(&trid_pcie, 0, sizeof(trid_pcie));
-		trid_pcie.trtype = SPDK_NVME_TRANSPORT_PCIE;
+		spdk_nvme_trid_populate_transport(&trid_pcie, SPDK_NVME_TRANSPORT_PCIE);
 		trid = &trid_pcie;
 	}
 
@@ -701,6 +727,60 @@ spdk_nvme_connect(const struct spdk_nvme_transport_id *trid,
 	return ctrlr;
 }
 
+void
+spdk_nvme_trid_populate_transport(struct spdk_nvme_transport_id *trid,
+				  enum spdk_nvme_transport_type trtype)
+{
+	const char *trstring;
+
+	trid->trtype = trtype;
+	switch (trtype) {
+	case SPDK_NVME_TRANSPORT_FC:
+		trstring = SPDK_NVME_TRANSPORT_NAME_FC;
+		break;
+	case SPDK_NVME_TRANSPORT_PCIE:
+		trstring = SPDK_NVME_TRANSPORT_NAME_PCIE;
+		break;
+	case SPDK_NVME_TRANSPORT_RDMA:
+		trstring = SPDK_NVME_TRANSPORT_NAME_RDMA;
+		break;
+	case SPDK_NVME_TRANSPORT_TCP:
+		trstring = SPDK_NVME_TRANSPORT_NAME_TCP;
+		break;
+	case SPDK_NVME_TRANSPORT_CUSTOM:
+	default:
+		SPDK_ERRLOG("don't use this for custom transports\n");
+		break;
+	}
+	snprintf(trid->trstring, SPDK_NVMF_TRSTRING_MAX_LEN, "%s", trstring);
+}
+
+int
+spdk_nvme_transport_id_populate_trstring(struct spdk_nvme_transport_id *trid, const char *trstring)
+{
+	int len, i, rc;
+
+	if (trstring == NULL) {
+		return -EINVAL;
+	}
+
+	len = strnlen(trstring, SPDK_NVMF_TRSTRING_MAX_LEN);
+	if (len == SPDK_NVMF_TRSTRING_MAX_LEN) {
+		return -EINVAL;
+	}
+
+	rc = snprintf(trid->trstring, SPDK_NVMF_TRSTRING_MAX_LEN, "%s", trstring);
+	if (rc < 0) {
+		return rc;
+	}
+
+	/* cast official trstring to uppercase version of input. */
+	for (i = 0; i < len; i++) {
+		trid->trstring[i] = toupper(trid->trstring[i]);
+	}
+	return 0;
+}
+
 int
 spdk_nvme_transport_id_parse_trtype(enum spdk_nvme_transport_type *trtype, const char *str)
 {
@@ -719,7 +799,7 @@ spdk_nvme_transport_id_parse_trtype(enum spdk_nvme_transport_type *trtype, const
 	} else if (strcasecmp(str, "MUSER") == 0) {
 		*trtype = SPDK_NVME_TRANSPORT_MUSER;
 	} else {
-		return -ENOENT;
+		*trtype = SPDK_NVME_TRANSPORT_CUSTOM;
 	}
 	return 0;
 }
@@ -857,6 +937,10 @@ spdk_nvme_transport_id_parse(struct spdk_nvme_transport_id *trid, const char *st
 		}
 
 		if (strcasecmp(key, "trtype") == 0) {
+			if (spdk_nvme_transport_id_populate_trstring(trid, val) != 0) {
+				SPDK_ERRLOG("invalid transport '%s'\n", val);
+				return -EINVAL;
+			}
 			if (spdk_nvme_transport_id_parse_trtype(&trid->trtype, val) != 0) {
 				SPDK_ERRLOG("Unknown trtype '%s'\n", val);
 				return -EINVAL;
@@ -988,7 +1072,12 @@ spdk_nvme_transport_id_compare(const struct spdk_nvme_transport_id *trid1,
 {
 	int cmp;
 
-	cmp = cmp_int(trid1->trtype, trid2->trtype);
+	if (trid1->trtype == SPDK_NVME_TRANSPORT_CUSTOM) {
+		cmp = strcasecmp(trid1->trstring, trid2->trstring);
+	} else {
+		cmp = cmp_int(trid1->trtype, trid2->trtype);
+	}
+
 	if (cmp) {
 		return cmp;
 	}

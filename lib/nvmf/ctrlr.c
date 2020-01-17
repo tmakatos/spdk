@@ -45,6 +45,7 @@
 #include "spdk/util.h"
 #include "spdk/version.h"
 
+#include "spdk_internal/nvmf.h"
 #include "spdk_internal/log.h"
 
 #define MIN_KEEP_ALIVE_TIMEOUT_IN_MS 10000
@@ -660,7 +661,7 @@ nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint64_t value)
 			ctrlr->vcprop.csts.bits.rdy = 1;
 		} else {
 			SPDK_ERRLOG("CC.EN transition from 1 to 0 (reset) not implemented!\n");
-
+			return false;
 		}
 		diff.bits.en = 0;
 	}
@@ -696,6 +697,21 @@ nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint64_t value)
 			      cc.bits.iocqes, 1u << cc.bits.iocqes);
 		ctrlr->vcprop.cc.bits.iocqes = cc.bits.iocqes;
 		diff.bits.iocqes = 0;
+	}
+
+	if (diff.bits.ams) {
+		SPDK_ERRLOG("Arbitration Mechanism Selected (AMS) 0x%x not supported!\n", cc.bits.ams);
+		return false;
+	}
+
+	if (diff.bits.mps) {
+		SPDK_ERRLOG("Memory Page Size (MPS) %u KiB not supported!\n", (1 << (2 + cc.bits.mps)));
+		return false;
+	}
+
+	if (diff.bits.css) {
+		SPDK_ERRLOG("I/O Command Set Selected (CSS) 0x%x not supported!\n", cc.bits.css);
+		return false;
 	}
 
 	if (diff.raw != 0) {
@@ -1510,7 +1526,7 @@ invalid_log_page:
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
-static int
+int
 spdk_nvmf_ctrlr_identify_ns(struct spdk_nvmf_ctrlr *ctrlr,
 			    struct spdk_nvme_cmd *cmd,
 			    struct spdk_nvme_cpl *rsp,
@@ -1552,7 +1568,7 @@ spdk_nvmf_ctrlr_identify_ns(struct spdk_nvmf_ctrlr *ctrlr,
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
-static int
+int
 spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_ctrlr_data *cdata)
 {
 	struct spdk_nvmf_subsystem *subsystem = ctrlr->subsys;
@@ -1928,9 +1944,20 @@ spdk_nvmf_ctrlr_get_features(struct spdk_nvmf_request *req)
 static int
 spdk_nvmf_ctrlr_set_features(struct spdk_nvmf_request *req)
 {
-	uint8_t feature;
+	uint8_t feature, save;
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
+
+	/*
+	 * Features are not saveable by the controller as indicated by
+	 * ONCS field of the Identify Controller data.
+	 * */
+	save = cmd->cdw10_bits.set_features.sv;
+	if (save) {
+		response->status.sc = SPDK_NVME_SC_FEATURE_ID_NOT_SAVEABLE;
+		response->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
 
 	feature = cmd->cdw10_bits.set_features.fid;
 	switch (feature) {
@@ -2492,9 +2519,8 @@ spdk_nvmf_request_complete(struct spdk_nvmf_request *req)
 	}
 
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF,
-		      "cpl: cid=%u cdw0=0x%08x rsvd1=%u status=0x%04x\n",
-		      rsp->cid, rsp->cdw0, rsp->rsvd1,
-		      *(uint16_t *)&rsp->status);
+		      "cpl: cdw0=0x%08x sct=0x%01x sc=0x%02x cid=0x%04x\n",
+		      rsp->cdw0, rsp->status.sct, rsp->status.sc, rsp->cid);
 
 	TAILQ_REMOVE(&qpair->outstanding, req, link);
 	if (spdk_nvmf_transport_req_complete(req)) {

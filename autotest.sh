@@ -96,6 +96,7 @@ if [ $(uname -s) = Linux ]; then
 	# automatic grabbing these devices when we add device/vendor ID to
 	# proper driver.
 	if [[ -n "$PCI_BLACKLIST" ]]; then
+		# shellcheck disable=SC2097,SC2098
 		PCI_WHITELIST="$PCI_BLACKLIST" \
 		PCI_BLACKLIST="" \
 		DRIVER_OVERRIDE="pci-stub" \
@@ -145,7 +146,6 @@ fi
 
 if [ $SPDK_TEST_UNITTEST -eq 1 ]; then
 	run_test "unittest" ./test/unit/unittest.sh
-	report_test_completion "unittest"
 fi
 
 
@@ -213,8 +213,21 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 	fi
 
 	if [ $SPDK_TEST_NVMF -eq 1 ]; then
-		run_test "nvmf" ./test/nvmf/nvmf.sh --transport=$SPDK_TEST_NVMF_TRANSPORT
-		run_test "spdkcli_nvmf" ./test/spdkcli/nvmf.sh
+		# The NVMe-oF run test cases are split out like this so that the parser that compiles the
+		# list of all tests can properly differentiate them. Please do not merge them into one line.
+		if [ "$SPDK_TEST_NVMF_TRANSPORT" = "rdma" ]; then
+			run_test "nvmf_rdma" ./test/nvmf/nvmf.sh --transport=$SPDK_TEST_NVMF_TRANSPORT
+			run_test "spdkcli_nvmf_rdma" ./test/spdkcli/nvmf.sh
+		elif [ "$SPDK_TEST_NVMF_TRANSPORT" = "tcp" ]; then
+			run_test "nvmf_tcp" ./test/nvmf/nvmf.sh --transport=$SPDK_TEST_NVMF_TRANSPORT
+			run_test "spdkcli_nvmf_tcp" ./test/spdkcli/nvmf.sh
+		elif [ "$SPDK_TEST_NVMF_TRANSPORT" = "fc" ]; then
+				run_test "nvmf_fc" ./test/nvmf/nvmf.sh --transport=$SPDK_TEST_NVMF_TRANSPORT
+				run_test "spdkcli_nvmf_fc" ./test/spdkcli/nvmf.sh
+		else
+			echo "unknown NVMe transport, please specify rdma, tcp, or fc."
+			exit 1
+		fi
 	fi
 
 	if [ $SPDK_TEST_VHOST -eq 1 ]; then
@@ -222,10 +235,10 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 	fi
 
 	if [ $SPDK_TEST_LVOL -eq 1 ]; then
+		#TODO: rewrite lvol tests in bash.
 		run_test "lvol" ./test/lvol/lvol.sh --test-cases=all
 		run_test "lvol2" ./test/lvol/lvol2.sh
 		run_test "blob_io_wait" ./test/blobstore/blob_io_wait/blob_io_wait.sh
-		report_test_completion "lvol"
 	fi
 
 	if [ $SPDK_TEST_VHOST_INIT -eq 1 ]; then
@@ -234,7 +247,6 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 		run_test "spdkcli_virtio" ./test/spdkcli/virtio.sh
 		run_test "vhost_shared" ./test/vhost/shared/shared.sh
 		run_test "vhost_fuzz" ./test/vhost/fuzz/fuzz.sh
-		report_test_completion "vhost initiator"
 		timing_exit vhost_initiator
 	fi
 

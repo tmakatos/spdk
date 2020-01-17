@@ -884,20 +884,16 @@ def bdev_split_delete(client, base_bdev):
 
 
 @deprecated_alias('construct_ftl_bdev')
-def bdev_ftl_create(client, name, trtype, traddr, punits, **kwargs):
+def bdev_ftl_create(client, name, base_bdev, **kwargs):
     """Construct FTL bdev
 
     Args:
         name: name of the bdev
-        trtype: transport type
-        traddr: transport address
-        punit: parallel unit range
+        base_bdev: name of the base bdev
         kwargs: optional parameters
     """
     params = {'name': name,
-              'trtype': trtype,
-              'traddr': traddr,
-              'punits': punits}
+              'base_bdev': base_bdev}
     for key, value in kwargs.items():
         if value is not None:
             params[key] = value

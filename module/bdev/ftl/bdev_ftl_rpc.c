@@ -41,9 +41,7 @@
 
 struct rpc_bdev_ftl_create {
 	char *name;
-	char *trtype;
-	char *traddr;
-	char *punits;
+	char *base_bdev;
 	char *uuid;
 	char *cache_bdev;
 	struct spdk_ftl_conf ftl_conf;
@@ -53,18 +51,14 @@ static void
 free_rpc_bdev_ftl_create(struct rpc_bdev_ftl_create *req)
 {
 	free(req->name);
-	free(req->trtype);
-	free(req->traddr);
-	free(req->punits);
+	free(req->base_bdev);
 	free(req->uuid);
 	free(req->cache_bdev);
 }
 
 static const struct spdk_json_object_decoder rpc_bdev_ftl_create_decoders[] = {
 	{"name", offsetof(struct rpc_bdev_ftl_create, name), spdk_json_decode_string},
-	{"trtype", offsetof(struct rpc_bdev_ftl_create, trtype), spdk_json_decode_string},
-	{"traddr", offsetof(struct rpc_bdev_ftl_create, traddr), spdk_json_decode_string},
-	{"punits", offsetof(struct rpc_bdev_ftl_create, punits), spdk_json_decode_string},
+	{"base_bdev", offsetof(struct rpc_bdev_ftl_create, base_bdev), spdk_json_decode_string},
 	{"uuid", offsetof(struct rpc_bdev_ftl_create, uuid), spdk_json_decode_string, true},
 	{"cache", offsetof(struct rpc_bdev_ftl_create, cache_bdev), spdk_json_decode_string, true},
 	{
@@ -125,8 +119,6 @@ static const struct spdk_json_object_decoder rpc_bdev_ftl_create_decoders[] = {
 	},
 };
 
-#define FTL_RANGE_MAX_LENGTH 32
-
 static void
 _spdk_rpc_bdev_ftl_create_cb(const struct ftl_bdev_info *bdev_info, void *ctx, int status)
 {
@@ -156,7 +148,7 @@ spdk_rpc_bdev_ftl_create(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_bdev_ftl_create req = {};
 	struct ftl_bdev_init_opts opts = {};
-	char range[FTL_RANGE_MAX_LENGTH];
+	struct spdk_json_write_ctx *w;
 	int rc;
 
 	spdk_ftl_conf_init_defaults(&req.ftl_conf);
@@ -177,35 +169,9 @@ spdk_rpc_bdev_ftl_create(struct spdk_jsonrpc_request *request,
 
 	opts.name = req.name;
 	opts.mode = SPDK_FTL_MODE_CREATE;
+	opts.base_bdev = req.base_bdev;
 	opts.cache_bdev = req.cache_bdev;
 	opts.ftl_conf = req.ftl_conf;
-
-	/* Parse trtype */
-	rc = spdk_nvme_transport_id_parse_trtype(&opts.trid.trtype, req.trtype);
-	if (rc) {
-		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						     "Failed to parse trtype: %s, rc: %s",
-						     req.trtype, spdk_strerror(-rc));
-		goto invalid;
-	}
-
-	if (opts.trid.trtype != SPDK_NVME_TRANSPORT_PCIE) {
-		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						     "Invalid trtype: %s. Only PCIe is supported",
-						     req.trtype);
-		goto invalid;
-	}
-
-	/* Parse traddr */
-	snprintf(opts.trid.traddr, sizeof(opts.trid.traddr), "%s", req.traddr);
-	snprintf(range, sizeof(range), "%s", req.punits);
-
-	if (bdev_ftl_parse_punits(&opts.range, req.punits)) {
-		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						     "Failed to parse parallel unit range: %s",
-						     req.punits);
-		goto invalid;
-	}
 
 	if (req.uuid) {
 		if (spdk_uuid_parse(&opts.uuid, req.uuid) < 0) {
@@ -220,11 +186,17 @@ spdk_rpc_bdev_ftl_create(struct spdk_jsonrpc_request *request,
 		}
 	}
 
-	rc = bdev_ftl_init_bdev(&opts, _spdk_rpc_bdev_ftl_create_cb, request);
+	rc = bdev_ftl_create_bdev(&opts, _spdk_rpc_bdev_ftl_create_cb, request);
 	if (rc) {
-		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-						     "Failed to create FTL bdev: %s",
-						     spdk_strerror(-rc));
+		if (rc == -ENODEV) {
+			w = spdk_jsonrpc_begin_result(request);
+			spdk_json_write_string_fmt(w, "FTL bdev: %s creation deferred", req.name);
+			spdk_jsonrpc_end_result(request, w);
+		} else {
+			spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
+							     "Failed to create FTL bdev: %s",
+							     spdk_strerror(-rc));
+		}
 		goto invalid;
 	}
 

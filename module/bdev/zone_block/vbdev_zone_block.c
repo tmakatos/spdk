@@ -37,6 +37,7 @@
 
 #include "spdk/config.h"
 #include "spdk/nvme.h"
+#include "spdk/bdev_zone.h"
 
 #include "spdk_internal/log.h"
 
@@ -70,11 +71,18 @@ struct bdev_zone_block_config {
 };
 static TAILQ_HEAD(, bdev_zone_block_config) g_bdev_configs = TAILQ_HEAD_INITIALIZER(g_bdev_configs);
 
+struct block_zone {
+	struct spdk_bdev_zone_info zone_info;
+};
+
 /* List of block vbdevs and associated info for each. */
 struct bdev_zone_block {
 	struct spdk_bdev		bdev;    /* the block zoned bdev */
 	struct spdk_bdev_desc		*base_desc; /* its descriptor we get from open */
+	struct block_zone		*zones; /* array of zones */
+	uint64_t			num_zones; /* number of zones */
 	uint64_t			zone_capacity; /* zone capacity */
+	uint64_t                        zone_shift; /* log2 of zone_size */
 	TAILQ_ENTRY(bdev_zone_block)	link;
 };
 static TAILQ_HEAD(, bdev_zone_block) g_bdev_nodes = TAILQ_HEAD_INITIALIZER(g_bdev_nodes);
@@ -148,6 +156,7 @@ _device_unregister_cb(void *io_device)
 	struct bdev_zone_block *bdev_node  = io_device;
 
 	free(bdev_node->bdev.name);
+	free(bdev_node->zones);
 	free(bdev_node);
 }
 
@@ -170,16 +179,83 @@ zone_block_destruct(void *ctx)
 	return 0;
 }
 
+static struct block_zone *
+zone_block_get_zone_by_slba(struct bdev_zone_block *bdev_node, uint64_t start_lba)
+{
+	struct block_zone *zone = NULL;
+	size_t index = start_lba >> bdev_node->zone_shift;
+
+	if (index >= bdev_node->num_zones) {
+		return NULL;
+	}
+
+	zone = &bdev_node->zones[index];
+	if (zone->zone_info.zone_id == start_lba) {
+		return zone;
+	} else {
+		return NULL;
+	}
+}
+
+static int
+zone_block_get_zone_info(struct bdev_zone_block *bdev_node, struct spdk_bdev_io *bdev_io)
+{
+	struct block_zone *zone;
+	struct spdk_bdev_zone_info *zone_info = bdev_io->u.zone_mgmt.buf;
+	uint64_t zone_id = bdev_io->u.zone_mgmt.zone_id;
+	size_t i;
+
+	/* User can request info for more zones than exist, need to check both internal and user
+	 * boundaries
+	 */
+	for (i = 0; i < bdev_io->u.zone_mgmt.num_zones; i++, zone_id += bdev_node->bdev.zone_size) {
+		zone = zone_block_get_zone_by_slba(bdev_node, zone_id);
+		if (!zone) {
+			return -EINVAL;
+		}
+		memcpy(&zone_info[i], &zone->zone_info, sizeof(*zone_info));
+	}
+
+	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	return 0;
+}
+
 static void
 zone_block_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-	spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	struct bdev_zone_block *bdev_node = SPDK_CONTAINEROF(bdev_io->bdev, struct bdev_zone_block, bdev);
+	int rc = 0;
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_GET_ZONE_INFO:
+		rc = zone_block_get_zone_info(bdev_node, bdev_io);
+		break;
+	default:
+		SPDK_ERRLOG("vbdev_block: unknown I/O type %u\n", bdev_io->type);
+		rc = -ENOTSUP;
+		break;
+	}
+
+	if (rc != 0) {
+		if (rc == -ENOMEM) {
+			SPDK_WARNLOG("ENOMEM, start to queue io for vbdev.\n");
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
+		} else {
+			SPDK_ERRLOG("ERROR on bdev_io submission!\n");
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		}
+	}
 }
 
 static bool
 zone_block_io_type_supported(void *ctx, enum spdk_bdev_io_type io_type)
 {
-	return false;
+	switch (io_type) {
+	case SPDK_BDEV_IO_TYPE_ZONE_MANAGEMENT:
+		return true;
+	default:
+		return false;
+	}
 }
 
 static struct spdk_io_channel *
@@ -297,11 +373,27 @@ zone_block_insert_name(const char *bdev_name, const char *vbdev_name, uint64_t z
 	return 0;
 }
 
+static void
+zone_block_init_zone_info(struct bdev_zone_block *bdev_node)
+{
+	size_t i;
+	struct block_zone *zone;
+
+	for (i = 0; i < bdev_node->num_zones; i++) {
+		zone = &bdev_node->zones[i];
+		zone->zone_info.zone_id = bdev_node->bdev.zone_size * i;
+		zone->zone_info.capacity = bdev_node->zone_capacity;
+		zone->zone_info.write_pointer = zone->zone_info.zone_id + zone->zone_info.capacity;
+		zone->zone_info.state = SPDK_BDEV_ZONE_STATE_FULL;
+	}
+}
+
 static int
 zone_block_register(struct spdk_bdev *base_bdev)
 {
 	struct bdev_zone_block_config *name, *tmp;
 	struct bdev_zone_block *bdev_node;
+	uint64_t zone_size;
 	int rc = 0;
 
 	/* Check our list of names from config versus this bdev and if
@@ -332,14 +424,42 @@ zone_block_register(struct spdk_bdev *base_bdev)
 			SPDK_ERRLOG("could not allocate bdev_node name\n");
 			goto strdup_failed;
 		}
+
+		zone_size = spdk_align64pow2(name->zone_capacity);
+		if (zone_size == 0) {
+			rc = -EINVAL;
+			SPDK_ERRLOG("invalid zone size\n");
+			goto roundup_failed;
+		}
+
+		bdev_node->zone_shift = spdk_u64log2(zone_size);
+		bdev_node->num_zones = base_bdev->blockcnt / zone_size;
+
+		/* Align num_zones to optimal_open_zones */
+		bdev_node->num_zones -= bdev_node->num_zones % name->optimal_open_zones;
+		bdev_node->zones = calloc(bdev_node->num_zones, sizeof(struct block_zone));
+		if (!bdev_node->zones) {
+			rc = -ENOMEM;
+			SPDK_ERRLOG("could not allocate zones\n");
+			goto calloc_failed;
+		}
+
 		bdev_node->bdev.product_name = "zone_block";
 
 		/* Copy some properties from the underlying base bdev. */
 		bdev_node->bdev.write_cache = base_bdev->write_cache;
 		bdev_node->bdev.required_alignment = base_bdev->required_alignment;
 		bdev_node->bdev.optimal_io_boundary = base_bdev->optimal_io_boundary;
+
 		bdev_node->bdev.blocklen = base_bdev->blocklen;
-		bdev_node->bdev.blockcnt = base_bdev->blockcnt;
+		bdev_node->bdev.blockcnt = bdev_node->num_zones * zone_size;
+
+		if (bdev_node->num_zones * name->zone_capacity != base_bdev->blockcnt) {
+			SPDK_DEBUGLOG(SPDK_LOG_VBDEV_ZONE_BLOCK,
+				      "Lost %lu blocks due to zone capacity and base bdev size misalignment\n",
+				      base_bdev->blockcnt - bdev_node->num_zones * name->zone_capacity);
+		}
+
 		bdev_node->bdev.write_unit_size = base_bdev->write_unit_size;
 
 		bdev_node->bdev.md_interleave = base_bdev->md_interleave;
@@ -354,16 +474,13 @@ zone_block_register(struct spdk_bdev *base_bdev)
 		bdev_node->bdev.module = &bdev_zoned_if;
 
 		/* bdev specific info */
-		bdev_node->bdev.zone_size = spdk_align64pow2(name->zone_capacity);
-		if (bdev_node->bdev.zone_size == 0) {
-			rc = -EINVAL;
-			SPDK_ERRLOG("invalid zone size\n");
-			goto roundup_failed;
-		}
+		bdev_node->bdev.zone_size = zone_size;
 
 		bdev_node->zone_capacity = name->zone_capacity;
 		bdev_node->bdev.optimal_open_zones = name->optimal_open_zones;
 		bdev_node->bdev.max_open_zones = 0;
+		zone_block_init_zone_info(bdev_node);
+
 		TAILQ_INSERT_TAIL(&g_bdev_nodes, bdev_node, link);
 
 		spdk_io_device_register(bdev_node, _zone_block_ch_create_cb, _zone_block_ch_destroy_cb,
@@ -399,6 +516,8 @@ claim_failed:
 open_failed:
 	TAILQ_REMOVE(&g_bdev_nodes, bdev_node, link);
 	spdk_io_device_unregister(bdev_node, NULL);
+	free(bdev_node->zones);
+calloc_failed:
 roundup_failed:
 	free(bdev_node->bdev.name);
 strdup_failed:

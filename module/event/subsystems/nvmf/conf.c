@@ -435,7 +435,7 @@ spdk_nvmf_parse_subsystem(struct spdk_conf_section *sp)
 
 	/* Parse Listen sections */
 	for (i = 0; ; i++) {
-		struct spdk_nvme_transport_id trid = {0};
+		struct spdk_nvme_transport_id trid = {{0}};
 		const char *transport;
 		const char *address;
 		char *address_dup;
@@ -443,6 +443,11 @@ spdk_nvmf_parse_subsystem(struct spdk_conf_section *sp)
 		transport = spdk_conf_section_get_nmval(sp, "Listen", i, 0);
 		if (!transport) {
 			break;
+		}
+
+		if (spdk_nvme_transport_id_populate_trstring(&trid, transport)) {
+			SPDK_ERRLOG("Invalid listen address transport type '%s'\n", transport);
+			continue;
 		}
 
 		if (spdk_nvme_transport_id_parse_trtype(&trid.trtype, transport)) {
@@ -580,14 +585,14 @@ spdk_nvmf_parse_transport(struct spdk_nvmf_parse_transport_ctx *ctx)
 		return;
 	}
 
-	if (spdk_nvmf_tgt_get_transport(g_spdk_nvmf_tgt, trtype)) {
+	if (spdk_nvmf_tgt_get_transport(g_spdk_nvmf_tgt, type)) {
 		SPDK_ERRLOG("Duplicate transport type '%s'\n", type);
 		ctx->cb_fn(-1);
 		free(ctx);
 		return;
 	}
 
-	if (!spdk_nvmf_transport_opts_init(trtype, &opts)) {
+	if (!spdk_nvmf_transport_opts_init(type, &opts)) {
 		ctx->cb_fn(-1);
 		free(ctx);
 		return;
@@ -638,12 +643,17 @@ spdk_nvmf_parse_transport(struct spdk_nvmf_parse_transport_ctx *ctx)
 	if (trtype == SPDK_NVME_TRANSPORT_TCP) {
 		bval = spdk_conf_section_get_boolval(ctx->sp, "C2HSuccess", true);
 		opts.c2h_success = bval;
+
+		val = spdk_conf_section_get_intval(ctx->sp, "SockPriority");
+		if (val >= 0) {
+			opts.sock_priority = val;
+		}
 	}
 
 	bval = spdk_conf_section_get_boolval(ctx->sp, "DifInsertOrStrip", false);
 	opts.dif_insert_or_strip = bval;
 
-	transport = spdk_nvmf_transport_create(trtype, &opts);
+	transport = spdk_nvmf_transport_create(type, &opts);
 	if (transport) {
 		spdk_nvmf_tgt_add_transport(g_spdk_nvmf_tgt, transport, spdk_nvmf_tgt_add_transport_done, ctx);
 	} else {

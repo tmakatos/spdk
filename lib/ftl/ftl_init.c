@@ -43,7 +43,6 @@
 #include "spdk/bdev_zone.h"
 
 #include "ftl_core.h"
-#include "ftl_anm.h"
 #include "ftl_io.h"
 #include "ftl_reloc.h"
 #include "ftl_rwb.h"
@@ -53,14 +52,14 @@
 #define FTL_CORE_RING_SIZE	4096
 #define FTL_INIT_TIMEOUT	30
 #define FTL_NSID		1
+#define FTL_ZONE_INFO_COUNT	64
 
-#define ftl_range_intersect(s1, e1, s2, e2) \
-	((s1) <= (e2) && (s2) <= (e1))
-
-struct ftl_admin_cmpl {
-	struct spdk_nvme_cpl			status;
-
-	int					complete;
+struct ftl_dev_init_ctx {
+	struct spdk_ftl_dev		*dev;
+	struct spdk_ftl_dev_init_opts	opts;
+	struct spdk_io_channel		*ioch;
+	struct spdk_bdev_zone_info	info[FTL_ZONE_INFO_COUNT];
+	size_t				zone_id;
 };
 
 static STAILQ_HEAD(, spdk_ftl_dev)	g_ftl_queue = STAILQ_HEAD_INITIALIZER(g_ftl_queue);
@@ -76,9 +75,9 @@ static const struct spdk_ftl_conf	g_default_conf = {
 		/* 40 free bands / 100 % host writes - defrag starts running */
 		[SPDK_FTL_LIMIT_START] = { .thld = 40, .limit = 100 },
 	},
-	/* 10 percent valid lbks */
+	/* 10 percent valid blocks */
 	.invalid_thld = 10,
-	/* 20% spare lbks */
+	/* 20% spare blocks */
 	.lba_rsvd = 20,
 	/* 6M write buffer */
 	.rwb_size = 6 * 1024 * 1024,
@@ -107,23 +106,12 @@ static const struct spdk_ftl_conf	g_default_conf = {
 	}
 };
 
-static void ftl_dev_free_sync(struct spdk_ftl_dev *dev);
-
-static void
-ftl_admin_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
-{
-	struct ftl_admin_cmpl *cmpl = ctx;
-
-	cmpl->complete = 1;
-	cmpl->status = *cpl;
-}
-
 static int
 ftl_band_init_md(struct ftl_band *band)
 {
 	struct ftl_lba_map *lba_map = &band->lba_map;
 
-	lba_map->vld = spdk_bit_array_create(ftl_num_band_lbks(band->dev));
+	lba_map->vld = spdk_bit_array_create(ftl_get_num_blocks_in_band(band->dev));
 	if (!lba_map->vld) {
 		return -ENOMEM;
 	}
@@ -134,8 +122,7 @@ ftl_band_init_md(struct ftl_band *band)
 }
 
 static int
-ftl_check_conf(const struct spdk_ftl_conf *conf,
-	       const struct spdk_ocssd_geometry_data *geo)
+ftl_check_conf(const struct spdk_ftl_dev *dev, const struct spdk_ftl_conf *conf)
 {
 	size_t i;
 
@@ -154,7 +141,7 @@ ftl_check_conf(const struct spdk_ftl_conf *conf,
 	if (conf->rwb_size % FTL_BLOCK_SIZE != 0) {
 		return -1;
 	}
-	if (geo->ws_opt % conf->num_interleave_units != 0) {
+	if (dev->xfer_size % conf->num_interleave_units != 0) {
 		return -1;
 	}
 
@@ -168,162 +155,22 @@ ftl_check_conf(const struct spdk_ftl_conf *conf,
 }
 
 static int
-ftl_check_init_opts(const struct spdk_ftl_dev_init_opts *opts,
-		    const struct spdk_ocssd_geometry_data *geo)
-{
-	struct spdk_ftl_dev *dev;
-	size_t num_punits = geo->num_pu * geo->num_grp;
-	int rc = 0;
-
-	if (opts->range.begin > opts->range.end || opts->range.end >= num_punits) {
-		return -1;
-	}
-
-	if (ftl_check_conf(opts->conf, geo)) {
-		return -1;
-	}
-
-	pthread_mutex_lock(&g_ftl_queue_lock);
-
-	STAILQ_FOREACH(dev, &g_ftl_queue, stailq) {
-		if (spdk_nvme_transport_id_compare(&dev->trid, &opts->trid)) {
-			continue;
-		}
-
-		if (ftl_range_intersect(opts->range.begin, opts->range.end,
-					dev->range.begin, dev->range.end)) {
-			rc = -1;
-			goto out;
-		}
-	}
-
-out:
-	pthread_mutex_unlock(&g_ftl_queue_lock);
-	return rc;
-}
-
-int
-ftl_retrieve_chunk_info(struct spdk_ftl_dev *dev, struct ftl_ppa ppa,
-			struct spdk_ocssd_chunk_information_entry *info,
-			unsigned int num_entries)
-{
-	volatile struct ftl_admin_cmpl cmpl = {};
-	uint32_t nsid = spdk_nvme_ns_get_id(dev->ns);
-	uint64_t offset = (ppa.grp * dev->geo.num_pu + ppa.pu) *
-			  dev->geo.num_chk + ppa.chk;
-	int rc;
-
-	rc = spdk_nvme_ctrlr_cmd_get_log_page(dev->ctrlr, SPDK_OCSSD_LOG_CHUNK_INFO, nsid,
-					      info, num_entries * sizeof(*info),
-					      offset * sizeof(*info),
-					      ftl_admin_cb, (void *)&cmpl);
-	if (spdk_unlikely(rc != 0)) {
-		SPDK_ERRLOG("spdk_nvme_ctrlr_cmd_get_log_page: %s\n", spdk_strerror(-rc));
-		return -1;
-	}
-
-	while (!cmpl.complete) {
-		spdk_nvme_ctrlr_process_admin_completions(dev->ctrlr);
-	}
-
-	if (spdk_nvme_cpl_is_error(&cmpl.status)) {
-		SPDK_ERRLOG("Unexpected status code: [%d], status code type: [%d]\n",
-			    cmpl.status.status.sc, cmpl.status.status.sct);
-		return -1;
-	}
-
-	return 0;
-}
-
-static int
-ftl_retrieve_punit_chunk_info(struct spdk_ftl_dev *dev, const struct ftl_punit *punit,
-			      struct spdk_ocssd_chunk_information_entry *info)
-{
-	uint32_t i = 0;
-	unsigned int num_entries = FTL_BLOCK_SIZE / sizeof(*info);
-	struct ftl_ppa chunk_ppa = punit->start_ppa;
-	char ppa_buf[128];
-
-	for (i = 0; i < dev->geo.num_chk; i += num_entries, chunk_ppa.chk += num_entries) {
-		if (num_entries > dev->geo.num_chk - i) {
-			num_entries = dev->geo.num_chk - i;
-		}
-
-		if (ftl_retrieve_chunk_info(dev, chunk_ppa, &info[i], num_entries)) {
-			SPDK_ERRLOG("Failed to retrieve chunk information @ppa: %s\n",
-				    ftl_ppa2str(chunk_ppa, ppa_buf, sizeof(ppa_buf)));
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-static unsigned char
-ftl_get_zone_state(const struct spdk_ocssd_chunk_information_entry *info)
-{
-	if (info->cs.free) {
-		return SPDK_BDEV_ZONE_STATE_EMPTY;
-	}
-
-	if (info->cs.open) {
-		return SPDK_BDEV_ZONE_STATE_OPEN;
-	}
-
-	if (info->cs.closed) {
-		return SPDK_BDEV_ZONE_STATE_CLOSED;
-	}
-
-	if (info->cs.offline) {
-		return SPDK_BDEV_ZONE_STATE_OFFLINE;
-	}
-
-	assert(0 && "Invalid block state");
-	return SPDK_BDEV_ZONE_STATE_OFFLINE;
-}
-
-static void
-ftl_remove_empty_bands(struct spdk_ftl_dev *dev)
-{
-	struct ftl_band *band, *temp_band;
-
-	/* Remove band from shut_bands list to prevent further processing */
-	/* if all blocks on this band are bad */
-	LIST_FOREACH_SAFE(band, &dev->shut_bands, list_entry, temp_band) {
-		if (!band->num_zones) {
-			dev->num_bands--;
-			LIST_REMOVE(band, list_entry);
-		}
-	}
-}
-
-static int
 ftl_dev_init_bands(struct spdk_ftl_dev *dev)
 {
-	struct spdk_ocssd_chunk_information_entry	*info;
-	struct ftl_band					*band, *pband;
-	struct ftl_punit				*punit;
-	struct ftl_zone					*zone;
-	unsigned int					i, j;
-	char						buf[128];
-	int						rc = 0;
+	struct ftl_band *band, *pband;
+	unsigned int i;
+	int rc = 0;
 
 	LIST_INIT(&dev->free_bands);
 	LIST_INIT(&dev->shut_bands);
 
 	dev->num_free = 0;
-	dev->num_bands = ftl_dev_num_bands(dev);
-	dev->bands = calloc(ftl_dev_num_bands(dev), sizeof(*dev->bands));
+	dev->bands = calloc(ftl_get_num_bands(dev), sizeof(*dev->bands));
 	if (!dev->bands) {
 		return -1;
 	}
 
-	info = calloc(dev->geo.num_chk, sizeof(*info));
-	if (!info) {
-		return -1;
-	}
-
-	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
+	for (i = 0; i < ftl_get_num_bands(dev); ++i) {
 		band = &dev->bands[i];
 		band->id = i;
 		band->dev = dev;
@@ -337,164 +184,27 @@ ftl_dev_init_bands(struct spdk_ftl_dev *dev)
 		pband = band;
 
 		CIRCLEQ_INIT(&band->zones);
-		band->zone_buf = calloc(ftl_dev_num_punits(dev), sizeof(*band->zone_buf));
+		band->zone_buf = calloc(ftl_get_num_punits(dev), sizeof(*band->zone_buf));
 		if (!band->zone_buf) {
 			SPDK_ERRLOG("Failed to allocate block state table for band: [%u]\n", i);
 			rc = -1;
-			goto out;
+			break;
 		}
 
 		rc = ftl_band_init_md(band);
 		if (rc) {
 			SPDK_ERRLOG("Failed to initialize metadata structures for band [%u]\n", i);
-			goto out;
+			break;
 		}
 
-		band->reloc_bitmap = spdk_bit_array_create(ftl_dev_num_bands(dev));
+		band->reloc_bitmap = spdk_bit_array_create(ftl_get_num_bands(dev));
 		if (!band->reloc_bitmap) {
 			SPDK_ERRLOG("Failed to allocate band relocation bitmap\n");
-			goto out;
+			break;
 		}
 	}
 
-	for (i = 0; i < ftl_dev_num_punits(dev); ++i) {
-		punit = &dev->punits[i];
-
-		rc = ftl_retrieve_punit_chunk_info(dev, punit, info);
-		if (rc) {
-			SPDK_ERRLOG("Failed to retrieve bbt for @ppa: %s [%lu]\n",
-				    ftl_ppa2str(punit->start_ppa, buf, sizeof(buf)),
-				    ftl_ppa_addr_pack(dev, punit->start_ppa));
-			goto out;
-		}
-
-		for (j = 0; j < ftl_dev_num_bands(dev); ++j) {
-			band = &dev->bands[j];
-			zone = &band->zone_buf[i];
-			zone->pos = i;
-			zone->state = ftl_get_zone_state(&info[j]);
-			zone->punit = punit;
-			zone->start_ppa = punit->start_ppa;
-			zone->start_ppa.chk = band->id;
-			zone->write_offset = ftl_dev_lbks_in_zone(dev);
-
-			if (zone->state != SPDK_BDEV_ZONE_STATE_OFFLINE) {
-				band->num_zones++;
-				CIRCLEQ_INSERT_TAIL(&band->zones, zone, circleq);
-			}
-		}
-	}
-
-	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
-		band = &dev->bands[i];
-		band->tail_md_ppa = ftl_band_tail_md_ppa(band);
-	}
-
-	ftl_remove_empty_bands(dev);
-out:
-	free(info);
 	return rc;
-}
-
-static int
-ftl_dev_init_punits(struct spdk_ftl_dev *dev)
-{
-	unsigned int i, punit;
-
-	dev->punits = calloc(ftl_dev_num_punits(dev), sizeof(*dev->punits));
-	if (!dev->punits) {
-		return -1;
-	}
-
-	for (i = 0; i < ftl_dev_num_punits(dev); ++i) {
-		dev->punits[i].dev = dev;
-		punit = dev->range.begin + i;
-
-		dev->punits[i].start_ppa.ppa = 0;
-		dev->punits[i].start_ppa.grp = punit % dev->geo.num_grp;
-		dev->punits[i].start_ppa.pu = punit / dev->geo.num_grp;
-	}
-
-	return 0;
-}
-
-static int
-ftl_dev_retrieve_geo(struct spdk_ftl_dev *dev)
-{
-	volatile struct ftl_admin_cmpl cmpl = {};
-	uint32_t nsid = spdk_nvme_ns_get_id(dev->ns);
-
-	if (spdk_nvme_ocssd_ctrlr_cmd_geometry(dev->ctrlr, nsid, &dev->geo, sizeof(dev->geo),
-					       ftl_admin_cb, (void *)&cmpl)) {
-		SPDK_ERRLOG("Unable to retrieve geometry\n");
-		return -1;
-	}
-
-	/* TODO: add a timeout */
-	while (!cmpl.complete) {
-		spdk_nvme_ctrlr_process_admin_completions(dev->ctrlr);
-	}
-
-	if (spdk_nvme_cpl_is_error(&cmpl.status)) {
-		SPDK_ERRLOG("Unexpected status code: [%d], status code type: [%d]\n",
-			    cmpl.status.status.sc, cmpl.status.status.sct);
-		return -1;
-	}
-
-	/* TODO: add sanity checks for the geo */
-	dev->ppa_len = dev->geo.lbaf.grp_len +
-		       dev->geo.lbaf.pu_len +
-		       dev->geo.lbaf.chk_len +
-		       dev->geo.lbaf.lbk_len;
-
-	dev->ppaf.lbk_offset = 0;
-	dev->ppaf.lbk_mask   = (1 << dev->geo.lbaf.lbk_len) - 1;
-	dev->ppaf.chk_offset = dev->ppaf.lbk_offset + dev->geo.lbaf.lbk_len;
-	dev->ppaf.chk_mask   = (1 << dev->geo.lbaf.chk_len) - 1;
-	dev->ppaf.pu_offset  = dev->ppaf.chk_offset + dev->geo.lbaf.chk_len;
-	dev->ppaf.pu_mask    = (1 << dev->geo.lbaf.pu_len) - 1;
-	dev->ppaf.grp_offset = dev->ppaf.pu_offset + dev->geo.lbaf.pu_len;
-	dev->ppaf.grp_mask   = (1 << dev->geo.lbaf.grp_len) - 1;
-
-	/* We're using optimal write size as our xfer size */
-	dev->xfer_size = dev->geo.ws_opt;
-
-	return 0;
-}
-
-static int
-ftl_dev_nvme_init(struct spdk_ftl_dev *dev, const struct spdk_ftl_dev_init_opts *opts)
-{
-	uint32_t block_size;
-
-	dev->ctrlr = opts->ctrlr;
-
-	if (spdk_nvme_ctrlr_get_num_ns(dev->ctrlr) != 1) {
-		SPDK_ERRLOG("Unsupported number of namespaces\n");
-		return -1;
-	}
-
-	dev->ns = spdk_nvme_ctrlr_get_ns(dev->ctrlr, FTL_NSID);
-	if (dev->ns == NULL) {
-		SPDK_ERRLOG("Invalid NS (%"PRIu32")\n", FTL_NSID);
-		return -1;
-	}
-	dev->trid = opts->trid;
-	dev->md_size = spdk_nvme_ns_get_md_size(dev->ns);
-
-	block_size = spdk_nvme_ns_get_extended_sector_size(dev->ns);
-	if (block_size != FTL_BLOCK_SIZE) {
-		SPDK_ERRLOG("Unsupported block size (%"PRIu32")\n", block_size);
-		return -1;
-	}
-
-	if (dev->md_size % sizeof(uint32_t) != 0) {
-		/* Metadata pointer must be dword aligned */
-		SPDK_ERRLOG("Unsupported metadata size (%zu)\n", dev->md_size);
-		return -1;
-	}
-
-	return 0;
 }
 
 static int
@@ -542,10 +252,10 @@ ftl_dev_init_nv_cache(struct spdk_ftl_dev *dev, struct spdk_bdev_desc *bdev_desc
 	 * inside the cache can be overwritten, the band it's stored on has to be closed. Plus one
 	 * extra block is needed to store the header.
 	 */
-	if (spdk_bdev_get_num_blocks(bdev) < ftl_num_band_lbks(dev) * 2 + 1) {
+	if (spdk_bdev_get_num_blocks(bdev) < ftl_get_num_blocks_in_band(dev) * 2 + 1) {
 		SPDK_ERRLOG("Insufficient number of blocks for write buffer cache (available: %"
 			    PRIu64", required: %"PRIu64")\n", spdk_bdev_get_num_blocks(bdev),
-			    ftl_num_band_lbks(dev) * 2 + 1);
+			    ftl_get_num_blocks_in_band(dev) * 2 + 1);
 		return -1;
 	}
 
@@ -597,7 +307,7 @@ ftl_lba_map_request_ctor(struct spdk_mempool *mp, void *opaque, void *obj, unsig
 	struct spdk_ftl_dev *dev = opaque;
 
 	request->segments = spdk_bit_array_create(spdk_divide_round_up(
-				    ftl_num_band_lbks(dev), FTL_NUM_LBA_IN_BLOCK));
+				    ftl_get_num_blocks_in_band(dev), FTL_NUM_LBA_IN_BLOCK));
 }
 
 static int
@@ -729,10 +439,6 @@ _ftl_dev_init_thread(void *ctx)
 		assert(0);
 	}
 
-	if (spdk_get_thread() == ftl_get_core_thread(dev)) {
-		ftl_anm_register_device(dev, ftl_process_anm_event);
-	}
-
 	thread->ioch = spdk_get_io_channel(dev);
 }
 
@@ -744,12 +450,6 @@ ftl_dev_init_thread(struct spdk_ftl_dev *dev, struct ftl_thread *thread,
 	thread->poller_fn = fn;
 	thread->thread = spdk_thread;
 	thread->period_us = period_us;
-
-	thread->qpair = spdk_nvme_ctrlr_alloc_io_qpair(dev->ctrlr, NULL, 0);
-	if (!thread->qpair) {
-		SPDK_ERRLOG("Unable to initialize qpair\n");
-		return -1;
-	}
 
 	spdk_thread_send_msg(spdk_thread, _ftl_dev_init_thread, thread);
 	return 0;
@@ -781,10 +481,8 @@ ftl_dev_free_thread(struct spdk_ftl_dev *dev, struct ftl_thread *thread)
 	assert(thread->poller == NULL);
 
 	spdk_put_io_channel(thread->ioch);
-	spdk_nvme_ctrlr_free_io_qpair(thread->qpair);
 	thread->thread = NULL;
 	thread->ioch = NULL;
-	thread->qpair = NULL;
 }
 
 static int
@@ -803,7 +501,7 @@ ftl_dev_l2p_alloc(struct spdk_ftl_dev *dev)
 		return -1;
 	}
 
-	addr_size = dev->ppa_len >= 32 ? 8 : 4;
+	addr_size = dev->addr_len >= 32 ? 8 : 4;
 	dev->l2p = malloc(dev->num_lbas * addr_size);
 	if (!dev->l2p) {
 		SPDK_DEBUGLOG(SPDK_LOG_FTL_INIT, "Failed to allocate l2p table\n");
@@ -811,7 +509,7 @@ ftl_dev_l2p_alloc(struct spdk_ftl_dev *dev)
 	}
 
 	for (i = 0; i < dev->num_lbas; ++i) {
-		ftl_l2p_set(dev, i, ftl_to_ppa(FTL_PPA_INVALID));
+		ftl_l2p_set(dev, i, ftl_to_addr(FTL_ADDR_INVALID));
 	}
 
 	return 0;
@@ -933,8 +631,8 @@ ftl_setup_initial_state(struct spdk_ftl_dev *dev)
 	spdk_uuid_generate(&dev->uuid);
 
 	dev->num_lbas = 0;
-	for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
-		dev->num_lbas += ftl_band_num_usable_lbks(&dev->bands[i]);
+	for (i = 0; i < ftl_get_num_bands(dev); ++i) {
+		dev->num_lbas += ftl_band_num_usable_blocks(&dev->bands[i]);
 	}
 
 	dev->num_lbas = (dev->num_lbas * (100 - conf->lba_rsvd)) / 100;
@@ -1018,14 +716,171 @@ error:
 }
 
 static int
-ftl_restore_state(struct spdk_ftl_dev *dev, const struct spdk_ftl_dev_init_opts *opts)
+ftl_restore_state(struct spdk_ftl_dev *dev, struct spdk_uuid uuid)
 {
-	dev->uuid = opts->uuid;
+	dev->uuid = uuid;
 
 	if (ftl_restore_md(dev, ftl_restore_md_cb)) {
 		SPDK_ERRLOG("Failed to start metadata restoration from the SSD\n");
 		return -1;
 	}
+
+	return 0;
+}
+
+static void
+ftl_dev_update_bands(struct spdk_ftl_dev *dev)
+{
+	struct ftl_band *band, *temp_band;
+	size_t i;
+
+	for (i = 0; i < ftl_get_num_bands(dev); ++i) {
+		band = &dev->bands[i];
+		band->tail_md_addr = ftl_band_tail_md_addr(band);
+	}
+
+	/* Remove band from shut_bands list to prevent further processing */
+	/* if all blocks on this band are bad */
+	LIST_FOREACH_SAFE(band, &dev->shut_bands, list_entry, temp_band) {
+		if (!band->num_zones) {
+			dev->num_bands--;
+			LIST_REMOVE(band, list_entry);
+		}
+	}
+}
+
+static void
+ftl_dev_free_init_ctx(struct ftl_dev_init_ctx *init_ctx)
+{
+	if (!init_ctx) {
+		return;
+	}
+
+	if (init_ctx->ioch) {
+		spdk_put_io_channel(init_ctx->ioch);
+	}
+
+	free(init_ctx);
+}
+
+static void
+ftl_dev_init_state(struct ftl_dev_init_ctx *init_ctx)
+{
+	struct spdk_ftl_dev *dev = init_ctx->dev;
+
+	ftl_dev_update_bands(dev);
+
+	if (ftl_dev_init_threads(dev, &init_ctx->opts)) {
+		SPDK_ERRLOG("Unable to initialize device threads\n");
+		goto fail;
+	}
+
+	if (init_ctx->opts.mode & SPDK_FTL_MODE_CREATE) {
+		if (ftl_setup_initial_state(dev)) {
+			SPDK_ERRLOG("Failed to setup initial state of the device\n");
+			goto fail;
+		}
+	} else {
+		if (ftl_restore_state(dev, init_ctx->opts.uuid)) {
+			SPDK_ERRLOG("Unable to restore device's state from the SSD\n");
+			goto fail;
+		}
+	}
+
+	ftl_dev_free_init_ctx(init_ctx);
+	return;
+fail:
+	ftl_dev_free_init_ctx(init_ctx);
+	ftl_init_fail(dev);
+}
+
+static void ftl_dev_get_zone_info(struct ftl_dev_init_ctx *init_ctx);
+
+static void
+ftl_dev_get_zone_info_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ftl_dev_init_ctx *init_ctx = cb_arg;
+	struct spdk_ftl_dev *dev = init_ctx->dev;
+	struct ftl_band *band;
+	struct ftl_zone *zone;
+	struct ftl_addr addr;
+	size_t i, zones_left, num_zones;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (spdk_unlikely(!success)) {
+		SPDK_ERRLOG("Unable to read zone info for zone id: %"PRIu64"\n", init_ctx->zone_id);
+		ftl_dev_free_init_ctx(init_ctx);
+		ftl_init_fail(dev);
+		return;
+	}
+
+	zones_left = ftl_get_num_zones(dev) - (init_ctx->zone_id / ftl_get_num_blocks_in_zone(dev));
+	num_zones = spdk_min(zones_left, FTL_ZONE_INFO_COUNT);
+
+	for (i = 0; i < num_zones; ++i) {
+		addr.offset = init_ctx->info[i].zone_id;
+		band = &dev->bands[ftl_addr_get_band(dev, addr)];
+		zone = &band->zone_buf[ftl_addr_get_punit(dev, addr)];
+		zone->info = init_ctx->info[i];
+
+		/* TODO: add support for zone capacity less than zone size */
+		if (zone->info.capacity != ftl_get_num_blocks_in_zone(dev)) {
+			zone->info.state = SPDK_BDEV_ZONE_STATE_OFFLINE;
+			SPDK_ERRLOG("Zone capacity is not equal zone size for "
+				    "zone id: %"PRIu64"\n", init_ctx->zone_id);
+		}
+
+		if (zone->info.state != SPDK_BDEV_ZONE_STATE_OFFLINE) {
+			band->num_zones++;
+			CIRCLEQ_INSERT_TAIL(&band->zones, zone, circleq);
+		}
+	}
+
+	init_ctx->zone_id = init_ctx->zone_id + num_zones * ftl_get_num_blocks_in_zone(dev);
+
+	ftl_dev_get_zone_info(init_ctx);
+}
+
+static void
+ftl_dev_get_zone_info(struct ftl_dev_init_ctx *init_ctx)
+{
+	struct spdk_ftl_dev *dev = init_ctx->dev;
+	size_t zones_left, num_zones;
+	int rc;
+
+	zones_left = ftl_get_num_zones(dev) - (init_ctx->zone_id / ftl_get_num_blocks_in_zone(dev));
+	if (zones_left == 0) {
+		ftl_dev_init_state(init_ctx);
+		return;
+	}
+
+	num_zones = spdk_min(zones_left, FTL_ZONE_INFO_COUNT);
+
+	rc = spdk_bdev_get_zone_info(dev->base_bdev_desc, init_ctx->ioch,
+				     init_ctx->zone_id, num_zones, init_ctx->info,
+				     ftl_dev_get_zone_info_cb, init_ctx);
+
+	if (spdk_unlikely(rc != 0)) {
+		SPDK_ERRLOG("Unable to read zone info for zone id: %"PRIu64"\n", init_ctx->zone_id);
+		ftl_dev_free_init_ctx(init_ctx);
+		ftl_init_fail(dev);
+	}
+}
+
+static int
+ftl_dev_init_zones(struct ftl_dev_init_ctx *init_ctx)
+{
+	struct spdk_ftl_dev *dev =  init_ctx->dev;
+
+	init_ctx->zone_id = 0;
+	init_ctx->ioch = spdk_bdev_get_io_channel(dev->base_bdev_desc);
+	if (!init_ctx->ioch) {
+		SPDK_ERRLOG("Failed to get base bdev IO channel\n");
+		return -1;
+	}
+
+	ftl_dev_get_zone_info(init_ctx);
 
 	return 0;
 }
@@ -1051,11 +906,19 @@ ftl_io_channel_create_cb(void *io_device, void *ctx)
 		return -1;
 	}
 
+	ioch->base_ioch = spdk_bdev_get_io_channel(dev->base_bdev_desc);
+	if (!ioch->base_ioch) {
+		SPDK_ERRLOG("Failed to create base bdev IO channel\n");
+		spdk_mempool_free(ioch->io_pool);
+		return -1;
+	}
+
 	if (ftl_dev_has_nv_cache(dev)) {
 		ioch->cache_ioch = spdk_bdev_get_io_channel(dev->nv_cache.bdev_desc);
 		if (!ioch->cache_ioch) {
 			SPDK_ERRLOG("Failed to create cache IO channel\n");
 			spdk_mempool_free(ioch->io_pool);
+			spdk_put_io_channel(ioch->base_ioch);
 			return -1;
 		}
 	}
@@ -1069,6 +932,8 @@ ftl_io_channel_destroy_cb(void *io_device, void *ctx)
 	struct ftl_io_channel *ioch = ctx;
 
 	spdk_mempool_free(ioch->io_pool);
+
+	spdk_put_io_channel(ioch->base_ioch);
 
 	if (ioch->cache_ioch) {
 		spdk_put_io_channel(ioch->cache_ioch);
@@ -1085,121 +950,46 @@ ftl_dev_init_io_channel(struct spdk_ftl_dev *dev)
 	return 0;
 }
 
-int
-spdk_ftl_dev_init(const struct spdk_ftl_dev_init_opts *_opts, spdk_ftl_init_fn cb_fn, void *cb_arg)
+static int
+ftl_dev_init_base_bdev(struct spdk_ftl_dev *dev)
 {
-	struct spdk_ftl_dev *dev;
-	struct spdk_ftl_dev_init_opts opts = *_opts;
+	uint32_t block_size;
+	uint64_t num_blocks;
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(dev->base_bdev_desc);
 
-	dev = calloc(1, sizeof(*dev));
-	if (!dev) {
-		return -ENOMEM;
+	if (!spdk_bdev_is_zoned(bdev)) {
+		SPDK_ERRLOG("Bdev dosen't support zone capabilities: %s\n",
+			    spdk_bdev_get_name(bdev));
+		return -1;
 	}
 
-	if (!opts.conf) {
-		opts.conf = &g_default_conf;
+	dev->xfer_size = spdk_bdev_get_write_unit_size(bdev);
+	dev->md_size = spdk_bdev_get_md_size(bdev);
+
+	block_size = spdk_bdev_get_block_size(bdev);
+	if (block_size != FTL_BLOCK_SIZE) {
+		SPDK_ERRLOG("Unsupported block size (%"PRIu32")\n", block_size);
+		return -1;
 	}
 
-	TAILQ_INIT(&dev->retry_queue);
-	dev->conf = *opts.conf;
-	dev->init_ctx.cb_fn = cb_fn;
-	dev->init_ctx.cb_arg = cb_arg;
-	dev->init_ctx.thread = spdk_get_thread();
-	dev->range = opts.range;
-	dev->limit = SPDK_FTL_LIMIT_MAX;
-
-	dev->name = strdup(opts.name);
-	if (!dev->name) {
-		SPDK_ERRLOG("Unable to set device name\n");
-		goto fail_sync;
+	num_blocks = spdk_bdev_get_num_blocks(bdev);
+	if (num_blocks % ftl_get_num_punits(dev)) {
+		SPDK_ERRLOG("Unsupported geometry. Base bdev block count must be multiple "
+			    "of optimal number of zones.\n");
+		return -1;
 	}
 
-	if (ftl_dev_nvme_init(dev, &opts)) {
-		SPDK_ERRLOG("Unable to initialize NVMe structures\n");
-		goto fail_sync;
+	if (ftl_is_append_supported(dev) &&
+	    !spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_ZONE_APPEND)) {
+		SPDK_ERRLOG("Bdev dosen't support append: %s\n",
+			    spdk_bdev_get_name(bdev));
+		return -1;
 	}
 
-	/* In case of errors, we free all of the memory in ftl_dev_free_sync(), */
-	/* so we don't have to clean up in each of the init functions. */
-	if (ftl_dev_retrieve_geo(dev)) {
-		SPDK_ERRLOG("Unable to retrieve geometry\n");
-		goto fail_sync;
-	}
-
-	if (ftl_check_init_opts(&opts, &dev->geo)) {
-		SPDK_ERRLOG("Invalid device configuration\n");
-		goto fail_sync;
-	}
-
-	if (ftl_dev_init_punits(dev)) {
-		SPDK_ERRLOG("Unable to initialize LUNs\n");
-		goto fail_sync;
-	}
-
-	if (ftl_init_lba_map_pools(dev)) {
-		SPDK_ERRLOG("Unable to init LBA map pools\n");
-		goto fail_sync;
-	}
-
-	ftl_init_wptr_list(dev);
-
-	if (ftl_dev_init_bands(dev)) {
-		SPDK_ERRLOG("Unable to initialize band array\n");
-		goto fail_sync;
-	}
-
-	if (ftl_dev_init_nv_cache(dev, opts.cache_bdev_desc)) {
-		SPDK_ERRLOG("Unable to initialize persistent cache\n");
-		goto fail_sync;
-	}
-
-	dev->rwb = ftl_rwb_init(&dev->conf, dev->geo.ws_opt, dev->md_size, ftl_dev_num_punits(dev));
-	if (!dev->rwb) {
-		SPDK_ERRLOG("Unable to initialize rwb structures\n");
-		goto fail_sync;
-	}
-
-	dev->reloc = ftl_reloc_init(dev);
-	if (!dev->reloc) {
-		SPDK_ERRLOG("Unable to initialize reloc structures\n");
-		goto fail_sync;
-	}
-
-	if (ftl_dev_init_io_channel(dev)) {
-		SPDK_ERRLOG("Unable to initialize IO channels\n");
-		goto fail_sync;
-	}
-
-	if (ftl_dev_init_threads(dev, &opts)) {
-		SPDK_ERRLOG("Unable to initialize device threads\n");
-		goto fail_sync;
-	}
-
-	if (opts.mode & SPDK_FTL_MODE_CREATE) {
-		if (ftl_setup_initial_state(dev)) {
-			SPDK_ERRLOG("Failed to setup initial state of the device\n");
-			goto fail_async;
-		}
-	} else {
-		if (ftl_restore_state(dev, &opts)) {
-			SPDK_ERRLOG("Unable to restore device's state from the SSD\n");
-			goto fail_async;
-		}
-	}
+	dev->num_bands = num_blocks / (ftl_get_num_punits(dev) * ftl_get_num_blocks_in_zone(dev));
+	dev->addr_len = spdk_u64log2(num_blocks) + 1;
 
 	return 0;
-fail_sync:
-	ftl_dev_free_sync(dev);
-	return -ENOMEM;
-fail_async:
-	ftl_init_fail(dev);
-	return 0;
-}
-
-static void
-_ftl_halt_defrag(void *arg)
-{
-	ftl_reloc_halt(((struct spdk_ftl_dev *)arg)->reloc);
 }
 
 static void
@@ -1246,7 +1036,7 @@ ftl_dev_free_sync(struct spdk_ftl_dev *dev)
 	}
 
 	if (dev->bands) {
-		for (i = 0; i < ftl_dev_num_bands(dev); ++i) {
+		for (i = 0; i < ftl_get_num_bands(dev); ++i) {
 			free(dev->bands[i].zone_buf);
 			spdk_bit_array_free(&dev->bands[i].lba_map.vld);
 			spdk_bit_array_free(&dev->bands[i].reloc_bitmap);
@@ -1266,10 +1056,122 @@ ftl_dev_free_sync(struct spdk_ftl_dev *dev)
 	ftl_reloc_free(dev->reloc);
 
 	free(dev->name);
-	free(dev->punits);
 	free(dev->bands);
 	free(dev->l2p);
 	free(dev);
+}
+
+int
+spdk_ftl_dev_init(const struct spdk_ftl_dev_init_opts *_opts, spdk_ftl_init_fn cb_fn, void *cb_arg)
+{
+	struct spdk_ftl_dev *dev;
+	struct spdk_ftl_dev_init_opts opts = *_opts;
+	struct ftl_dev_init_ctx *init_ctx = NULL;
+	int rc = -ENOMEM;
+
+	dev = calloc(1, sizeof(*dev));
+	if (!dev) {
+		return -ENOMEM;
+	}
+
+	init_ctx = calloc(1, sizeof(*init_ctx));
+	if (!init_ctx) {
+		goto fail_sync;
+	}
+
+	init_ctx->dev = dev;
+	init_ctx->opts = *_opts;
+
+	if (!opts.conf) {
+		opts.conf = &g_default_conf;
+	}
+
+	if (!opts.base_bdev_desc) {
+		SPDK_ERRLOG("Lack of underlying device in configuration\n");
+		rc = -EINVAL;
+		goto fail_sync;
+	}
+
+	TAILQ_INIT(&dev->retry_queue);
+	dev->conf = *opts.conf;
+	dev->init_ctx.cb_fn = cb_fn;
+	dev->init_ctx.cb_arg = cb_arg;
+	dev->init_ctx.thread = spdk_get_thread();
+	dev->base_bdev_desc = opts.base_bdev_desc;
+	dev->limit = SPDK_FTL_LIMIT_MAX;
+
+	dev->name = strdup(opts.name);
+	if (!dev->name) {
+		SPDK_ERRLOG("Unable to set device name\n");
+		goto fail_sync;
+	}
+
+	if (ftl_dev_init_base_bdev(dev)) {
+		SPDK_ERRLOG("Unsupported underlying device\n");
+		goto fail_sync;
+	}
+
+	/* In case of errors, we free all of the memory in ftl_dev_free_sync(), */
+	/* so we don't have to clean up in each of the init functions. */
+	if (ftl_check_conf(dev, opts.conf)) {
+		SPDK_ERRLOG("Invalid device configuration\n");
+		goto fail_sync;
+	}
+
+	if (ftl_init_lba_map_pools(dev)) {
+		SPDK_ERRLOG("Unable to init LBA map pools\n");
+		goto fail_sync;
+	}
+
+	ftl_init_wptr_list(dev);
+
+	if (ftl_dev_init_bands(dev)) {
+		SPDK_ERRLOG("Unable to initialize band array\n");
+		goto fail_sync;
+	}
+
+	if (ftl_dev_init_nv_cache(dev, opts.cache_bdev_desc)) {
+		SPDK_ERRLOG("Unable to initialize persistent cache\n");
+		goto fail_sync;
+	}
+
+	dev->rwb = ftl_rwb_init(&dev->conf, dev->xfer_size, dev->md_size, ftl_get_num_punits(dev));
+	if (!dev->rwb) {
+		SPDK_ERRLOG("Unable to initialize rwb structures\n");
+		goto fail_sync;
+	}
+
+	dev->reloc = ftl_reloc_init(dev);
+	if (!dev->reloc) {
+		SPDK_ERRLOG("Unable to initialize reloc structures\n");
+		goto fail_sync;
+	}
+
+	if (ftl_dev_init_io_channel(dev)) {
+		SPDK_ERRLOG("Unable to initialize IO channels\n");
+		goto fail_sync;
+	}
+
+	if (ftl_dev_init_zones(init_ctx)) {
+		SPDK_ERRLOG("Failed to initialize zones\n");
+		goto fail_async;
+	}
+
+	return 0;
+fail_sync:
+	ftl_dev_free_sync(dev);
+	ftl_dev_free_init_ctx(init_ctx);
+	return rc;
+fail_async:
+	ftl_init_fail(dev);
+	ftl_dev_free_init_ctx(init_ctx);
+	return 0;
+}
+
+static void
+_ftl_halt_defrag(void *arg)
+{
+	ftl_reloc_halt(((struct spdk_ftl_dev *)arg)->reloc);
 }
 
 static void
@@ -1307,39 +1209,19 @@ ftl_nv_cache_header_fini_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb
 	spdk_thread_send_msg(dev->fini_ctx.thread, ftl_halt_complete_cb, dev);
 }
 
-static void
-_ftl_anm_unregister_cb(void *ctx)
-{
-	struct spdk_ftl_dev *dev = ctx;
-
-	if (ftl_dev_has_nv_cache(dev)) {
-		ftl_nv_cache_write_header(&dev->nv_cache, true, ftl_nv_cache_header_fini_cb, dev);
-	} else {
-		dev->halt_complete_status = 0;
-		spdk_thread_send_msg(dev->fini_ctx.thread, ftl_halt_complete_cb, dev);
-	}
-}
-
-static void
-ftl_anm_unregister_cb(void *ctx, int status)
-{
-	struct spdk_ftl_dev *dev = ctx;
-
-	spdk_thread_send_msg(ftl_get_core_thread(dev), _ftl_anm_unregister_cb, dev);
-}
-
 static int
 ftl_halt_poller(void *ctx)
 {
 	struct spdk_ftl_dev *dev = ctx;
-	int rc;
 
 	if (!dev->core_thread.poller && !dev->read_thread.poller) {
-		rc = ftl_anm_unregister_device(dev, ftl_anm_unregister_cb);
-		if (spdk_unlikely(rc != 0)) {
-			SPDK_ERRLOG("Failed to unregister ANM device, will retry later\n");
+		spdk_poller_unregister(&dev->fini_ctx.poller);
+
+		if (ftl_dev_has_nv_cache(dev)) {
+			ftl_nv_cache_write_header(&dev->nv_cache, true, ftl_nv_cache_header_fini_cb, dev);
 		} else {
-			spdk_poller_unregister(&dev->fini_ctx.poller);
+			dev->halt_complete_status = 0;
+			spdk_thread_send_msg(dev->fini_ctx.thread, ftl_halt_complete_cb, dev);
 		}
 	}
 
@@ -1380,18 +1262,6 @@ int
 spdk_ftl_dev_free(struct spdk_ftl_dev *dev, spdk_ftl_init_fn cb_fn, void *cb_arg)
 {
 	return _spdk_ftl_dev_free(dev, cb_fn, cb_arg, spdk_get_thread());
-}
-
-int
-spdk_ftl_module_init(const struct ftl_module_init_opts *opts, spdk_ftl_fn cb, void *cb_arg)
-{
-	return ftl_anm_init(opts->anm_thread, cb, cb_arg);
-}
-
-int
-spdk_ftl_module_fini(spdk_ftl_fn cb, void *cb_arg)
-{
-	return ftl_anm_free(cb, cb_arg);
 }
 
 SPDK_LOG_REGISTER_COMPONENT("ftl_init", SPDK_LOG_FTL_INIT)

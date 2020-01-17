@@ -53,9 +53,6 @@ struct spdk_nvmf_transport_opts g_rdma_ut_transport_opts = {
 	.num_shared_buffers = SPDK_NVMF_RDMA_DEFAULT_NUM_SHARED_BUFFERS,
 };
 
-const struct spdk_nvmf_transport_ops spdk_nvmf_transport_tcp;
-const struct spdk_nvmf_transport_ops spdk_nvmf_transport_fc;
-
 SPDK_LOG_REGISTER_COMPONENT("nvmf", SPDK_LOG_NVMF)
 DEFINE_STUB(spdk_mem_map_set_translation, int, (struct spdk_mem_map *map, uint64_t vaddr,
 		uint64_t size, uint64_t translation), 0);
@@ -82,6 +79,44 @@ DEFINE_STUB(spdk_nvme_transport_id_compare, int, (const struct spdk_nvme_transpo
 DEFINE_STUB_V(spdk_nvmf_ctrlr_abort_aer, (struct spdk_nvmf_ctrlr *ctrlr));
 DEFINE_STUB(spdk_nvmf_request_get_dif_ctx, bool, (struct spdk_nvmf_request *req,
 		struct spdk_dif_ctx *dif_ctx), false);
+DEFINE_STUB_V(spdk_nvme_trid_populate_transport, (struct spdk_nvme_transport_id *trid,
+		enum spdk_nvme_transport_type trtype));
+
+const char *
+spdk_nvme_transport_id_trtype_str(enum spdk_nvme_transport_type trtype)
+{
+	switch (trtype) {
+	case SPDK_NVME_TRANSPORT_PCIE:
+		return "PCIe";
+	case SPDK_NVME_TRANSPORT_RDMA:
+		return "RDMA";
+	case SPDK_NVME_TRANSPORT_FC:
+		return "FC";
+	default:
+		return NULL;
+	}
+}
+
+int
+spdk_nvme_transport_id_populate_trstring(struct spdk_nvme_transport_id *trid, const char *trstring)
+{
+	int len, i;
+
+	if (trstring == NULL) {
+		return -EINVAL;
+	}
+
+	len = strnlen(trstring, SPDK_NVMF_TRSTRING_MAX_LEN);
+	if (len == SPDK_NVMF_TRSTRING_MAX_LEN) {
+		return -EINVAL;
+	}
+
+	/* cast official trstring to uppercase version of input. */
+	for (i = 0; i < len; i++) {
+		trid->trstring[i] = toupper(trstring[i]);
+	}
+	return 0;
+}
 
 uint64_t
 spdk_mem_map_translate(const struct spdk_mem_map *map, uint64_t vaddr, uint64_t *size)
@@ -535,14 +570,14 @@ free_req(struct spdk_nvmf_rdma_request *rdma_req)
 static void
 qpair_reset(struct spdk_nvmf_rdma_qpair *rqpair,
 	    struct spdk_nvmf_rdma_poller *poller,
-	    struct spdk_nvmf_rdma_port *port,
+	    struct spdk_nvmf_rdma_device *device,
 	    struct spdk_nvmf_rdma_resources *resources)
 {
 	memset(rqpair, 0, sizeof(*rqpair));
 	STAILQ_INIT(&rqpair->pending_rdma_write_queue);
 	STAILQ_INIT(&rqpair->pending_rdma_read_queue);
 	rqpair->poller = poller;
-	rqpair->port = port;
+	rqpair->device = device;
 	rqpair->resources = resources;
 	rqpair->qpair.qid = 1;
 	rqpair->ibv_state = IBV_QPS_RTS;
@@ -569,7 +604,6 @@ test_spdk_nvmf_rdma_request_process(void)
 	struct spdk_nvmf_rdma_transport rtransport = {};
 	struct spdk_nvmf_rdma_poll_group group = {};
 	struct spdk_nvmf_rdma_poller poller = {};
-	struct spdk_nvmf_rdma_port port = {};
 	struct spdk_nvmf_rdma_device device = {};
 	struct spdk_nvmf_rdma_resources resources = {};
 	struct spdk_nvmf_rdma_qpair rqpair = {};
@@ -581,9 +615,8 @@ test_spdk_nvmf_rdma_request_process(void)
 	STAILQ_INIT(&group.group.pending_buf_queue);
 	group.group.buf_cache_size = 0;
 	group.group.buf_cache_count = 0;
-	port.device = &device;
 	poller_reset(&poller, &group);
-	qpair_reset(&rqpair, &poller, &port, &resources);
+	qpair_reset(&rqpair, &poller, &device, &resources);
 
 	rtransport.transport.opts = g_rdma_ut_transport_opts;
 	rtransport.transport.data_buf_pool = spdk_mempool_create("test_data_pool", 16, 128, 0, 0);
@@ -624,7 +657,7 @@ test_spdk_nvmf_rdma_request_process(void)
 	free_recv(rdma_recv);
 	free_req(rdma_req);
 	poller_reset(&poller, &group);
-	qpair_reset(&rqpair, &poller, &port, &resources);
+	qpair_reset(&rqpair, &poller, &device, &resources);
 
 	/* Test 2: single SGL WRITE request */
 	rdma_recv = create_recv(&rqpair, SPDK_NVME_OPC_WRITE);
@@ -663,7 +696,7 @@ test_spdk_nvmf_rdma_request_process(void)
 	free_recv(rdma_recv);
 	free_req(rdma_req);
 	poller_reset(&poller, &group);
-	qpair_reset(&rqpair, &poller, &port, &resources);
+	qpair_reset(&rqpair, &poller, &device, &resources);
 
 	/* Test 3: WRITE+WRITE ibv_send batching */
 	{
@@ -736,7 +769,7 @@ test_spdk_nvmf_rdma_request_process(void)
 		free_recv(recv2);
 		free_req(req2);
 		poller_reset(&poller, &group);
-		qpair_reset(&rqpair, &poller, &port, &resources);
+		qpair_reset(&rqpair, &poller, &device, &resources);
 	}
 
 	spdk_mempool_free(rtransport.transport.data_buf_pool);

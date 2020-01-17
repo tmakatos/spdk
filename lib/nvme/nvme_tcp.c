@@ -230,8 +230,8 @@ fail:
 	return -ENOMEM;
 }
 
-static void
-nvme_tcp_qpair_disconnect(struct spdk_nvme_qpair *qpair)
+void
+nvme_tcp_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
 	struct nvme_tcp_qpair *tqpair = nvme_tcp_qpair(qpair);
 	struct nvme_tcp_pdu *pdu;
@@ -249,8 +249,8 @@ nvme_tcp_qpair_disconnect(struct spdk_nvme_qpair *qpair)
 	}
 }
 
-static int
-nvme_tcp_qpair_destroy(struct spdk_nvme_qpair *qpair)
+int
+nvme_tcp_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
 	struct nvme_tcp_qpair *tqpair;
 
@@ -258,7 +258,7 @@ nvme_tcp_qpair_destroy(struct spdk_nvme_qpair *qpair)
 		return -1;
 	}
 
-	nvme_tcp_qpair_disconnect(qpair);
+	nvme_tcp_ctrlr_disconnect_qpair(ctrlr, qpair);
 	nvme_tcp_qpair_abort_reqs(qpair, 1);
 	nvme_qpair_deinit(qpair);
 	tqpair = nvme_tcp_qpair(qpair);
@@ -274,21 +274,13 @@ nvme_tcp_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr)
 	return 0;
 }
 
-/* This function must only be called while holding g_spdk_nvme_driver->lock */
-int
-nvme_tcp_ctrlr_scan(struct spdk_nvme_probe_ctx *probe_ctx,
-		    bool direct_connect)
-{
-	return nvme_fabric_ctrlr_scan(probe_ctx, direct_connect);
-}
-
 int
 nvme_tcp_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
 {
 	struct nvme_tcp_ctrlr *tctrlr = nvme_tcp_ctrlr(ctrlr);
 
 	if (ctrlr->adminq) {
-		nvme_tcp_qpair_destroy(ctrlr->adminq);
+		nvme_tcp_ctrlr_delete_io_qpair(ctrlr, ctrlr->adminq);
 	}
 
 	nvme_ctrlr_destruct_finish(ctrlr);
@@ -296,30 +288,6 @@ nvme_tcp_ctrlr_destruct(struct spdk_nvme_ctrlr *ctrlr)
 	free(tctrlr);
 
 	return 0;
-}
-
-int
-nvme_tcp_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value)
-{
-	return nvme_fabric_ctrlr_set_reg_4(ctrlr, offset, value);
-}
-
-int
-nvme_tcp_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value)
-{
-	return nvme_fabric_ctrlr_set_reg_8(ctrlr, offset, value);
-}
-
-int
-nvme_tcp_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value)
-{
-	return nvme_fabric_ctrlr_get_reg_4(ctrlr, offset, value);
-}
-
-int
-nvme_tcp_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value)
-{
-	return nvme_fabric_ctrlr_get_reg_8(ctrlr, offset, value);
 }
 
 static int
@@ -643,12 +611,6 @@ nvme_tcp_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 	}
 
 	return nvme_tcp_qpair_capsule_cmd_send(tqpair, tcp_req);
-}
-
-int
-nvme_tcp_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
-{
-	return nvme_tcp_qpair_destroy(qpair);
 }
 
 int
@@ -1509,13 +1471,13 @@ fail:
 
 	/*
 	 * Since admin queues take the ctrlr_lock before entering this function,
-	 * we can call nvme_tcp_qpair_disconnect. For other qpairs we need
+	 * we can call nvme_tcp_ctrlr_disconnect_qpair. For other qpairs we need
 	 * to call the generic function which will take the lock for us.
 	 */
 	qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_UNKNOWN;
 
 	if (nvme_qpair_is_admin_queue(qpair)) {
-		nvme_tcp_qpair_disconnect(qpair);
+		nvme_tcp_ctrlr_disconnect_qpair(qpair->ctrlr, qpair);
 	} else {
 		nvme_ctrlr_disconnect_qpair(qpair);
 	}
@@ -1562,17 +1524,17 @@ nvme_tcp_qpair_icreq_send(struct nvme_tcp_qpair *tqpair)
 	return 0;
 }
 
-static int
-nvme_tcp_qpair_connect(struct nvme_tcp_qpair *tqpair)
+int
+nvme_tcp_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
 	struct sockaddr_storage dst_addr;
 	struct sockaddr_storage src_addr;
 	int rc;
-	struct spdk_nvme_ctrlr *ctrlr;
+	struct nvme_tcp_qpair *tqpair;
 	int family;
 	long int port;
 
-	ctrlr = tqpair->qpair.ctrlr;
+	tqpair = nvme_tcp_qpair(qpair);
 
 	switch (ctrlr->trid.adrfam) {
 	case SPDK_NVMF_ADRFAM_IPV4:
@@ -1612,7 +1574,7 @@ nvme_tcp_qpair_connect(struct nvme_tcp_qpair *tqpair)
 		return -1;
 	}
 
-	tqpair->sock = spdk_sock_connect(ctrlr->trid.traddr, port);
+	tqpair->sock = spdk_sock_connect(ctrlr->trid.traddr, port, NULL);
 	if (!tqpair->sock) {
 		SPDK_ERRLOG("sock connection error of tqpair=%p with addr=%s, port=%ld\n",
 			    tqpair, ctrlr->trid.traddr, port);
@@ -1641,18 +1603,6 @@ nvme_tcp_qpair_connect(struct nvme_tcp_qpair *tqpair)
 	return 0;
 }
 
-int
-nvme_tcp_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
-{
-	return nvme_tcp_qpair_connect(nvme_tcp_qpair(qpair));
-}
-
-void
-nvme_tcp_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
-{
-	return nvme_tcp_qpair_disconnect(qpair);
-}
-
 static struct spdk_nvme_qpair *
 nvme_tcp_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr,
 			    uint16_t qid, uint32_t qsize,
@@ -1672,7 +1622,6 @@ nvme_tcp_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr,
 	tqpair->num_entries = qsize;
 	qpair = &tqpair->qpair;
 	tqpair->recv_pdu.hdr = &tqpair->recv_pdu.hdr_mem;
-
 	rc = nvme_qpair_init(qpair, qid, ctrlr, qprio, num_requests);
 	if (rc != 0) {
 		free(tqpair);
@@ -1681,13 +1630,13 @@ nvme_tcp_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr,
 
 	rc = nvme_tcp_alloc_reqs(tqpair);
 	if (rc) {
-		nvme_tcp_qpair_destroy(qpair);
+		nvme_tcp_ctrlr_delete_io_qpair(ctrlr, qpair);
 		return NULL;
 	}
 
 	rc = nvme_transport_ctrlr_connect_qpair(ctrlr, qpair);
 	if (rc < 0) {
-		nvme_tcp_qpair_destroy(qpair);
+		nvme_tcp_ctrlr_delete_io_qpair(ctrlr, qpair);
 		return NULL;
 	}
 
@@ -1717,9 +1666,9 @@ struct spdk_nvme_ctrlr *nvme_tcp_ctrlr_construct(const struct spdk_nvme_transpor
 		return NULL;
 	}
 
-	tctrlr->ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_TCP;
 	tctrlr->ctrlr.opts = *opts;
 	tctrlr->ctrlr.trid = *trid;
+	spdk_nvme_trid_populate_transport(&tctrlr->ctrlr.trid, SPDK_NVME_TRANSPORT_TCP);
 
 	rc = nvme_ctrlr_construct(&tctrlr->ctrlr);
 	if (rc != 0) {
@@ -1817,3 +1766,36 @@ nvme_tcp_admin_qpair_abort_aers(struct spdk_nvme_qpair *qpair)
 		nvme_tcp_req_put(tqpair, tcp_req);
 	}
 }
+
+const struct spdk_nvme_transport_ops tcp_ops = {
+	.name = "TCP",
+	.type = SPDK_NVME_TRANSPORT_TCP,
+	.ctrlr_construct = nvme_tcp_ctrlr_construct,
+	.ctrlr_scan = nvme_fabric_ctrlr_scan,
+	.ctrlr_destruct = nvme_tcp_ctrlr_destruct,
+	.ctrlr_enable = nvme_tcp_ctrlr_enable,
+
+	.ctrlr_set_reg_4 = nvme_fabric_ctrlr_set_reg_4,
+	.ctrlr_set_reg_8 = nvme_fabric_ctrlr_set_reg_8,
+	.ctrlr_get_reg_4 = nvme_fabric_ctrlr_get_reg_4,
+	.ctrlr_get_reg_8 = nvme_fabric_ctrlr_get_reg_8,
+
+	.ctrlr_get_max_xfer_size = nvme_tcp_ctrlr_get_max_xfer_size,
+	.ctrlr_get_max_sges = nvme_tcp_ctrlr_get_max_sges,
+
+	.ctrlr_alloc_cmb_io_buffer = nvme_tcp_ctrlr_alloc_cmb_io_buffer,
+	.ctrlr_free_cmb_io_buffer = nvme_tcp_ctrlr_free_cmb_io_buffer,
+
+	.ctrlr_create_io_qpair = nvme_tcp_ctrlr_create_io_qpair,
+	.ctrlr_delete_io_qpair = nvme_tcp_ctrlr_delete_io_qpair,
+	.ctrlr_connect_qpair = nvme_tcp_ctrlr_connect_qpair,
+	.ctrlr_disconnect_qpair = nvme_tcp_ctrlr_disconnect_qpair,
+
+	.qpair_abort_reqs = nvme_tcp_qpair_abort_reqs,
+	.qpair_reset = nvme_tcp_qpair_reset,
+	.qpair_submit_request = nvme_tcp_qpair_submit_request,
+	.qpair_process_completions = nvme_tcp_qpair_process_completions,
+	.admin_qpair_abort_aers = nvme_tcp_admin_qpair_abort_aers,
+};
+
+SPDK_NVME_TRANSPORT_REGISTER(tcp, &tcp_ops);

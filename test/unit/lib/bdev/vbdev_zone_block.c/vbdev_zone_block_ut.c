@@ -44,13 +44,25 @@
 #define BLOCK_SIZE 4096
 
 /* Globals */
+struct io_output *g_io_output = NULL;
+uint32_t g_max_io_size;
+uint32_t g_io_output_index;
 uint32_t g_io_comp_status;
 uint8_t g_rpc_err;
 uint8_t g_json_decode_obj_construct;
 static TAILQ_HEAD(, spdk_bdev) g_bdev_list = TAILQ_HEAD_INITIALIZER(g_bdev_list);
 void *g_rpc_req = NULL;
-uint32_t g_rpc_req_size = 0;
 static struct spdk_thread *g_thread;
+
+struct io_output {
+	struct spdk_bdev_desc       *desc;
+	struct spdk_io_channel      *ch;
+	uint64_t                    offset_blocks;
+	uint64_t                    num_blocks;
+	spdk_bdev_io_completion_cb  cb;
+	void                        *cb_arg;
+	enum spdk_bdev_io_type      iotype;
+};
 
 DEFINE_STUB_V(spdk_bdev_module_list_add, (struct spdk_bdev_module *bdev_module));
 DEFINE_STUB_V(spdk_bdev_close, (struct spdk_bdev_desc *desc));
@@ -73,6 +85,21 @@ DEFINE_STUB_V(spdk_jsonrpc_end_result, (struct spdk_jsonrpc_request *request,
 					struct spdk_json_write_ctx *w));
 DEFINE_STUB(spdk_bdev_get_io_channel, struct spdk_io_channel *, (struct spdk_bdev_desc *desc),
 	    (void *)1);
+
+static void
+init_test_globals(void)
+{
+	g_io_output = calloc(g_max_io_size, sizeof(struct io_output));
+	SPDK_CU_ASSERT_FATAL(g_io_output != NULL);
+	g_io_output_index = 0;
+}
+
+static void
+free_test_globals(void)
+{
+	free(g_io_output);
+	g_io_output = NULL;
+}
 
 int
 spdk_bdev_open(struct spdk_bdev *bdev, bool write, spdk_bdev_remove_cb_t remove_cb,
@@ -169,20 +196,25 @@ spdk_json_decode_object(const struct spdk_json_val *values,
 			const struct spdk_json_object_decoder *decoders, size_t num_decoders,
 			void *out)
 {
-	struct rpc_construct_zone_block *req, *_out;
+	struct rpc_construct_zone_block *construct, *_construct;
+	struct rpc_delete_zone_block *delete, *_delete;
 
 	if (g_json_decode_obj_construct) {
-		req = g_rpc_req;
-		_out = out;
+		construct = g_rpc_req;
+		_construct = out;
 
-		_out->name = strdup(req->name);
-		SPDK_CU_ASSERT_FATAL(_out->name != NULL);
-		_out->base_bdev = strdup(req->base_bdev);
-		SPDK_CU_ASSERT_FATAL(_out->base_bdev != NULL);
-		_out->zone_capacity = req->zone_capacity;
-		_out->optimal_open_zones = req->optimal_open_zones;
+		_construct->name = strdup(construct->name);
+		SPDK_CU_ASSERT_FATAL(_construct->name != NULL);
+		_construct->base_bdev = strdup(construct->base_bdev);
+		SPDK_CU_ASSERT_FATAL(_construct->base_bdev != NULL);
+		_construct->zone_capacity = construct->zone_capacity;
+		_construct->optimal_open_zones = construct->optimal_open_zones;
 	} else {
-		memcpy(out, g_rpc_req, g_rpc_req_size);
+		delete = g_rpc_req;
+		_delete = out;
+
+		_delete->name = strdup(delete->name);
+		SPDK_CU_ASSERT_FATAL(_delete->name != NULL);
 	}
 
 	return 0;
@@ -284,9 +316,8 @@ static void
 verify_bdev_present(const char *name, bool presence)
 {
 	struct bdev_zone_block *bdev;
-	bool   bdev_found;
+	bool bdev_found = false;
 
-	bdev_found = false;
 	TAILQ_FOREACH(bdev, &g_bdev_nodes, link) {
 		if (strcmp(bdev->bdev.name, name) == 0) {
 			bdev_found = true;
@@ -301,9 +332,14 @@ verify_bdev_present(const char *name, bool presence)
 }
 
 static void
-create_test_req(struct rpc_construct_zone_block *r, const char *vbdev_name, const char *base_name,
-		uint64_t zone_capacity, uint64_t optimal_open_zones, bool create_base_bdev)
+initialize_create_req(const char *vbdev_name, const char *base_name,
+		      uint64_t zone_capacity, uint64_t optimal_open_zones, bool create_base_bdev)
 {
+	struct rpc_construct_zone_block *r;
+
+	r = g_rpc_req = calloc(1, sizeof(struct rpc_construct_zone_block));
+	SPDK_CU_ASSERT_FATAL(r != NULL);
+
 	r->name = strdup(vbdev_name);
 	SPDK_CU_ASSERT_FATAL(r->name != NULL);
 	r->base_bdev = strdup(base_name);
@@ -314,43 +350,49 @@ create_test_req(struct rpc_construct_zone_block *r, const char *vbdev_name, cons
 	if (create_base_bdev == true) {
 		create_nvme_bdev();
 	}
-	g_rpc_req = r;
-	g_rpc_req_size = sizeof(*r);
-}
-
-static void
-free_test_req(struct rpc_construct_zone_block *r)
-{
-	free(r->name);
-	free(r->base_bdev);
-}
-
-static void
-initialize_create_req(struct rpc_construct_zone_block *r, const char *vbdev_name,
-		      const char *base_name,
-		      uint64_t zone_capacity, uint64_t optimal_open_zones, bool create_base_bdev)
-{
-	create_test_req(r, vbdev_name, base_name, zone_capacity, optimal_open_zones, create_base_bdev);
-
 	g_rpc_err = 0;
 	g_json_decode_obj_construct = 1;
 }
 
 static void
-create_delete_req(struct rpc_delete_zone_block *r, const char *vbdev_name)
+free_create_req(void)
 {
+	struct rpc_construct_zone_block *r = g_rpc_req;
+
+	free(r->name);
+	free(r->base_bdev);
+	free(r);
+	g_rpc_req = NULL;
+}
+
+static void
+initialize_delete_req(const char *vbdev_name)
+{
+	struct rpc_delete_zone_block *r;
+
+	r = g_rpc_req = calloc(1, sizeof(struct rpc_delete_zone_block));
+	SPDK_CU_ASSERT_FATAL(r != NULL);
 	r->name = strdup(vbdev_name);
 	SPDK_CU_ASSERT_FATAL(r->name != NULL);
 
-	g_rpc_req = r;
-	g_rpc_req_size = sizeof(*r);
 	g_rpc_err = 0;
 	g_json_decode_obj_construct = 0;
 }
 
 static void
-verify_zone_config(struct rpc_construct_zone_block *r, bool presence)
+free_delete_req(void)
 {
+	struct rpc_delete_zone_block *r = g_rpc_req;
+
+	free(r->name);
+	free(r);
+	g_rpc_req = NULL;
+}
+
+static void
+verify_zone_config(bool presence)
+{
+	struct rpc_construct_zone_block *r = g_rpc_req;
 	struct bdev_zone_block_config *cfg = NULL;
 
 	TAILQ_FOREACH(cfg, &g_bdev_configs, link) {
@@ -360,7 +402,7 @@ verify_zone_config(struct rpc_construct_zone_block *r, bool presence)
 			}
 			CU_ASSERT(strcmp(r->base_bdev, cfg->bdev_name) == 0);
 			CU_ASSERT(r->zone_capacity == cfg->zone_capacity);
-			CU_ASSERT(r->optimal_open_zones == cfg->optimal_open_zones);
+			CU_ASSERT(spdk_max(r->optimal_open_zones, 1) == cfg->optimal_open_zones);
 			break;
 		}
 	}
@@ -373,12 +415,16 @@ verify_zone_config(struct rpc_construct_zone_block *r, bool presence)
 }
 
 static void
-verify_zone_bdev(struct rpc_construct_zone_block *r, bool presence)
+verify_zone_bdev(bool presence)
 {
+	struct rpc_construct_zone_block *r = g_rpc_req;
+	struct block_zone *zone;
 	struct bdev_zone_block *bdev;
-	bool   bdev_found;
+	bool bdev_found = false;
+	uint32_t i;
+	uint64_t expected_num_zones;
+	uint64_t expected_optimal_open_zones;
 
-	bdev_found = false;
 	TAILQ_FOREACH(bdev, &g_bdev_nodes, link) {
 		if (strcmp(bdev->bdev.name, r->name) == 0) {
 			bdev_found = true;
@@ -386,17 +432,27 @@ verify_zone_bdev(struct rpc_construct_zone_block *r, bool presence)
 				break;
 			}
 
+			expected_optimal_open_zones = spdk_max(r->optimal_open_zones, 1);
+			expected_num_zones = BLOCK_CNT / spdk_align64pow2(r->zone_capacity) / expected_optimal_open_zones;
+			expected_num_zones *= expected_optimal_open_zones;
+
+			CU_ASSERT(bdev->num_zones == expected_num_zones);
 			CU_ASSERT(bdev->bdev.zoned == true);
-			CU_ASSERT(bdev->bdev.blockcnt == BLOCK_CNT);
+			CU_ASSERT(bdev->bdev.blockcnt == expected_num_zones * spdk_align64pow2(r->zone_capacity));
 			CU_ASSERT(bdev->bdev.blocklen == BLOCK_SIZE);
 			CU_ASSERT(bdev->bdev.ctxt == bdev);
 			CU_ASSERT(bdev->bdev.fn_table == &zone_block_fn_table);
 			CU_ASSERT(bdev->bdev.module == &bdev_zoned_if);
 			CU_ASSERT(bdev->bdev.write_unit_size == 1);
 			CU_ASSERT(bdev->bdev.zone_size == spdk_align64pow2(r->zone_capacity));
-			CU_ASSERT(bdev->bdev.optimal_open_zones == r->optimal_open_zones);
+			CU_ASSERT(bdev->bdev.optimal_open_zones == expected_optimal_open_zones);
 			CU_ASSERT(bdev->bdev.max_open_zones == 0);
 
+			for (i = 0; i < bdev->num_zones; i++) {
+				zone = &bdev->zones[i];
+				CU_ASSERT(zone->zone_info.state == SPDK_BDEV_ZONE_STATE_FULL);
+				CU_ASSERT(zone->zone_info.capacity == r->zone_capacity);
+			}
 			break;
 		}
 	}
@@ -409,13 +465,43 @@ verify_zone_bdev(struct rpc_construct_zone_block *r, bool presence)
 }
 
 static void
+send_create_vbdev(char *vdev_name, char *name, uint64_t zone_capacity, uint64_t optimal_open_zones,
+		  bool create_bdev, bool success)
+{
+	initialize_create_req(vdev_name, name, zone_capacity, optimal_open_zones, create_bdev);
+	rpc_zone_block_create(NULL, NULL);
+	CU_ASSERT(g_rpc_err != success);
+	verify_zone_config(success);
+	verify_zone_bdev(success);
+	free_create_req();
+}
+
+static void
+send_delete_vbdev(char *name, bool success)
+{
+	initialize_delete_req(name);
+	rpc_zone_block_delete(NULL, NULL);
+	verify_config_present(name, false);
+	verify_bdev_present(name, false);
+	CU_ASSERT(g_rpc_err != success);
+	free_delete_req();
+}
+
+static void
+test_cleanup(void)
+{
+	CU_ASSERT(spdk_thread_is_idle(g_thread));
+	zone_block_finish();
+	base_bdevs_cleanup();
+	free_test_globals();
+}
+
+static void
 test_zone_block_create(void)
 {
-	struct rpc_construct_zone_block req;
-	struct rpc_delete_zone_block delete_req;
 	struct spdk_bdev *bdev;
 	char *name = "Nvme0n1";
-	size_t num_zones = 20;
+	size_t num_zones = 16;
 	size_t zone_capacity = BLOCK_CNT / num_zones;
 
 	CU_ASSERT(zone_block_init() == 0);
@@ -423,53 +509,33 @@ test_zone_block_create(void)
 	/* Create zoned virtual device before nvme device */
 	verify_config_present("zone_dev1", false);
 	verify_bdev_present("zone_dev1", false);
-	initialize_create_req(&req, "zone_dev1", name, zone_capacity, 1, false);
+	initialize_create_req("zone_dev1", name, zone_capacity, 1, false);
 	rpc_zone_block_create(NULL, NULL);
 	CU_ASSERT(g_rpc_err == 0);
-	verify_zone_config(&req, true);
-	verify_zone_bdev(&req, false);
+	verify_zone_config(true);
+	verify_zone_bdev(false);
 	bdev = create_nvme_bdev();
 	zone_block_examine(bdev);
-	verify_zone_bdev(&req, true);
-	free_test_req(&req);
+	verify_zone_bdev(true);
+	free_create_req();
 
 	/* Delete bdev */
-	create_delete_req(&delete_req, "zone_dev1");
-	rpc_zone_block_delete(NULL, NULL);
-	verify_config_present("zone_dev1", false);
-	verify_bdev_present("zone_dev1", false);
-	CU_ASSERT(g_rpc_err == 0);
+	send_delete_vbdev("zone_dev1", true);
 
 	/* Create zoned virtual device and verify its correctness */
 	verify_config_present("zone_dev1", false);
-	verify_bdev_present("zone_dev1", false);
-	initialize_create_req(&req, "zone_dev1", name, zone_capacity, 1, false);
-	rpc_zone_block_create(NULL, NULL);
-	CU_ASSERT(g_rpc_err == 0);
-	verify_zone_config(&req, true);
-	verify_zone_bdev(&req, true);
-	free_test_req(&req);
-
-	/* Delete bdev */
-	create_delete_req(&delete_req, "zone_dev1");
-	rpc_zone_block_delete(NULL, NULL);
-	verify_config_present("zone_dev1", false);
-	verify_bdev_present("zone_dev1", false);
-	CU_ASSERT(g_rpc_err == 0);
+	send_create_vbdev("zone_dev1", name, zone_capacity, 1, false, true);
+	send_delete_vbdev("zone_dev1", true);
 
 	while (spdk_thread_poll(g_thread, 0, 0) > 0) {}
-	zone_block_finish();
-	base_bdevs_cleanup();
-	SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&g_bdev_list));
+	test_cleanup();
 }
 
 static void
 test_zone_block_create_invalid(void)
 {
-	struct rpc_construct_zone_block req;
-	struct rpc_delete_zone_block delete_req;
 	char *name = "Nvme0n1";
-	size_t num_zones = 10;
+	size_t num_zones = 8;
 	size_t zone_capacity = BLOCK_CNT / num_zones;
 
 	CU_ASSERT(zone_block_init() == 0);
@@ -477,57 +543,207 @@ test_zone_block_create_invalid(void)
 	/* Create zoned virtual device and verify its correctness */
 	verify_config_present("zone_dev1", false);
 	verify_bdev_present("zone_dev1", false);
-	initialize_create_req(&req, "zone_dev1", name, zone_capacity, 1, true);
-	rpc_zone_block_create(NULL, NULL);
-	CU_ASSERT(g_rpc_err == 0);
-	verify_zone_config(&req, true);
-	verify_zone_bdev(&req, true);
-	free_test_req(&req);
+	send_create_vbdev("zone_dev1", name, zone_capacity, 1, true, true);
 
 	/* Try to create another zoned virtual device on the same bdev */
-	initialize_create_req(&req, "zone_dev2", name, zone_capacity, 1, false);
-	rpc_zone_block_create(NULL, NULL);
-	CU_ASSERT(g_rpc_err == 1);
-	verify_config_present("zone_dev2", false);
-	verify_bdev_present("zone_dev2", false);
-	free_test_req(&req);
+	send_create_vbdev("zone_dev2", name, zone_capacity, 1, false, false);
 
 	/* Try to create zoned virtual device on the zoned bdev */
-	initialize_create_req(&req, "zone_dev2", "zone_dev1", zone_capacity, 1, false);
-	rpc_zone_block_create(NULL, NULL);
-	CU_ASSERT(g_rpc_err == 1);
-	verify_config_present("zone_dev2", false);
-	verify_bdev_present("zone_dev2", false);
-	free_test_req(&req);
+	send_create_vbdev("zone_dev2", "zone_dev1", zone_capacity, 1, false, false);
 
 	/* Unclaim the base bdev */
-	create_delete_req(&delete_req, "zone_dev1");
-	rpc_zone_block_delete(NULL, NULL);
-	verify_config_present("zone_dev1", false);
-	verify_bdev_present("zone_dev1", false);
-	CU_ASSERT(g_rpc_err == 0);
+	send_delete_vbdev("zone_dev1", true);
 
 	/* Try to create zoned virtual device with 0 zone size */
-	initialize_create_req(&req, "zone_dev2", name, 0, 1, false);
-	rpc_zone_block_create(NULL, NULL);
-	CU_ASSERT(g_rpc_err == 1);
-	verify_config_present("zone_dev2", false);
-	verify_bdev_present("zone_dev2", false);
-	free_test_req(&req);
+	send_create_vbdev("zone_dev1", name, 0, 1, false, false);
 
 	/* Try to create zoned virtual device with 0 optimal number of zones */
-	initialize_create_req(&req, "zone_dev2", name, zone_capacity, 0, false);
-	rpc_zone_block_create(NULL, NULL);
-	verify_config_present("zone_dev2", false);
-	verify_bdev_present("zone_dev2", false);
-	CU_ASSERT(g_rpc_err == 1);
-	free_test_req(&req);
+	send_create_vbdev("zone_dev1", name, zone_capacity, 0, false, false);
 
 	while (spdk_thread_poll(g_thread, 0, 0) > 0) {}
+	test_cleanup();
+}
 
-	zone_block_finish();
-	base_bdevs_cleanup();
-	SPDK_CU_ASSERT_FATAL(TAILQ_EMPTY(&g_bdev_list));
+static void
+bdev_io_zone_info_initialize(struct spdk_bdev_io *bdev_io, struct spdk_bdev *bdev,
+			     uint64_t zone_id, uint32_t num_zones)
+{
+	bdev_io->bdev = bdev;
+	bdev_io->type = SPDK_BDEV_IO_TYPE_GET_ZONE_INFO;
+
+	bdev_io->u.zone_mgmt.zone_id = zone_id;
+
+	bdev_io->u.zone_mgmt.num_zones = num_zones;
+	if (num_zones) {
+		bdev_io->u.zone_mgmt.buf = calloc(num_zones, sizeof(struct spdk_bdev_zone_info));
+		SPDK_CU_ASSERT_FATAL(bdev_io->u.zone_mgmt.buf != NULL);
+	}
+}
+
+static void
+bdev_io_zone_cleanup(struct spdk_bdev_io *bdev_io)
+{
+	free(bdev_io->u.zone_mgmt.buf);
+	free(bdev_io);
+}
+
+static struct bdev_zone_block *
+create_and_get_vbdev(char *vdev_name, char *name, uint64_t num_zones, uint64_t optimal_open_zones,
+		     bool create_bdev)
+{
+	size_t zone_size = BLOCK_CNT / num_zones;
+	struct bdev_zone_block *bdev = NULL;
+
+	send_create_vbdev(vdev_name, name, zone_size, optimal_open_zones, create_bdev, true);
+
+	TAILQ_FOREACH(bdev, &g_bdev_nodes, link) {
+		if (strcmp(bdev->bdev.name, vdev_name) == 0) {
+			break;
+		}
+	}
+
+	SPDK_CU_ASSERT_FATAL(bdev != NULL);
+	return bdev;
+}
+
+static void
+test_supported_io_types(void)
+{
+	struct bdev_zone_block *bdev;
+	char *name = "Nvme0n1";
+	uint32_t num_zones = 8;
+
+	init_test_globals();
+	CU_ASSERT(zone_block_init() == 0);
+
+	/* Create zone dev */
+	bdev = create_and_get_vbdev("zone_dev1", name, num_zones, 1, true);
+
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_ZONE_MANAGEMENT) == true);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_ZONE_APPEND) == false);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_READ) == false);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_WRITE) == false);
+
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_NVME_ADMIN) == false);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_NVME_IO) == false);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_NVME_IO_MD) == false);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP) == false);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_FLUSH) == false);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_RESET) == false);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_WRITE_ZEROES) == false);
+	CU_ASSERT(zone_block_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_ZCOPY) == false);
+
+	send_delete_vbdev("zone_dev1", true);
+	while (spdk_thread_poll(g_thread, 0, 0) > 0) {}
+	test_cleanup();
+}
+
+static void
+send_zone_info(struct bdev_zone_block *bdev, struct spdk_io_channel *ch, uint64_t zone_id,
+	       uint64_t wp,
+	       enum spdk_bdev_zone_state state, uint32_t output_index, bool success)
+{
+	struct spdk_bdev_io *bdev_io;
+	struct spdk_bdev_zone_info *info;
+
+	bdev_io = calloc(1, sizeof(struct spdk_bdev_io));
+	SPDK_CU_ASSERT_FATAL(bdev_io != NULL);
+	bdev_io_zone_info_initialize(bdev_io, &bdev->bdev, zone_id, 1);
+	memset(g_io_output, 0, (g_max_io_size * sizeof(struct io_output)));
+	g_io_output_index = output_index;
+
+	g_io_comp_status = !success;
+	zone_block_submit_request(ch, bdev_io);
+	CU_ASSERT(g_io_comp_status == success);
+
+	if (success) {
+		info = (struct spdk_bdev_zone_info *)bdev_io->u.zone_mgmt.buf;
+		CU_ASSERT(info->zone_id == zone_id);
+		CU_ASSERT(info->capacity == bdev->zone_capacity);
+		CU_ASSERT(info->write_pointer == wp);
+		CU_ASSERT(info->state == state);
+	}
+
+	bdev_io_zone_cleanup(bdev_io);
+}
+
+static void
+test_get_zone_info(void)
+{
+	struct spdk_io_channel *ch;
+	struct bdev_zone_block *bdev;
+	struct spdk_bdev_io *bdev_io;
+	char *name = "Nvme0n1";
+	uint32_t num_zones = 8, i;
+	struct spdk_bdev_zone_info *info;
+
+	init_test_globals();
+	CU_ASSERT(zone_block_init() == 0);
+
+	/* Create zone dev */
+	bdev = create_and_get_vbdev("zone_dev1", name, num_zones, 1, true);
+
+	ch = calloc(1, sizeof(struct spdk_io_channel) + sizeof(struct zone_block_io_channel));
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	/* Get info about each zone */
+	for (i = 0; i < num_zones; i++) {
+		send_zone_info(bdev, ch, i * bdev->bdev.zone_size,
+			       i * bdev->bdev.zone_size + bdev->zone_capacity, SPDK_BDEV_ZONE_STATE_FULL, 0, true);
+	}
+
+	/* Send info asking for 0 zones */
+	bdev_io = calloc(1, sizeof(struct spdk_bdev_io));
+	SPDK_CU_ASSERT_FATAL(bdev_io != NULL);
+	bdev_io_zone_info_initialize(bdev_io, &bdev->bdev, 0, 0);
+	memset(g_io_output, 0, (g_max_io_size * sizeof(struct io_output)));
+	g_io_output_index = 0;
+	zone_block_submit_request(ch, bdev_io);
+	CU_ASSERT(g_io_comp_status);
+	bdev_io_zone_cleanup(bdev_io);
+
+	/* Send info asking for all zones */
+	bdev_io = calloc(1, sizeof(struct spdk_bdev_io));
+	SPDK_CU_ASSERT_FATAL(bdev_io != NULL);
+	bdev_io_zone_info_initialize(bdev_io, &bdev->bdev, 0, num_zones);
+	memset(g_io_output, 0, (g_max_io_size * sizeof(struct io_output)));
+	g_io_output_index = 0;
+	zone_block_submit_request(ch, bdev_io);
+	CU_ASSERT(g_io_comp_status);
+
+	for (i = 0; i < num_zones; i++) {
+		info = &(((struct spdk_bdev_zone_info *)bdev_io->u.zone_mgmt.buf)[i]);
+		CU_ASSERT(info->zone_id == i * bdev->bdev.zone_size);
+		CU_ASSERT(info->capacity == bdev->zone_capacity);
+		CU_ASSERT(info->write_pointer == i * bdev->bdev.zone_size + bdev->zone_capacity);
+		CU_ASSERT(info->state == SPDK_BDEV_ZONE_STATE_FULL);
+	}
+	bdev_io_zone_cleanup(bdev_io);
+
+	/* Send info asking for too many zones */
+	bdev_io = calloc(1, sizeof(struct spdk_bdev_io));
+	SPDK_CU_ASSERT_FATAL(bdev_io != NULL);
+	bdev_io_zone_info_initialize(bdev_io, &bdev->bdev, 0, num_zones + 1);
+	memset(g_io_output, 0, (g_max_io_size * sizeof(struct io_output)));
+	g_io_output_index = 0;
+	zone_block_submit_request(ch, bdev_io);
+	CU_ASSERT(!g_io_comp_status);
+	bdev_io_zone_cleanup(bdev_io);
+
+	/* Send info with misaligned start LBA */
+	send_zone_info(bdev, ch, 1, 0, SPDK_BDEV_ZONE_STATE_FULL, 0, false);
+
+	/* Send info with too high LBA */
+	send_zone_info(bdev, ch, num_zones * bdev->bdev.zone_size, 0, SPDK_BDEV_ZONE_STATE_FULL, 0,
+		       false);
+
+	/* Delete zone dev */
+	send_delete_vbdev("zone_dev1", true);
+
+	while (spdk_thread_poll(g_thread, 0, 0) > 0) {}
+	free(ch);
+
+	test_cleanup();
 }
 
 int main(int argc, char **argv)
@@ -547,7 +763,9 @@ int main(int argc, char **argv)
 
 	if (
 		CU_add_test(suite, "test_zone_block_create", test_zone_block_create) == NULL ||
-		CU_add_test(suite, "test_zone_block_create_invalid", test_zone_block_create_invalid) == NULL
+		CU_add_test(suite, "test_zone_block_create_invalid", test_zone_block_create_invalid) == NULL ||
+		CU_add_test(suite, "test_get_zone_info", test_get_zone_info) == NULL ||
+		CU_add_test(suite, "test_supported_io_types", test_supported_io_types) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

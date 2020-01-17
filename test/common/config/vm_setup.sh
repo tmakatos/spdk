@@ -76,7 +76,7 @@ function install_iscsi_adm()
                 git -C open-iscsi-install/open-iscsi config user.email none
 
                 git -C open-iscsi-install/open-iscsi checkout 86e8892
-                for patch in $(ls open-iscsi-install/patches); do
+                for patch in open-iscsi-install/patches/*; do
                     git -C open-iscsi-install/open-iscsi am ../patches/$patch
                 done
                 sed -i '427s/.*/-1);/' open-iscsi-install/open-iscsi/usr/session_info.c
@@ -639,13 +639,11 @@ wait
 if [ ! -e ~/autorun-spdk.conf ]; then
 	cat > ~/autorun-spdk.conf << EOF
 # assign a value of 1 to all of the pertinent tests
-SPDK_BUILD_DOC=1
 SPDK_BUILD_SHARED_OBJECT=1
-SPDK_RUN_CHECK_FORMAT=1
-SPDK_RUN_SCANBUILD=1
 SPDK_RUN_VALGRIND=1
 SPDK_TEST_CRYPTO=1
 SPDK_RUN_FUNCTIONAL_TEST=1
+SPDK_TEST_AUTOBUILD=1
 SPDK_TEST_UNITTEST=1
 SPDK_TEST_ISCSI=1
 SPDK_TEST_ISCSI_INITIATOR=1

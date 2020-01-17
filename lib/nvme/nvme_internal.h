@@ -355,6 +355,11 @@ enum nvme_qpair_state {
 	NVME_QPAIR_ENABLED,
 };
 
+struct nvme_transport {
+	struct spdk_nvme_transport_ops	ops;
+	TAILQ_ENTRY(nvme_transport)	link;
+};
+
 struct spdk_nvme_qpair {
 	struct spdk_nvme_ctrlr		*ctrlr;
 
@@ -378,6 +383,8 @@ struct spdk_nvme_qpair {
 	 */
 	uint8_t				no_deletion_notification_needed: 1;
 
+	uint8_t				first_fused_submitted: 1;
+
 	enum spdk_nvme_transport_type	trtype;
 
 	STAILQ_HEAD(, nvme_request)	free_req;
@@ -397,6 +404,8 @@ struct spdk_nvme_qpair {
 	struct spdk_nvme_ctrlr_process	*active_proc;
 
 	void				*req_buf;
+
+	const struct nvme_transport	*transport;
 
 	uint8_t				transport_failure_reason: 2;
 };
@@ -1107,6 +1116,8 @@ bool	nvme_completion_is_retry(const struct spdk_nvme_cpl *cpl);
 
 struct spdk_nvme_ctrlr *spdk_nvme_get_ctrlr_by_trid_unsafe(
 	const struct spdk_nvme_transport_id *trid);
+
+const struct nvme_transport *nvme_get_transport(const char *transport_name);
 
 /* Transport specific functions */
 #define DECLARE_TRANSPORT(name) \

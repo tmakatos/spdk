@@ -160,12 +160,14 @@ nvme_fabric_discover_probe(struct spdk_nvmf_discovery_log_page_entry *entry,
 	}
 
 	trid.trtype = entry->trtype;
-	if (!spdk_nvme_transport_available(trid.trtype)) {
+	spdk_nvme_transport_id_populate_trstring(&trid, spdk_nvme_transport_id_trtype_str(entry->trtype));
+	if (!spdk_nvme_transport_available_by_name(trid.trstring)) {
 		SPDK_WARNLOG("NVMe transport type %u not available; skipping probe\n",
 			     trid.trtype);
 		return;
 	}
 
+	snprintf(trid.trstring, sizeof(trid.trstring), "%s", probe_ctx->trid.trstring);
 	trid.adrfam = entry->adrfam;
 
 	/* Ensure that subnqn is null terminated. */

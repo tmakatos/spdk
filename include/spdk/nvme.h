@@ -48,6 +48,11 @@ extern "C" {
 #include "spdk/nvme_spec.h"
 #include "spdk/nvmf_spec.h"
 
+#define SPDK_NVME_TRANSPORT_NAME_FC	"FC"
+#define SPDK_NVME_TRANSPORT_NAME_PCIE	"PCIE"
+#define SPDK_NVME_TRANSPORT_NAME_RDMA	"RDMA"
+#define SPDK_NVME_TRANSPORT_NAME_TCP	"TCP"
+
 /**
  * Opaque handle to a controller. Returned by spdk_nvme_probe()'s attach_cb.
  */
@@ -284,6 +289,11 @@ enum spdk_nvme_transport_type {
 	 * Kernel mdev-based Transport
 	 */
 	SPDK_NVME_TRANSPORT_MUSER = SPDK_NVMF_TRTYPE_MUSER,
+
+	/**
+	 * Custom Transport (Not spec defined)
+	 */
+	SPDK_NVME_TRANSPORT_CUSTOM = 4096,
 };
 
 /* typedef added for coding style reasons */
@@ -298,6 +308,11 @@ typedef enum spdk_nvme_transport_type spdk_nvme_transport_type_t;
  * spdk_nvme_transport_id_parse().
  */
 struct spdk_nvme_transport_id {
+	/**
+	 * NVMe transport string.
+	 */
+	char trstring[SPDK_NVMF_TRSTRING_MAX_LEN + 1];
+
 	/**
 	 * NVMe transport type.
 	 */
@@ -399,6 +414,17 @@ enum spdk_nvme_ctrlr_flags {
  */
 int spdk_nvme_transport_id_parse(struct spdk_nvme_transport_id *trid, const char *str);
 
+
+/**
+ * Fill in the trtype and trstring fields of this trid based on a known transport type.
+ *
+ * \param trid The trid to fill out.
+ * \param trtype The transport type to use for filling the trid fields. Only valid for
+ * transport types referenced in the NVMe-oF spec.
+ */
+void spdk_nvme_trid_populate_transport(struct spdk_nvme_transport_id *trid,
+				       enum spdk_nvme_transport_type trtype);
+
 /**
  * Parse the string representation of a host ID.
  *
@@ -423,6 +449,18 @@ int spdk_nvme_transport_id_parse(struct spdk_nvme_transport_id *trid, const char
  * values on failure.
  */
 int spdk_nvme_host_id_parse(struct spdk_nvme_host_id *hostid, const char *str);
+
+/**
+ * Parse the string representation of a transport ID tranport type into the trid struct.
+ *
+ * \param trid The trid to write to
+ * \param trstring Input string representation of transport type (e.g. "PCIe", "RDMA").
+ *
+ * \return 0 if parsing was successful and trtype is filled out, or negated errno
+ * values if the provided string was an invalid transport string.
+ */
+int spdk_nvme_transport_id_populate_trstring(struct spdk_nvme_transport_id *trid,
+		const char *trstring);
 
 /**
  * Parse the string representation of a transport ID tranport type.
@@ -511,9 +549,21 @@ const char *spdk_nvme_prchk_flags_str(uint32_t prchk_flags);
  *
  * \param trtype NVMe over Fabrics transport type to check.
  *
- * \return true if trtype is supported or false if it is not supported.
+ * \return true if trtype is supported or false if it is not supported or if
+ * SPDK_NVME_TRANSPORT_CUSTOM is supplied as trtype since it can represent multiple
+ * transports.
  */
 bool spdk_nvme_transport_available(enum spdk_nvme_transport_type trtype);
+
+/**
+ * Determine whether the NVMe library can handle a specific NVMe over Fabrics
+ * transport type.
+ *
+ * \param transport_name Name of the NVMe over Fabrics transport type to check.
+ *
+ * \return true if transport_name is supported or false if it is not supported.
+ */
+bool spdk_nvme_transport_available_by_name(const char *transport_name);
 
 /**
  * Callback for spdk_nvme_probe() enumeration.
@@ -1406,6 +1456,46 @@ int spdk_nvme_ctrlr_cmd_get_log_page(struct spdk_nvme_ctrlr *ctrlr,
 				     spdk_nvme_cmd_cb cb_fn, void *cb_arg);
 
 /**
+ * Get a specific log page from the NVMe controller.
+ *
+ * This function is thread safe and can be called at any point while the controller
+ * is attached to the SPDK NVMe driver.
+ *
+ * This function allows specifying extra fields in cdw10 and cdw11 such as
+ * Retain Asynchronous Event and Log Specific Field.
+ *
+ * Call spdk_nvme_ctrlr_process_admin_completions() to poll for completion of
+ * commands submitted through this function.
+ *
+ * \sa spdk_nvme_ctrlr_is_log_page_supported()
+ *
+ * \param ctrlr Opaque handle to NVMe controller.
+ * \param log_page The log page identifier.
+ * \param nsid Depending on the log page, this may be 0, a namespace identifier,
+ * or SPDK_NVME_GLOBAL_NS_TAG.
+ * \param payload The pointer to the payload buffer.
+ * \param payload_size The size of payload buffer.
+ * \param offset Offset in bytes within the log page to start retrieving log page
+ * data. May only be non-zero if the controller supports extended data for Get Log
+ * Page as reported in the controller data log page attributes.
+ * \param cdw10 Value to specify for cdw10.  Specify 0 for numdl - it will be
+ * set by this function based on the payload_size parameter.  Specify 0 for lid -
+ * it will be set by this function based on the log_page parameter.
+ * \param cdw11 Value to specify for cdw11.  Specify 0 for numdu - it will be
+ * set by this function based on the payload_size.
+ * \param cdw14 Value to specify for cdw14.
+ * \param cb_fn Callback function to invoke when the log page has been retrieved.
+ * \param cb_arg Argument to pass to the callback function.
+ *
+ * \return 0 if successfully submitted, negated errno if resources could not be
+ * allocated for this request, -ENXIO if the admin qpair is failed at the transport layer.
+ */
+int spdk_nvme_ctrlr_cmd_get_log_page_ext(struct spdk_nvme_ctrlr *ctrlr, uint8_t log_page,
+		uint32_t nsid, void *payload, uint32_t payload_size,
+		uint64_t offset, uint32_t cdw10, uint32_t cdw11,
+		uint32_t cdw14, spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+
+/**
  * Abort a specific previously-submitted NVMe command.
  *
  * \sa spdk_nvme_ctrlr_register_timeout_callback()
@@ -1895,6 +1985,18 @@ uint32_t spdk_nvme_ns_get_md_size(struct spdk_nvme_ns *ns);
 bool spdk_nvme_ns_supports_extended_lba(struct spdk_nvme_ns *ns);
 
 /**
+ * Check whether if the namespace supports compare operation
+ *
+ * This function is thread safe and can be called at any point while the controller
+ * is attached to the SPDK NVMe driver.
+ *
+ * \param ns Namespace to query.
+ *
+ * \return true if the namespace supports compare operation, or false otherwise.
+ */
+bool spdk_nvme_ns_supports_compare(struct spdk_nvme_ns *ns);
+
+/**
  * Determine the value returned when reading deallocated blocks.
  *
  * If deallocated blocks return 0, the deallocate command can be used as a more
@@ -1942,6 +2044,7 @@ enum spdk_nvme_ns_flags {
 							      metadata is transferred as a contiguous
 							      part of the logical block that it is associated with */
 	SPDK_NVME_NS_WRITE_UNCORRECTABLE_SUPPORTED	= 0x40, /**< The write uncorrectable command is supported */
+	SPDK_NVME_NS_COMPARE_SUPPORTED		= 0x80, /**< The compare command is supported */
 };
 
 /**
@@ -2520,6 +2623,43 @@ int spdk_nvme_ns_cmd_comparev(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *q
  *
  * \param ns NVMe namespace to submit the compare I/O.
  * \param qpair I/O queue pair to submit the request.
+ * \param lba Starting LBA to compare the data.
+ * \param lba_count Length (in sectors) for the compare operation.
+ * \param cb_fn Callback function to invoke when the I/O is completed.
+ * \param cb_arg Argument to pass to the callback function.
+ * \param io_flags Set flags, defined in nvme_spec.h, for this I/O.
+ * \param reset_sgl_fn Callback function to reset scattered payload.
+ * \param next_sge_fn Callback function to iterate each scattered payload memory
+ * segment.
+ * \param metadata Virtual address pointer to the metadata payload, the length
+ * of metadata is specified by spdk_nvme_ns_get_md_size()
+ * \param apptag_mask Application tag mask.
+ * \param apptag Application tag to use end-to-end protection information.
+ *
+ * \return 0 if successfully submitted, negated errnos on the following error conditions:
+ * -EINVAL: The request is malformed.
+ * -ENOMEM: The request cannot be allocated.
+ * -ENXIO: The qpair is failed at the transport level.
+ * -EFAULT: Invalid address was specified as part of payload.  cb_fn is also called
+ *          with error status including dnr=1 in this case.
+ */
+int
+spdk_nvme_ns_cmd_comparev_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+				  uint64_t lba, uint32_t lba_count,
+				  spdk_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t io_flags,
+				  spdk_nvme_req_reset_sgl_cb reset_sgl_fn,
+				  spdk_nvme_req_next_sge_cb next_sge_fn, void *metadata,
+				  uint16_t apptag_mask, uint16_t apptag);
+
+/**
+ * Submit a compare I/O to the specified NVMe namespace.
+ *
+ * The command is submitted to a qpair allocated by spdk_nvme_ctrlr_alloc_io_qpair().
+ * The user must ensure that only one thread submits I/O on a given qpair at any
+ * given time.
+ *
+ * \param ns NVMe namespace to submit the compare I/O.
+ * \param qpair I/O queue pair to submit the request.
  * \param payload Virtual address pointer to the data payload.
  * \param metadata Virtual address pointer to the metadata payload, the length
  * of metadata is specified by spdk_nvme_ns_get_md_size().
@@ -2708,6 +2848,80 @@ void spdk_nvme_cuse_unregister(struct spdk_nvme_ctrlr *ctrlr);
 int spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
                    uint32_t len, size_t mps,
                    void* (*gpa_to_vva)(void* prv, uint64_t addr, uint64_t len));
+
+struct nvme_request;
+
+struct spdk_nvme_transport_ops {
+	char name[SPDK_NVMF_TRSTRING_MAX_LEN + 1];
+
+	enum spdk_nvme_transport_type type;
+
+	struct spdk_nvme_ctrlr *(*ctrlr_construct)(const struct spdk_nvme_transport_id *trid,
+			const struct spdk_nvme_ctrlr_opts *opts,
+			void *devhandle);
+
+	int (*ctrlr_scan)(struct spdk_nvme_probe_ctx *probe_ctx, bool direct_connect);
+
+	int (*ctrlr_destruct)(struct spdk_nvme_ctrlr *ctrlr);
+
+	int (*ctrlr_enable)(struct spdk_nvme_ctrlr *ctrlr);
+
+	int (*ctrlr_set_reg_4)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value);
+
+	int (*ctrlr_set_reg_8)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value);
+
+	int (*ctrlr_get_reg_4)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value);
+
+	int (*ctrlr_get_reg_8)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value);
+
+	uint32_t (*ctrlr_get_max_xfer_size)(struct spdk_nvme_ctrlr *ctrlr);
+
+	uint16_t (*ctrlr_get_max_sges)(struct spdk_nvme_ctrlr *ctrlr);
+
+	void *(*ctrlr_alloc_cmb_io_buffer)(struct spdk_nvme_ctrlr *ctrlr, size_t size);
+
+	int (*ctrlr_free_cmb_io_buffer)(struct spdk_nvme_ctrlr *ctrlr, void *buf, size_t size);
+
+	struct spdk_nvme_qpair *(*ctrlr_create_io_qpair)(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid,
+			const struct spdk_nvme_io_qpair_opts *opts);
+
+	int (*ctrlr_delete_io_qpair)(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair);
+
+	int (*ctrlr_connect_qpair)(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair);
+
+	volatile struct spdk_nvme_registers *(*ctrlr_get_registers)(struct spdk_nvme_ctrlr *ctrlr);
+
+	void (*ctrlr_disconnect_qpair)(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair);
+
+	void (*qpair_abort_reqs)(struct spdk_nvme_qpair *qpair, uint32_t dnr);
+
+	int (*qpair_reset)(struct spdk_nvme_qpair *qpair);
+
+	int (*qpair_submit_request)(struct spdk_nvme_qpair *qpair, struct nvme_request *req);
+
+	int32_t (*qpair_process_completions)(struct spdk_nvme_qpair *qpair, uint32_t max_completions);
+
+	void (*admin_qpair_abort_aers)(struct spdk_nvme_qpair *qpair);
+};
+
+/**
+ * Register the operations for a given transport type.
+ *
+ * This function should be invoked by referencing the macro
+ * SPDK_NVME_TRANSPORT_REGISTER macro in the transport's .c file.
+ *
+ * \param ops The operations associated with an NVMe-oF transport.
+ */
+void spdk_nvme_transport_register(const struct spdk_nvme_transport_ops *ops);
+
+/*
+ * Macro used to register new transports.
+ */
+#define SPDK_NVME_TRANSPORT_REGISTER(name, transport_ops) \
+static void __attribute__((constructor)) spdk_nvme_transport_register_##name(void) \
+{ \
+	spdk_nvme_transport_register(transport_ops); \
+}\
 
 #ifdef __cplusplus
 }

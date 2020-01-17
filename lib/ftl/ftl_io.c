@@ -83,7 +83,7 @@ ftl_io_iovec(struct ftl_io *io)
 uint64_t
 ftl_io_get_lba(const struct ftl_io *io, size_t offset)
 {
-	assert(offset < io->lbk_cnt);
+	assert(offset < io->num_blocks);
 
 	if (io->flags & FTL_IO_VECTOR_LBA) {
 		return io->lba.vector[offset];
@@ -99,45 +99,45 @@ ftl_io_current_lba(const struct ftl_io *io)
 }
 
 void
-ftl_io_advance(struct ftl_io *io, size_t lbk_cnt)
+ftl_io_advance(struct ftl_io *io, size_t num_blocks)
 {
 	struct iovec *iov = ftl_io_iovec(io);
-	size_t iov_lbks, lbk_left = lbk_cnt;
+	size_t iov_blocks, block_left = num_blocks;
 
-	io->pos += lbk_cnt;
+	io->pos += num_blocks;
 
 	if (io->iov_cnt != 0) {
-		while (lbk_left > 0) {
+		while (block_left > 0) {
 			assert(io->iov_pos < io->iov_cnt);
-			iov_lbks = iov[io->iov_pos].iov_len / FTL_BLOCK_SIZE;
+			iov_blocks = iov[io->iov_pos].iov_len / FTL_BLOCK_SIZE;
 
-			if (io->iov_off + lbk_left < iov_lbks) {
-				io->iov_off += lbk_left;
+			if (io->iov_off + block_left < iov_blocks) {
+				io->iov_off += block_left;
 				break;
 			}
 
-			assert(iov_lbks > io->iov_off);
-			lbk_left -= (iov_lbks - io->iov_off);
+			assert(iov_blocks > io->iov_off);
+			block_left -= (iov_blocks - io->iov_off);
 			io->iov_off = 0;
 			io->iov_pos++;
 		}
 	}
 
 	if (io->parent) {
-		ftl_io_advance(io->parent, lbk_cnt);
+		ftl_io_advance(io->parent, num_blocks);
 	}
 }
 
 size_t
-ftl_iovec_num_lbks(struct iovec *iov, size_t iov_cnt)
+ftl_iovec_num_blocks(struct iovec *iov, size_t iov_cnt)
 {
-	size_t lbks = 0, i = 0;
+	size_t num_blocks = 0, i = 0;
 
 	for (; i < iov_cnt; ++i) {
-		lbks += iov[i].iov_len / FTL_BLOCK_SIZE;
+		num_blocks += iov[i].iov_len / FTL_BLOCK_SIZE;
 	}
 
-	return lbks;
+	return num_blocks;
 }
 
 void *
@@ -158,19 +158,19 @@ ftl_io_iovec_len_left(struct ftl_io *io)
 }
 
 static void
-_ftl_io_init_iovec(struct ftl_io *io, const struct iovec *iov, size_t iov_cnt, size_t lbk_cnt)
+_ftl_io_init_iovec(struct ftl_io *io, const struct iovec *iov, size_t iov_cnt, size_t num_blocks)
 {
 	size_t iov_off;
 
 	io->iov_pos = 0;
 	io->iov_cnt = iov_cnt;
-	io->lbk_cnt = lbk_cnt;
+	io->num_blocks = num_blocks;
 
 	memcpy(io->iov, iov, iov_cnt * sizeof(*iov));
 
-	if (lbk_cnt == 0) {
+	if (num_blocks == 0) {
 		for (iov_off = 0; iov_off < iov_cnt; ++iov_off) {
-			io->lbk_cnt += iov[iov_off].iov_len / FTL_BLOCK_SIZE;
+			io->num_blocks += iov[iov_off].iov_len / FTL_BLOCK_SIZE;
 		}
 	}
 }
@@ -190,24 +190,24 @@ ftl_io_add_child(struct ftl_io *io, const struct iovec *iov, size_t iov_cnt)
 	_ftl_io_init_iovec(child, iov, iov_cnt, 0);
 
 	if (io->flags & FTL_IO_VECTOR_LBA) {
-		child->lba.vector = io->lba.vector + io->lbk_cnt;
+		child->lba.vector = io->lba.vector + io->num_blocks;
 	} else {
-		child->lba.single = io->lba.single + io->lbk_cnt;
+		child->lba.single = io->lba.single + io->num_blocks;
 	}
 
-	io->lbk_cnt += child->lbk_cnt;
+	io->num_blocks += child->num_blocks;
 	return 0;
 }
 
 static int
-ftl_io_init_iovec(struct ftl_io *io, const struct iovec *iov, size_t iov_cnt, size_t lbk_cnt)
+ftl_io_init_iovec(struct ftl_io *io, const struct iovec *iov, size_t iov_cnt, size_t num_blocks)
 {
 	struct ftl_io *child;
 	size_t iov_off = 0, iov_left;
 	int rc;
 
 	if (spdk_likely(iov_cnt <= FTL_IO_MAX_IOVEC)) {
-		_ftl_io_init_iovec(io, iov, iov_cnt, lbk_cnt);
+		_ftl_io_init_iovec(io, iov, iov_cnt, num_blocks);
 		return 0;
 	}
 
@@ -228,30 +228,30 @@ ftl_io_init_iovec(struct ftl_io *io, const struct iovec *iov, size_t iov_cnt, si
 		iov_off += iov_left;
 	}
 
-	assert(io->lbk_cnt == lbk_cnt);
+	assert(io->num_blocks == num_blocks);
 	return 0;
 }
 
 void
-ftl_io_shrink_iovec(struct ftl_io *io, size_t lbk_cnt)
+ftl_io_shrink_iovec(struct ftl_io *io, size_t num_blocks)
 {
-	size_t iov_off = 0, lbk_off = 0;
+	size_t iov_off = 0, block_off = 0;
 
-	assert(io->lbk_cnt >= lbk_cnt);
+	assert(io->num_blocks >= num_blocks);
 	assert(io->pos == 0 && io->iov_pos == 0 && io->iov_off == 0);
 
 	for (; iov_off < io->iov_cnt; ++iov_off) {
 		size_t num_iov = io->iov[iov_off].iov_len / FTL_BLOCK_SIZE;
-		size_t num_left = lbk_cnt - lbk_off;
+		size_t num_left = num_blocks - block_off;
 
 		if (num_iov >= num_left) {
 			io->iov[iov_off].iov_len = num_left * FTL_BLOCK_SIZE;
 			io->iov_cnt = iov_off + 1;
-			io->lbk_cnt = lbk_cnt;
+			io->num_blocks = num_blocks;
 			break;
 		}
 
-		lbk_off += num_iov;
+		block_off += num_iov;
 	}
 }
 
@@ -263,7 +263,7 @@ ftl_io_init(struct ftl_io *io, struct spdk_ftl_dev *dev,
 	io->type = type;
 	io->dev = dev;
 	io->lba.single = FTL_LBA_INVALID;
-	io->ppa.ppa = FTL_PPA_INVALID;
+	io->addr.offset = FTL_ADDR_INVALID;
 	io->cb_fn = fn;
 	io->cb_ctx = ctx;
 	io->trace = ftl_trace_alloc_id(dev);
@@ -277,7 +277,7 @@ ftl_io_init_internal(const struct ftl_io_init_opts *opts)
 	struct spdk_ftl_dev *dev = opts->dev;
 	struct iovec iov = {
 		.iov_base = opts->data,
-		.iov_len  = opts->lbk_cnt * FTL_BLOCK_SIZE
+		.iov_len  = opts->num_blocks * FTL_BLOCK_SIZE
 	};
 
 	if (!io) {
@@ -307,7 +307,7 @@ ftl_io_init_internal(const struct ftl_io_init_opts *opts)
 		}
 	}
 
-	if (ftl_io_init_iovec(io, &iov, 1, opts->lbk_cnt)) {
+	if (ftl_io_init_iovec(io, &iov, 1, opts->num_blocks)) {
 		if (!opts->io) {
 			ftl_io_free(io);
 		}
@@ -315,7 +315,7 @@ ftl_io_init_internal(const struct ftl_io_init_opts *opts)
 	}
 
 	if (opts->flags & FTL_IO_VECTOR_LBA) {
-		io->lba.vector = calloc(io->lbk_cnt, sizeof(uint64_t));
+		io->lba.vector = calloc(io->num_blocks, sizeof(uint64_t));
 		if (!io->lba.vector) {
 			ftl_io_free(io);
 			return NULL;
@@ -326,9 +326,10 @@ ftl_io_init_internal(const struct ftl_io_init_opts *opts)
 }
 
 struct ftl_io *
-ftl_io_rwb_init(struct spdk_ftl_dev *dev, struct ftl_band *band,
+ftl_io_rwb_init(struct spdk_ftl_dev *dev, struct ftl_addr addr, struct ftl_band *band,
 		struct ftl_rwb_batch *batch, ftl_io_fn cb)
 {
+	struct ftl_io *io;
 	struct ftl_io_init_opts opts = {
 		.dev		= dev,
 		.io		= NULL,
@@ -337,17 +338,24 @@ ftl_io_rwb_init(struct spdk_ftl_dev *dev, struct ftl_band *band,
 		.size		= sizeof(struct ftl_io),
 		.flags		= 0,
 		.type		= FTL_IO_WRITE,
-		.lbk_cnt	= dev->xfer_size,
+		.num_blocks	= dev->xfer_size,
 		.cb_fn		= cb,
 		.data		= ftl_rwb_batch_get_data(batch),
 		.md		= ftl_rwb_batch_get_md(batch),
 	};
 
-	return ftl_io_init_internal(&opts);
+	io = ftl_io_init_internal(&opts);
+	if (!io) {
+		return NULL;
+	}
+
+	io->addr = addr;
+
+	return io;
 }
 
 struct ftl_io *
-ftl_io_erase_init(struct ftl_band *band, size_t lbk_cnt, ftl_io_fn cb)
+ftl_io_erase_init(struct ftl_band *band, size_t num_blocks, ftl_io_fn cb)
 {
 	struct ftl_io *io;
 	struct ftl_io_init_opts opts = {
@@ -356,9 +364,9 @@ ftl_io_erase_init(struct ftl_band *band, size_t lbk_cnt, ftl_io_fn cb)
 		.rwb_batch	= NULL,
 		.band		= band,
 		.size		= sizeof(struct ftl_io),
-		.flags		= FTL_IO_PPA_MODE,
+		.flags		= FTL_IO_PHYSICAL_MODE,
 		.type		= FTL_IO_ERASE,
-		.lbk_cnt	= 1,
+		.num_blocks	= 1,
 		.cb_fn		= cb,
 		.data		= NULL,
 		.md		= NULL,
@@ -369,7 +377,7 @@ ftl_io_erase_init(struct ftl_band *band, size_t lbk_cnt, ftl_io_fn cb)
 		return NULL;
 	}
 
-	io->lbk_cnt = lbk_cnt;
+	io->num_blocks = num_blocks;
 
 	return io;
 }
@@ -381,7 +389,7 @@ _ftl_user_cb(struct ftl_io *io, void *arg, int status)
 }
 
 struct ftl_io *
-ftl_io_user_init(struct spdk_io_channel *_ioch, uint64_t lba, size_t lbk_cnt, struct iovec *iov,
+ftl_io_user_init(struct spdk_io_channel *_ioch, uint64_t lba, size_t num_blocks, struct iovec *iov,
 		 size_t iov_cnt, spdk_ftl_fn cb_fn, void *cb_ctx, int type)
 {
 	struct ftl_io_channel *ioch = spdk_io_channel_get_ctx(_ioch);
@@ -397,7 +405,7 @@ ftl_io_user_init(struct spdk_io_channel *_ioch, uint64_t lba, size_t lbk_cnt, st
 	io->lba.single = lba;
 	io->user_fn = cb_fn;
 
-	if (ftl_io_init_iovec(io, iov, iov_cnt, lbk_cnt)) {
+	if (ftl_io_init_iovec(io, iov, iov_cnt, num_blocks)) {
 		ftl_io_free(io);
 		return NULL;
 	}
@@ -486,28 +494,10 @@ ftl_io_alloc_child(struct ftl_io *parent)
 	return io;
 }
 
-void
-ftl_io_process_error(struct ftl_io *io, const struct spdk_nvme_cpl *status)
-{
-	char ppa_buf[128];
-
-	/* TODO: add error handling for specifc cases */
-	if (status->status.sct == SPDK_NVME_SCT_MEDIA_ERROR &&
-	    status->status.sc == SPDK_OCSSD_SC_READ_HIGH_ECC) {
-		return;
-	}
-
-	SPDK_ERRLOG("Status code type 0x%x, status code 0x%x for IO type %u @ppa: %s, lba 0x%lx, cnt %lu\n",
-		    status->status.sct, status->status.sc, io->type, ftl_ppa2str(io->ppa, ppa_buf, sizeof(ppa_buf)),
-		    ftl_io_get_lba(io, 0), io->lbk_cnt);
-
-	io->status = -EIO;
-}
-
 void ftl_io_fail(struct ftl_io *io, int status)
 {
 	io->status = status;
-	ftl_io_advance(io, io->lbk_cnt - io->pos);
+	ftl_io_advance(io, io->num_blocks - io->pos);
 }
 
 void *

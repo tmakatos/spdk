@@ -52,6 +52,7 @@
 #include "spdk_internal/log.h"
 
 struct spdk_nvme_rdma_hooks g_nvmf_hooks = {};
+const struct spdk_nvmf_transport_ops spdk_nvmf_transport_rdma;
 
 /*
  RDMA Connection Resource Defaults
@@ -342,7 +343,7 @@ struct spdk_nvmf_rdma_ibv_event_ctx {
 struct spdk_nvmf_rdma_qpair {
 	struct spdk_nvmf_qpair			qpair;
 
-	struct spdk_nvmf_rdma_port		*port;
+	struct spdk_nvmf_rdma_device		*device;
 	struct spdk_nvmf_rdma_poller		*poller;
 
 	struct rdma_cm_id			*cm_id;
@@ -1024,7 +1025,7 @@ spdk_nvmf_rdma_qpair_initialize(struct spdk_nvmf_qpair *qpair)
 	struct ibv_qp_init_attr			ibv_init_attr;
 
 	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
-	device = rqpair->port->device;
+	device = rqpair->device;
 
 	memset(&ibv_init_attr, 0, sizeof(struct ibv_qp_init_attr));
 	ibv_init_attr.qp_context	= rqpair;
@@ -1049,7 +1050,7 @@ spdk_nvmf_rdma_qpair_initialize(struct spdk_nvmf_qpair *qpair)
 		goto error;
 	}
 
-	rc = rdma_create_qp(rqpair->cm_id, rqpair->port->device->pd, &ibv_init_attr);
+	rc = rdma_create_qp(rqpair->cm_id, device->pd, &ibv_init_attr);
 	if (rc) {
 		SPDK_ERRLOG("rdma_create_qp failed: errno %d: %s\n", errno, spdk_strerror(errno));
 		goto error;
@@ -1350,7 +1351,7 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 		return -1;
 	}
 
-	rqpair->port = port;
+	rqpair->device = port->device;
 	rqpair->max_queue_depth = max_queue_depth;
 	rqpair->max_read_depth = max_read_depth;
 	rqpair->cm_id = event->id;
@@ -2011,7 +2012,7 @@ spdk_nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 	uint32_t			num_blocks;
 
 	rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
-	device = rqpair->port->device;
+	device = rqpair->device;
 	rgroup = rqpair->poller->group;
 
 	assert(rdma_req->state != RDMA_REQUEST_STATE_FREE);
@@ -2622,27 +2623,39 @@ spdk_nvmf_rdma_trid_from_cm_id(struct rdma_cm_id *id,
 
 static int
 spdk_nvmf_rdma_listen(struct spdk_nvmf_transport *transport,
-		      const struct spdk_nvme_transport_id *trid)
+		      const struct spdk_nvme_transport_id *trid,
+		      spdk_nvmf_tgt_listen_done_fn cb_fn,
+		      void *cb_arg)
 {
 	struct spdk_nvmf_rdma_transport	*rtransport;
 	struct spdk_nvmf_rdma_device	*device;
-	struct spdk_nvmf_rdma_port	*port_tmp, *port;
+	struct spdk_nvmf_rdma_port	*port;
 	struct addrinfo			*res;
 	struct addrinfo			hints;
 	int				family;
 	int				rc;
 
 	rtransport = SPDK_CONTAINEROF(transport, struct spdk_nvmf_rdma_transport, transport);
+	assert(rtransport->event_channel != NULL);
+
+	pthread_mutex_lock(&rtransport->lock);
+	TAILQ_FOREACH(port, &rtransport->ports, link) {
+		if (spdk_nvme_transport_id_compare(&port->trid, trid) == 0) {
+			goto success;
+		}
+	}
 
 	port = calloc(1, sizeof(*port));
 	if (!port) {
+		SPDK_ERRLOG("Port allocation failed\n");
+		pthread_mutex_unlock(&rtransport->lock);
 		return -ENOMEM;
 	}
 
 	/* Selectively copy the trid. Things like NQN don't matter here - that
 	 * mapping is enforced elsewhere.
 	 */
-	port->trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
+	spdk_nvme_trid_populate_transport(&port->trid, SPDK_NVME_TRANSPORT_RDMA);
 	port->trid.adrfam = trid->adrfam;
 	snprintf(port->trid.traddr, sizeof(port->trid.traddr), "%s", trid->traddr);
 	snprintf(port->trid.trsvcid, sizeof(port->trid.trsvcid), "%s", trid->trsvcid);
@@ -2657,6 +2670,7 @@ spdk_nvmf_rdma_listen(struct spdk_nvmf_transport *transport,
 	default:
 		SPDK_ERRLOG("Unhandled ADRFAM %d\n", port->trid.adrfam);
 		free(port);
+		pthread_mutex_unlock(&rtransport->lock);
 		return -EINVAL;
 	}
 
@@ -2670,20 +2684,8 @@ spdk_nvmf_rdma_listen(struct spdk_nvmf_transport *transport,
 	if (rc) {
 		SPDK_ERRLOG("getaddrinfo failed: %s (%d)\n", gai_strerror(rc), rc);
 		free(port);
+		pthread_mutex_unlock(&rtransport->lock);
 		return -EINVAL;
-	}
-
-	pthread_mutex_lock(&rtransport->lock);
-	assert(rtransport->event_channel != NULL);
-	TAILQ_FOREACH(port_tmp, &rtransport->ports, link) {
-		if (spdk_nvme_transport_id_compare(&port_tmp->trid, &port->trid) == 0) {
-			port_tmp->ref++;
-			freeaddrinfo(res);
-			free(port);
-			/* Already listening at this address */
-			pthread_mutex_unlock(&rtransport->lock);
-			return 0;
-		}
 	}
 
 	rc = rdma_create_id(rtransport->event_channel, &port->id, port, RDMA_PS_TCP);
@@ -2738,14 +2740,15 @@ spdk_nvmf_rdma_listen(struct spdk_nvmf_transport *transport,
 		return -EINVAL;
 	}
 
-	SPDK_INFOLOG(SPDK_LOG_RDMA, "*** NVMf Target Listening on %s port %d ***\n",
-		     port->trid.traddr, ntohs(rdma_get_src_port(port->id)));
-
-	port->ref = 1;
+	SPDK_NOTICELOG("*** NVMe/RDMA Target Listening on %s port %s ***\n",
+		       trid->traddr, trid->trsvcid);
 
 	TAILQ_INSERT_TAIL(&rtransport->ports, port, link);
-	pthread_mutex_unlock(&rtransport->lock);
 
+success:
+	port->ref++;
+	pthread_mutex_unlock(&rtransport->lock);
+	cb_fn(cb_arg, 0);
 	return 0;
 }
 
@@ -2762,7 +2765,7 @@ spdk_nvmf_rdma_stop_listen(struct spdk_nvmf_transport *transport,
 	/* Selectively copy the trid. Things like NQN don't matter here - that
 	 * mapping is enforced elsewhere.
 	 */
-	trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
+	spdk_nvme_trid_populate_transport(&trid, SPDK_NVME_TRANSPORT_RDMA);
 	trid.adrfam = _trid->adrfam;
 	snprintf(trid.traddr, sizeof(port->trid.traddr), "%s", _trid->traddr);
 	snprintf(trid.trsvcid, sizeof(port->trid.trsvcid), "%s", _trid->trsvcid);
@@ -3456,7 +3459,7 @@ spdk_nvmf_rdma_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	rgroup = SPDK_CONTAINEROF(group, struct spdk_nvmf_rdma_poll_group, group);
 	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
 
-	device = rqpair->port->device;
+	device = rqpair->device;
 
 	TAILQ_FOREACH(poller, &rgroup->pollers, link) {
 		if (poller->device == device) {
@@ -3928,7 +3931,7 @@ spdk_nvmf_rdma_trid_from_cm_id(struct rdma_cm_id *id,
 	struct sockaddr *saddr;
 	uint16_t port;
 
-	trid->trtype = SPDK_NVME_TRANSPORT_RDMA;
+	spdk_nvme_trid_populate_transport(trid, SPDK_NVME_TRANSPORT_RDMA);
 
 	if (peer) {
 		saddr = rdma_get_peer_addr(id);
@@ -4080,6 +4083,7 @@ spdk_nvmf_rdma_poll_group_free_stat(struct spdk_nvmf_transport_poll_group_stat *
 }
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_rdma = {
+	.name = "RDMA",
 	.type = SPDK_NVME_TRANSPORT_RDMA,
 	.opts_init = spdk_nvmf_rdma_opts_init,
 	.create = spdk_nvmf_rdma_create,
@@ -4109,4 +4113,5 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_rdma = {
 	.poll_group_free_stat = spdk_nvmf_rdma_poll_group_free_stat,
 };
 
+SPDK_NVMF_TRANSPORT_REGISTER(rdma, &spdk_nvmf_transport_rdma);
 SPDK_LOG_REGISTER_COMPONENT("rdma", SPDK_LOG_RDMA)

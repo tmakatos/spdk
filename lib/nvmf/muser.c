@@ -200,6 +200,10 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
                 struct io_q *cq, uint32_t cdw0, uint16_t sc,
                 uint16_t sct);
 
+static void
+muser_nvmf_subsystem_resumed(struct spdk_nvmf_subsystem *subsys, void *cb_arg,
+                            int status);
+
 /*
  * XXX We need a way to extract the queue ID from an io_q, which is already
  * available in muser_qpair->qpair.qid. Currently we store the type of the
@@ -2194,7 +2198,8 @@ muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
 
 static int
 muser_listen(struct spdk_nvmf_transport *transport,
-	     const struct spdk_nvme_transport_id *trid)
+	     const struct spdk_nvme_transport_id *trid,
+             spdk_nvmf_tgt_listen_done_fn cb_fn, void *cb_arg)
 {
 	struct muser_transport *muser_transport;
 	struct muser_ctrlr *muser_ctrlr;
@@ -2316,6 +2321,8 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	}
 
 	TAILQ_INSERT_TAIL(&muser_transport->ctrlrs, muser_ctrlr, link);
+
+	cb_fn(cb_arg, 0);
 
 	return 0;
 
@@ -2887,41 +2894,6 @@ handle_cmd_req(struct muser_ctrlr * ctrlr, struct spdk_nvme_cmd * cmd,
 	return 0;
 }
 
-/* TODO s/resume/start */
-static void
-muser_nvmf_subsystem_resumed(struct spdk_nvmf_subsystem *subsys, void *cb_arg,
-                            int status)
-{
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr*)cb_arg;
-	int err;
-	struct spdk_nvmf_transport *transport;
-
-	assert(ctrlr != NULL);
-
-	if (status != 0) {
-		ctrlr->err = status;
-		return;
-	}
-
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "NVMf subsystem resumed\n");
-
-	transport = spdk_nvmf_tgt_get_transport(subsys->tgt,
-	                                        SPDK_NVME_TRANSPORT_MUSER);
-	if (transport == NULL) {
-		ctrlr->err = -1;
-		return;
-	}
-
-	err = add_qp(ctrlr, transport, MUSER_DEFAULT_AQ_DEPTH, 0, NULL);
-	if (err != 0) {
-		ctrlr->err = err;
-		err = sem_post(&ctrlr->sem);
-		if (err != 0) {
-			fail_ctrlr(ctrlr);
-		}
-	}
-}
-
 static int
 muser_do_spdk_nvmf_subsystem_resume(struct muser_ctrlr *ctrlr)
 {
@@ -3143,6 +3115,7 @@ muser_opts_init(struct spdk_nvmf_transport_opts *opts)
 }
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_muser = {
+	.name = "muser",
 	.type = SPDK_NVME_TRANSPORT_MUSER,
 	.opts_init = muser_opts_init,
 	.create = muser_create,
@@ -3170,4 +3143,40 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_muser = {
 	.qpair_set_sqsize = muser_qpair_set_sq_size,
 };
 
+/* TODO s/resume/start */
+static void
+muser_nvmf_subsystem_resumed(struct spdk_nvmf_subsystem *subsys, void *cb_arg,
+                            int status)
+{
+	struct muser_ctrlr *ctrlr = (struct muser_ctrlr*)cb_arg;
+	int err;
+	struct spdk_nvmf_transport *transport;
+
+	assert(ctrlr != NULL);
+
+	if (status != 0) {
+		ctrlr->err = status;
+		return;
+	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "NVMf subsystem resumed\n");
+
+	transport = spdk_nvmf_tgt_get_transport(subsys->tgt,
+	                                        spdk_nvmf_transport_muser.name);
+	if (transport == NULL) {
+		ctrlr->err = -1;
+		return;
+	}
+
+	err = add_qp(ctrlr, transport, MUSER_DEFAULT_AQ_DEPTH, 0, NULL);
+	if (err != 0) {
+		ctrlr->err = err;
+		err = sem_post(&ctrlr->sem);
+		if (err != 0) {
+			fail_ctrlr(ctrlr);
+		}
+	}
+}
+
+SPDK_NVMF_TRANSPORT_REGISTER(muser, &spdk_nvmf_transport_muser);
 SPDK_LOG_REGISTER_COMPONENT("nvmf_muser", SPDK_LOG_NVMF_MUSER)

@@ -115,7 +115,8 @@ spdk_rpc_bdev_nvme_set_options(struct spdk_jsonrpc_request *request,
 
 	return;
 }
-SPDK_RPC_REGISTER("bdev_nvme_set_options", spdk_rpc_bdev_nvme_set_options, SPDK_RPC_STARTUP)
+SPDK_RPC_REGISTER("bdev_nvme_set_options", spdk_rpc_bdev_nvme_set_options,
+		  SPDK_RPC_STARTUP | SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(bdev_nvme_set_options, set_bdev_nvme_options)
 
 struct rpc_bdev_nvme_hotplug {
@@ -266,6 +267,15 @@ spdk_rpc_bdev_nvme_attach_controller(struct spdk_jsonrpc_request *request,
 		SPDK_ERRLOG("spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
 						 "spdk_json_decode_object failed");
+		goto cleanup;
+	}
+
+	/* Parse trstring */
+	rc = spdk_nvme_transport_id_populate_trstring(&trid, ctx->req.trtype);
+	if (rc < 0) {
+		SPDK_ERRLOG("Failed to parse trtype: %s\n", ctx->req.trtype);
+		spdk_jsonrpc_send_error_response_fmt(request, -EINVAL, "Failed to parse trtype: %s",
+						     ctx->req.trtype);
 		goto cleanup;
 	}
 

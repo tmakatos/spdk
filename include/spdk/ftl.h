@@ -35,8 +35,6 @@
 #define SPDK_FTL_H
 
 #include "spdk/stdinc.h"
-#include "spdk/nvme.h"
-#include "spdk/nvme_ocssd.h"
 #include "spdk/uuid.h"
 #include "spdk/thread.h"
 #include "spdk/bdev.h"
@@ -83,7 +81,7 @@ struct spdk_ftl_conf {
 	/* IO pool size per user thread */
 	size_t					user_io_pool_size;
 
-	/* Lowest percentage of invalid lbks for a band to be defragged */
+	/* Lowest percentage of invalid blocks for a band to be defragged */
 	size_t					invalid_thld;
 
 	/* User writes limits */
@@ -95,6 +93,9 @@ struct spdk_ftl_conf {
 	/* Allow for partial recovery from open bands instead of returning error */
 	bool					allow_open_bands;
 
+	/* Use append instead of write */
+	bool					use_append;
+
 	struct {
 		/* Maximum number of concurrent requests */
 		size_t				max_request_cnt;
@@ -103,22 +104,14 @@ struct spdk_ftl_conf {
 	} nv_cache;
 };
 
-/* Range of parallel units (inclusive) */
-struct spdk_ftl_punit_range {
-	unsigned int				begin;
-	unsigned int				end;
-};
-
 enum spdk_ftl_mode {
 	/* Create new device */
 	SPDK_FTL_MODE_CREATE = (1 << 0),
 };
 
 struct spdk_ftl_dev_init_opts {
-	/* NVMe controller */
-	struct spdk_nvme_ctrlr			*ctrlr;
-	/* Controller's transport ID */
-	struct spdk_nvme_transport_id		trid;
+	/* Underlying device */
+	struct spdk_bdev_desc			*base_bdev_desc;
 	/* Write buffer cache */
 	struct spdk_bdev_desc			*cache_bdev_desc;
 
@@ -131,8 +124,6 @@ struct spdk_ftl_dev_init_opts {
 	const struct spdk_ftl_conf		*conf;
 	/* Device's name */
 	const char				*name;
-	/* Parallel unit range */
-	struct spdk_ftl_punit_range		range;
 	/* Mode flags */
 	unsigned int				mode;
 	/* Device UUID (valid when restoring device from disk) */
@@ -142,12 +133,10 @@ struct spdk_ftl_dev_init_opts {
 struct spdk_ftl_attrs {
 	/* Device's UUID */
 	struct spdk_uuid			uuid;
-	/* Parallel unit range */
-	struct spdk_ftl_punit_range		range;
 	/* Number of logical blocks */
-	uint64_t				lbk_cnt;
+	uint64_t				num_blocks;
 	/* Logical block size */
-	size_t					lbk_size;
+	size_t					block_size;
 	/* Write buffer cache */
 	struct spdk_bdev_desc			*cache_bdev_desc;
 	/* Number of zones per parallel unit in the underlying device (including any offline ones) */
@@ -158,44 +147,14 @@ struct spdk_ftl_attrs {
 	struct spdk_ftl_conf			conf;
 };
 
-struct ftl_module_init_opts {
-	/* Thread on which to poll for ANM events */
-	struct spdk_thread			*anm_thread;
-};
-
 typedef void (*spdk_ftl_fn)(void *, int);
 typedef void (*spdk_ftl_init_fn)(struct spdk_ftl_dev *, void *, int);
-
-/**
- * Initialize the FTL module.
- *
- * \param opts module configuration
- * \param cb callback function to call when the module is initialized
- * \param cb_arg callback's argument
- *
- * \return 0 if successfully started initialization, negative values if
- * resources could not be allocated.
- */
-int spdk_ftl_module_init(const struct ftl_module_init_opts *opts, spdk_ftl_fn cb, void *cb_arg);
-
-/**
- * Deinitialize the FTL module. All FTL devices have to be unregistered prior to
- * calling this function.
- *
- * \param cb callback function to call when the deinitialization is completed
- * \param cb_arg callback's argument
- *
- * \return 0 if successfully scheduled deinitialization, negative errno
- * otherwise.
- */
-int spdk_ftl_module_fini(spdk_ftl_fn cb, void *cb_arg);
 
 /**
  * Initialize the FTL on given NVMe device and parallel unit range.
  *
  * Covers the following:
- * - initialize and register NVMe ctrlr,
- * - retrieve geometry and check if the device has proper configuration,
+ * - retrieve zone device information,
  * - allocate buffers and resources,
  * - initialize internal structures,
  * - initialize internal thread(s),

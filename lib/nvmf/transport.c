@@ -42,30 +42,49 @@
 #include "spdk/queue.h"
 #include "spdk/util.h"
 
-static const struct spdk_nvmf_transport_ops *const g_transport_ops[] = {
-#ifdef SPDK_CONFIG_RDMA
-	&spdk_nvmf_transport_rdma,
-#endif
-	&spdk_nvmf_transport_tcp,
-#ifdef SPDK_CONFIG_FC
-	&spdk_nvmf_transport_fc,
-#endif
-	&spdk_nvmf_transport_muser,
-};
-
-#define NUM_TRANSPORTS (SPDK_COUNTOF(g_transport_ops))
 #define MAX_MEMPOOL_NAME_LENGTH 40
 
+struct nvmf_transport_ops_list_element {
+	struct spdk_nvmf_transport_ops			ops;
+	TAILQ_ENTRY(nvmf_transport_ops_list_element)	link;
+};
+
+TAILQ_HEAD(nvmf_transport_ops_list, nvmf_transport_ops_list_element)
+g_spdk_nvmf_transport_ops = TAILQ_HEAD_INITIALIZER(g_spdk_nvmf_transport_ops);
+
 static inline const struct spdk_nvmf_transport_ops *
-spdk_nvmf_get_transport_ops(enum spdk_nvme_transport_type type)
+spdk_nvmf_get_transport_ops(const char *transport_name)
 {
-	size_t i;
-	for (i = 0; i != NUM_TRANSPORTS; i++) {
-		if (g_transport_ops[i]->type == type) {
-			return g_transport_ops[i];
+	struct nvmf_transport_ops_list_element *ops;
+	TAILQ_FOREACH(ops, &g_spdk_nvmf_transport_ops, link) {
+		if (strcasecmp(transport_name, ops->ops.name) == 0) {
+			return &ops->ops;
 		}
 	}
 	return NULL;
+}
+
+void
+spdk_nvmf_transport_register(const struct spdk_nvmf_transport_ops *ops)
+{
+	struct nvmf_transport_ops_list_element *new_ops;
+
+	if (spdk_nvmf_get_transport_ops(ops->name) != NULL) {
+		SPDK_ERRLOG("Double registering nvmf transport type %s.\n", ops->name);
+		assert(false);
+		return;
+	}
+
+	new_ops = calloc(1, sizeof(*new_ops));
+	if (new_ops == NULL) {
+		SPDK_ERRLOG("Unable to allocate memory to register new transport type %s.\n", ops->name);
+		assert(false);
+		return;
+	}
+
+	new_ops->ops = *ops;
+
+	TAILQ_INSERT_TAIL(&g_spdk_nvmf_transport_ops, new_ops, link);
 }
 
 const struct spdk_nvmf_transport_opts *
@@ -81,32 +100,29 @@ spdk_nvmf_get_transport_type(struct spdk_nvmf_transport *transport)
 }
 
 struct spdk_nvmf_transport *
-spdk_nvmf_transport_create(enum spdk_nvme_transport_type type,
-			   struct spdk_nvmf_transport_opts *opts)
+spdk_nvmf_transport_create(const char *transport_name, struct spdk_nvmf_transport_opts *opts)
 {
 	const struct spdk_nvmf_transport_ops *ops = NULL;
 	struct spdk_nvmf_transport *transport;
 	char spdk_mempool_name[MAX_MEMPOOL_NAME_LENGTH];
 	int chars_written;
 
-	ops = spdk_nvmf_get_transport_ops(type);
+	ops = spdk_nvmf_get_transport_ops(transport_name);
 	if (!ops) {
-		SPDK_ERRLOG("Transport type '%s' unavailable.\n",
-			    spdk_nvme_transport_id_trtype_str(type));
+		SPDK_ERRLOG("Transport type '%s' unavailable.\n", transport_name);
 		return NULL;
 	}
 
 	transport = ops->create(opts);
 	if (!transport) {
-		SPDK_ERRLOG("Unable to create new transport of type %s\n",
-			    spdk_nvme_transport_id_trtype_str(type));
+		SPDK_ERRLOG("Unable to create new transport of type %s\n", transport_name);
 		return NULL;
 	}
 
 	transport->ops = ops;
 	transport->opts = *opts;
 	chars_written = snprintf(spdk_mempool_name, MAX_MEMPOOL_NAME_LENGTH, "%s_%s_%s", "spdk_nvmf",
-				 spdk_nvme_transport_id_trtype_str(type), "data");
+				 transport_name, "data");
 	if (chars_written < 0) {
 		SPDK_ERRLOG("Unable to generate transport data buffer pool name.\n");
 		ops->destroy(transport);
@@ -159,9 +175,11 @@ spdk_nvmf_transport_destroy(struct spdk_nvmf_transport *transport)
 
 int
 spdk_nvmf_transport_listen(struct spdk_nvmf_transport *transport,
-			   const struct spdk_nvme_transport_id *trid)
+			   const struct spdk_nvme_transport_id *trid,
+			   spdk_nvmf_tgt_listen_done_fn cb_fn,
+			   void *cb_arg)
 {
-	return transport->ops->listen(transport, trid);
+	return transport->ops->listen(transport, trid, cb_fn, cb_arg);
 }
 
 int
@@ -319,15 +337,14 @@ spdk_nvmf_transport_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 }
 
 bool
-spdk_nvmf_transport_opts_init(enum spdk_nvme_transport_type type,
+spdk_nvmf_transport_opts_init(const char *transport_name,
 			      struct spdk_nvmf_transport_opts *opts)
 {
 	const struct spdk_nvmf_transport_ops *ops;
 
-	ops = spdk_nvmf_get_transport_ops(type);
+	ops = spdk_nvmf_get_transport_ops(transport_name);
 	if (!ops) {
-		SPDK_ERRLOG("Transport type %s unavailable.\n",
-			    spdk_nvme_transport_id_trtype_str(type));
+		SPDK_ERRLOG("Transport type %s unavailable.\n", transport_name);
 		return false;
 	}
 

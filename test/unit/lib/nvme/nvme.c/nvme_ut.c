@@ -1,8 +1,8 @@
 /*-
  *   BSD LICENSE
  *
- *   Copyright (c) Intel Corporation.
- *   All rights reserved.
+ *   Copyright (c) Intel Corporation. All rights reserved.
+ *   Copyright (c) 2020 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -44,8 +44,8 @@
 DEFINE_STUB_V(nvme_ctrlr_proc_get_ref, (struct spdk_nvme_ctrlr *ctrlr));
 DEFINE_STUB_V(nvme_ctrlr_proc_put_ref, (struct spdk_nvme_ctrlr *ctrlr));
 DEFINE_STUB_V(nvme_ctrlr_fail, (struct spdk_nvme_ctrlr *ctrlr, bool hotremove));
-DEFINE_STUB(spdk_nvme_transport_available, bool,
-	    (enum spdk_nvme_transport_type trtype), true);
+DEFINE_STUB(spdk_nvme_transport_available_by_name, bool,
+	    (const char *transport_name), true);
 /* return anything non-NULL, this won't be deferenced anywhere in this test */
 DEFINE_STUB(spdk_nvme_ctrlr_get_current_process, struct spdk_nvme_ctrlr_process *,
 	    (struct spdk_nvme_ctrlr *ctrlr), (struct spdk_nvme_ctrlr_process *)(uintptr_t)0x1);
@@ -61,6 +61,9 @@ DEFINE_STUB(nvme_transport_ctrlr_construct, struct spdk_nvme_ctrlr *,
 	     const struct spdk_nvme_ctrlr_opts *opts,
 	     void *devhandle), NULL);
 DEFINE_STUB_V(nvme_io_msg_ctrlr_detach, (struct spdk_nvme_ctrlr *ctrlr));
+DEFINE_STUB(spdk_nvme_transport_available, bool,
+	    (enum spdk_nvme_transport_type trtype), true);
+
 
 static bool ut_destruct_called = false;
 void
@@ -178,7 +181,7 @@ test_spdk_nvme_probe(void)
 	 * called for any controllers already initialized by the primary
 	 * process.
 	 */
-	MOCK_SET(spdk_nvme_transport_available, false);
+	MOCK_SET(spdk_nvme_transport_available_by_name, false);
 	MOCK_SET(spdk_process_is_primary, true);
 	dummy.initialized = true;
 	g_spdk_nvme_driver = &dummy;
@@ -186,7 +189,7 @@ test_spdk_nvme_probe(void)
 	CU_ASSERT(rc == -1);
 
 	/* driver init passes, transport available, secondary call attach_cb */
-	MOCK_SET(spdk_nvme_transport_available, true);
+	MOCK_SET(spdk_nvme_transport_available_by_name, true);
 	MOCK_SET(spdk_process_is_primary, false);
 	MOCK_SET(spdk_memzone_lookup, g_spdk_nvme_driver);
 	dummy.initialized = true;
@@ -240,7 +243,7 @@ test_spdk_nvme_connect(void)
 	/* driver init passes, transport available, secondary process connects ctrlr */
 	MOCK_SET(spdk_process_is_primary, false);
 	MOCK_SET(spdk_memzone_lookup, g_spdk_nvme_driver);
-	MOCK_SET(spdk_nvme_transport_available, true);
+	MOCK_SET(spdk_nvme_transport_available_by_name, true);
 	memset(&trid, 0, sizeof(trid));
 	trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
 	ret_ctrlr = spdk_nvme_connect(&trid, NULL, 0);
@@ -988,7 +991,8 @@ test_spdk_nvme_transport_id_parse_trtype(void)
 	/* test function returned value when str and strtype not NULL, but str value
 	 * not "PCIe" or "RDMA" */
 	str = "unit_test";
-	CU_ASSERT(spdk_nvme_transport_id_parse_trtype(trtype, str) == (-ENOENT));
+	CU_ASSERT(spdk_nvme_transport_id_parse_trtype(trtype, str) == 0);
+	CU_ASSERT((*trtype) == SPDK_NVME_TRANSPORT_CUSTOM);
 
 	/* test trtype value when use function "strcasecmp" to compare str and "PCIe"，not case-sensitive */
 	str = "PCIe";
@@ -1206,14 +1210,16 @@ test_nvme_request_check_timeout(void)
 
 struct nvme_completion_poll_status g_status;
 uint64_t completion_delay, timeout_in_secs;
+int g_process_comp_result;
+
 int
 spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_completions)
 {
 	spdk_delay_us(completion_delay * spdk_get_ticks_hz());
 
-	g_status.done = completion_delay < timeout_in_secs ? true : false;
+	g_status.done = completion_delay < timeout_in_secs && g_process_comp_result == 0 ? true : false;
 
-	return 0;
+	return g_process_comp_result;
 }
 
 static void
@@ -1231,7 +1237,19 @@ test_nvme_wait_for_completion(void)
 	g_status.done = true;
 	rc = spdk_nvme_wait_for_completion_timeout(&qpair, &g_status, timeout_in_secs);
 	CU_ASSERT(g_status.done == false);
-	CU_ASSERT(rc == -EIO);
+	CU_ASSERT(rc == -ECANCELED);
+
+	/* spdk_nvme_qpair_process_completions returns error */
+	g_process_comp_result = -1;
+	completion_delay = 1;
+	timeout_in_secs = 2;
+	rc = spdk_nvme_wait_for_completion_timeout(&qpair, &g_status, timeout_in_secs);
+	CU_ASSERT(rc == -ECANCELED);
+	CU_ASSERT(g_status.done == false);
+	CU_ASSERT(g_status.cpl.status.sct == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(g_status.cpl.status.sc == SPDK_NVME_SC_ABORTED_SQ_DELETION);
+
+	g_process_comp_result = 0;
 
 	/* complete in time */
 	completion_delay = 1;
@@ -1239,6 +1257,22 @@ test_nvme_wait_for_completion(void)
 	rc = spdk_nvme_wait_for_completion_timeout(&qpair, &g_status, timeout_in_secs);
 	CU_ASSERT(g_status.done == true);
 	CU_ASSERT(rc == 0);
+
+	/* spdk_nvme_wait_for_completion */
+	/* spdk_nvme_qpair_process_completions returns error */
+	g_process_comp_result = -1;
+	rc = spdk_nvme_wait_for_completion(&qpair, &g_status);
+	CU_ASSERT(rc == -ECANCELED);
+	CU_ASSERT(g_status.done == false);
+	CU_ASSERT(g_status.cpl.status.sct == SPDK_NVME_SCT_GENERIC);
+	CU_ASSERT(g_status.cpl.status.sc == SPDK_NVME_SC_ABORTED_SQ_DELETION);
+
+	g_process_comp_result = 0;
+
+	/* successful completion */
+	rc = spdk_nvme_wait_for_completion(&qpair, &g_status);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_status.done == true);
 }
 
 static void

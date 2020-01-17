@@ -135,10 +135,9 @@ timing_exit wait_for_example
 
 trap - SIGINT SIGTERM EXIT
 
-qemupid=$(cat "$qemu_pidfile" | awk '{printf $0}')
+qemupid=$(awk '{printf $0}' "$qemu_pidfile")
 kill -9 $qemupid
 rm "$qemu_pidfile"
 rm "$test_img"
 
-report_test_completion "nvme_hotplug"
 timing_exit hotplug_test

@@ -31,48 +31,46 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef SPDK_BDEV_FTL_H
-#define SPDK_BDEV_FTL_H
+#ifndef FTL_ADDR_H
+#define FTL_ADDR_H
 
 #include "spdk/stdinc.h"
-#include "spdk/nvme.h"
-#include "spdk/bdev_module.h"
-#include "spdk/ftl.h"
 
-#define FTL_MAX_CONTROLLERS	64
-#define FTL_MAX_BDEVS		(FTL_MAX_CONTROLLERS * 128)
-#define FTL_RANGE_MAX_LENGTH	32
+/* Marks address as invalid */
+#define FTL_ADDR_INVALID	(-1)
+/* Marks LBA as invalid */
+#define FTL_LBA_INVALID		((uint64_t)-1)
+/* Smallest data unit size */
+#define FTL_BLOCK_SIZE		4096
 
-struct spdk_bdev;
-struct spdk_uuid;
+/* This structure represents on-disk address. It can have one of the following */
+/* formats: */
+/*        - offset inside the disk */
+/*        - cache_offset inside the cache (indicated by the cached flag) */
+/*        - packed version of the two formats above (can be only used when the */
+/*          offset can be represented in less than 32 bits) */
+/* Packed format is used, when possible, to avoid wasting RAM on the L2P table. */
+struct ftl_addr {
+	union {
+		struct {
+			uint64_t cache_offset : 63;
+			uint64_t cached	      : 1;
+		};
 
-struct ftl_bdev_info {
-	const char		*name;
-	struct spdk_uuid	uuid;
+		struct {
+			union {
+				struct  {
+					uint32_t cache_offset : 31;
+					uint32_t cached	      : 1;
+				};
+
+				uint32_t offset;
+			};
+			uint32_t rsvd;
+		} pack;
+
+		uint64_t offset;
+	};
 };
 
-struct ftl_bdev_init_opts {
-	/* NVMe controller's transport ID */
-	struct spdk_nvme_transport_id		trid;
-	/* Parallel unit range */
-	struct spdk_ftl_punit_range		range;
-	/* Bdev's name */
-	const char				*name;
-	/* Write buffer bdev's name */
-	const char				*cache_bdev;
-	/* Bdev's mode */
-	uint32_t				mode;
-	/* UUID if device is restored from SSD */
-	struct spdk_uuid			uuid;
-	/* FTL library configuration */
-	struct spdk_ftl_conf			ftl_conf;
-};
-
-typedef void (*ftl_bdev_init_fn)(const struct ftl_bdev_info *, void *, int);
-
-int	bdev_ftl_parse_punits(struct spdk_ftl_punit_range *range, const char *range_string);
-int	bdev_ftl_init_bdev(struct ftl_bdev_init_opts *opts, ftl_bdev_init_fn cb,
-			   void *cb_arg);
-void	bdev_ftl_delete_bdev(const char *name, spdk_bdev_unregister_cb cb_fn, void *cb_arg);
-
-#endif /* SPDK_BDEV_FTL_H */
+#endif /* FTL_ADDR_H */

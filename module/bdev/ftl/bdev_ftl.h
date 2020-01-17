@@ -31,72 +31,40 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef FTL_PPA_H
-#define FTL_PPA_H
+#ifndef SPDK_BDEV_FTL_H
+#define SPDK_BDEV_FTL_H
 
 #include "spdk/stdinc.h"
+#include "spdk/bdev_module.h"
+#include "spdk/ftl.h"
 
-/* Marks PPA as invalid */
-#define FTL_PPA_INVALID		(-1)
-/* Marks LBA as invalid */
-#define FTL_LBA_INVALID		((uint64_t)-1)
-/* Smallest data unit size */
-#define FTL_BLOCK_SIZE		4096
+struct spdk_bdev;
+struct spdk_uuid;
 
-/* This structure represents PPA address. It can have one of the following */
-/* formats: */
-/*        - PPA describing the on-disk address */
-/*        - offset inside the cache (indicated by the cached flag) */
-/*        - packed version of the two formats above (can be only used when the */
-/*          on-disk PPA address can be represented in less than 32 bits) */
-/* Packed format is used, when possible, to avoid wasting RAM on the L2P table. */
-struct ftl_ppa {
-	union {
-		struct {
-			uint64_t lbk	: 32;
-			uint64_t chk	: 16;
-			uint64_t pu	: 8;
-			uint64_t grp	: 7;
-			uint64_t rsvd	: 1;
-		};
-
-		struct {
-			uint64_t offset	: 63;
-			uint64_t cached : 1;
-		};
-
-		struct {
-			union {
-				struct  {
-					uint32_t offset : 31;
-					uint32_t cached : 1;
-				};
-
-				uint32_t ppa;
-			};
-			uint32_t rsvd;
-		} pack;
-
-		uint64_t ppa;
-	};
+struct ftl_bdev_info {
+	const char		*name;
+	struct spdk_uuid	uuid;
 };
 
-struct ftl_ppa_fmt {
-	/* Logical block */
-	unsigned int				lbk_offset;
-	unsigned int				lbk_mask;
-
-	/* Chunk */
-	unsigned int				chk_offset;
-	unsigned int				chk_mask;
-
-	/* Parallel unit (NAND die) */
-	unsigned int				pu_offset;
-	unsigned int				pu_mask;
-
-	/* Group */
-	unsigned int				grp_offset;
-	unsigned int				grp_mask;
+struct ftl_bdev_init_opts {
+	/* Bdev's name */
+	const char				*name;
+	/* Base bdev's name */
+	const char				*base_bdev;
+	/* Write buffer bdev's name */
+	const char				*cache_bdev;
+	/* Bdev's mode */
+	uint32_t				mode;
+	/* UUID if device is restored from SSD */
+	struct spdk_uuid			uuid;
+	/* FTL library configuration */
+	struct spdk_ftl_conf			ftl_conf;
 };
 
-#endif /* FTL_PPA_H */
+typedef void (*ftl_bdev_init_fn)(const struct ftl_bdev_info *, void *, int);
+
+int	bdev_ftl_create_bdev(const struct ftl_bdev_init_opts *bdev_opts,
+			     ftl_bdev_init_fn cb, void *cb_arg);
+void	bdev_ftl_delete_bdev(const char *name, spdk_bdev_unregister_cb cb_fn, void *cb_arg);
+
+#endif /* SPDK_BDEV_FTL_H */

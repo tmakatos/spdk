@@ -222,6 +222,7 @@ struct spdk_bdev_fn_table {
 
 /** bdev I/O completion status */
 enum spdk_bdev_io_status {
+	SPDK_BDEV_IO_STATUS_MISCOMPARE = -5,
 	/*
 	 * NOMEM should be returned when a bdev module cannot start an I/O because of
 	 *  some lack of resources.  It may not be returned for RESET I/O.  I/O completed
@@ -243,6 +244,7 @@ struct spdk_bdev_alias {
 
 typedef TAILQ_HEAD(, spdk_bdev_io) bdev_io_tailq_t;
 typedef STAILQ_HEAD(, spdk_bdev_io) bdev_io_stailq_t;
+typedef TAILQ_HEAD(, lba_range) lba_range_tailq_t;
 
 struct spdk_bdev {
 	/** User context passed in by the backend */
@@ -268,6 +270,9 @@ struct spdk_bdev {
 
 	/** Number of blocks required for write */
 	uint32_t write_unit_size;
+
+	/** Atomic compare & write unit */
+	uint16_t acwu;
 
 	/**
 	 * Specifies an alignment requirement for data buffers associated with an spdk_bdev_io.
@@ -428,6 +433,14 @@ struct spdk_bdev {
 		/** histogram enabled on this bdev */
 		bool	histogram_enabled;
 		bool	histogram_in_progress;
+
+		/** Currently locked ranges for this bdev.  Used to populate new channels. */
+		lba_range_tailq_t locked_ranges;
+
+		/** Pending locked ranges for this bdev.  These ranges are not currently
+		 *  locked due to overlapping with another locked range.
+		 */
+		lba_range_tailq_t pending_locked_ranges;
 	} internal;
 };
 
@@ -452,6 +465,9 @@ struct spdk_bdev_io {
 	/** Enumerated value representing the I/O type. */
 	uint8_t type;
 
+	/** Number of IO submission retries */
+	uint16_t num_retries;
+
 	/** A single iovec element for use by this bdev_io. */
 	struct iovec iov;
 
@@ -465,6 +481,14 @@ struct spdk_bdev_io {
 
 			/** For SG buffer cases, number of iovecs in iovec array. */
 			int iovcnt;
+
+			/** For fused operations such as COMPARE_AND_WRITE, array of iovecs
+			 *  for the second operation.
+			 */
+			struct iovec *fused_iovs;
+
+			/** Number of iovecs in fused_iovs. */
+			int fused_iovcnt;
 
 			/* Metadata buffer */
 			void *md_buf;

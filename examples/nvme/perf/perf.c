@@ -1448,6 +1448,9 @@ add_trid(const char *trid_str)
 		return 1;
 	}
 
+	spdk_nvme_transport_id_populate_trstring(trid,
+			spdk_nvme_transport_id_trtype_str(trid->trtype));
+
 	ns = strcasestr(trid_str, "ns:");
 	if (ns) {
 		char nsid_str[6]; /* 5 digits maximum in an nsid */
@@ -1716,18 +1719,22 @@ parse_args(int argc, char **argv)
 	}
 
 	if (!g_queue_depth) {
+		fprintf(stderr, "missing -q (queue size) operand\n");
 		usage(argv[0]);
 		return 1;
 	}
 	if (!g_io_size_bytes) {
+		fprintf(stderr, "missing -o (block size) operand\n");
 		usage(argv[0]);
 		return 1;
 	}
 	if (!workload_type) {
+		fprintf(stderr, "missing -w (io pattern type) operand\n");
 		usage(argv[0]);
 		return 1;
 	}
 	if (!g_time_in_sec) {
+		fprintf(stderr, "missing -t (test time in seconds) operand\n");
 		usage(argv[0]);
 		return 1;
 	}

@@ -169,12 +169,16 @@ spdk_sock_getaddr(struct spdk_sock *sock, char *saddr, int slen, uint16_t *sport
 }
 
 struct spdk_sock *
-spdk_sock_connect(const char *ip, int port)
+spdk_sock_connect(const char *ip, int port, char *impl_name)
 {
 	struct spdk_net_impl *impl = NULL;
 	struct spdk_sock *sock;
 
 	STAILQ_FOREACH_FROM(impl, &g_net_impls, link) {
+		if (impl_name && strncmp(impl_name, impl->name, strlen(impl->name) + 1)) {
+			continue;
+		}
+
 		sock = impl->connect(ip, port);
 		if (sock != NULL) {
 			sock->net_impl = impl;
@@ -188,12 +192,16 @@ spdk_sock_connect(const char *ip, int port)
 }
 
 struct spdk_sock *
-spdk_sock_listen(const char *ip, int port)
+spdk_sock_listen(const char *ip, int port, char *impl_name)
 {
 	struct spdk_net_impl *impl = NULL;
 	struct spdk_sock *sock;
 
 	STAILQ_FOREACH_FROM(impl, &g_net_impls, link) {
+		if (impl_name && strncmp(impl_name, impl->name, strlen(impl->name) + 1)) {
+			continue;
+		}
+
 		sock = impl->listen(ip, port);
 		if (sock != NULL) {
 			sock->net_impl = impl;
@@ -585,10 +593,21 @@ spdk_sock_group_close(struct spdk_sock_group **group)
 }
 
 void
-spdk_net_impl_register(struct spdk_net_impl *impl)
+spdk_net_impl_register(struct spdk_net_impl *impl, int priority)
 {
-	if (!strcmp("posix", impl->name)) {
-		STAILQ_INSERT_TAIL(&g_net_impls, impl, link);
+	struct spdk_net_impl *cur, *prev;
+
+	impl->priority = priority;
+	prev = NULL;
+	STAILQ_FOREACH(cur, &g_net_impls, link) {
+		if (impl->priority > cur->priority) {
+			break;
+		}
+		prev = cur;
+	}
+
+	if (prev) {
+		STAILQ_INSERT_AFTER(&g_net_impls, prev, impl, link);
 	} else {
 		STAILQ_INSERT_HEAD(&g_net_impls, impl, link);
 	}

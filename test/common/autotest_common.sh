@@ -5,6 +5,10 @@ function xtrace_disable() {
 			XTRACE_DISABLED="yes"
 		fi
 		set +x
+        elif [ -z $XTRACE_NESTING_LEVEL ]; then
+                XTRACE_NESTING_LEVEL=1
+        else
+                XTRACE_NESTING_LEVEL=$((++XTRACE_NESTING_LEVEL))
 	fi
 }
 
@@ -23,7 +27,17 @@ function xtrace_enable() {
 # Keep it as alias to avoid xtrace_enable backtrace always pointing to xtrace_restore.
 # xtrace_enable will appear as called directly from the user script, from the same line
 # that "called" xtrace_restore.
-alias xtrace_restore='if [[ "$PREV_BASH_OPTS" == *"x"* ]]; then set -x; XTRACE_DISABLED="no"; PREV_BASH_OPTS=""; xtrace_enable; fi'
+alias xtrace_restore=\
+'if [ -z $XTRACE_NESTING_LEVEL ]; then
+        if [[ "$PREV_BASH_OPTS" == *"x"* ]]; then
+		XTRACE_DISABLED="no"; PREV_BASH_OPTS=""; set -x; xtrace_enable;
+	fi
+else
+	XTRACE_NESTING_LEVEL=$((--XTRACE_NESTING_LEVEL));
+	if [ $XTRACE_NESTING_LEVEL -eq "0" ]; then
+		unset XTRACE_NESTING_LEVEL
+	fi
+fi'
 
 : ${RUN_NIGHTLY:=0}
 export RUN_NIGHTLY
@@ -35,11 +49,10 @@ export RUN_NIGHTLY_FAILING
 : ${SPDK_BUILD_DOC=0}; export SPDK_BUILD_DOC
 : ${SPDK_BUILD_PACKAGE=0}; export SPDK_BUILD_PACKAGE
 : ${SPDK_BUILD_SHARED_OBJECT=0}; export SPDK_BUILD_SHARED_OBJECT
-: ${SPDK_RUN_CHECK_FORMAT=0}; export SPDK_RUN_CHECK_FORMAT
-: ${SPDK_RUN_SCANBUILD=0}; export SPDK_RUN_SCANBUILD
 : ${SPDK_RUN_VALGRIND=0}; export SPDK_RUN_VALGRIND
 : ${SPDK_RUN_FUNCTIONAL_TEST=0}; export SPDK_RUN_FUNCTIONAL_TEST
 : ${SPDK_TEST_UNITTEST=0}; export SPDK_TEST_UNITTEST
+: ${SPDK_TEST_AUTOBUILD=0}; export SPDK_TEST_AUTOBUILD
 : ${SPDK_TEST_ISAL=0}; export SPDK_TEST_ISAL
 : ${SPDK_TEST_ISCSI=0}; export SPDK_TEST_ISCSI
 : ${SPDK_TEST_ISCSI_INITIATOR=0}; export SPDK_TEST_ISCSI_INITIATOR
@@ -193,11 +206,7 @@ if [ -f /usr/include/libpmem.h ] && [ $SPDK_TEST_REDUCE -eq 1 ]; then
 fi
 
 if [ -d /usr/include/rbd ] &&  [ -d /usr/include/rados ] && [ $SPDK_TEST_RBD -eq 1 ]; then
-	if [ $SPDK_TEST_ISAL -eq 0 ]; then
-		config_params+=' --with-rbd'
-	else
-		echo "rbd not enabled because isal is enabled."
-	fi
+	config_params+=' --with-rbd'
 fi
 
 if [ $SPDK_TEST_VPP -eq 1 ]; then
@@ -321,11 +330,11 @@ function timing_finish() {
 }
 
 function create_test_list() {
-	grep -rshI --exclude="autotest_common.sh" --exclude="$rootdir/test/common/autotest_common.sh" -e "report_test_completion" $rootdir | sed 's/report_test_completion//g; s/[[:blank:]]//g; s/"//g;' > $output_dir/all_tests.txt || true
-}
-
-function report_test_completion() {
-	echo "$1" >> $output_dir/test_completions.txt
+	grep -rshI --exclude="autotest_common.sh" \
+	--exclude="$rootdir/test/common/autotest_common.sh" \
+	-e "run_test " $rootdir | grep -v "#" \
+	| sed 's/^.*run_test/run_test/' | awk '{print $2}' | \
+	sed 's/\"//g' | sort > $output_dir/all_tests.txt || true
 }
 
 function process_core() {
@@ -593,6 +602,7 @@ function run_test() {
 	echo "END TEST $test_name"
 	echo "************************************"
 
+	echo "$test_name" >> $output_dir/test_completions.txt
 	timing_exit $test_name
 	xtrace_restore
 }
@@ -950,7 +960,9 @@ trap "trap - ERR; print_backtrace >&2" ERR
 
 PS4=' \t	\$ '
 if $SPDK_AUTOTEST_X; then
-	# explicitly enable xtraces
+	# explicitly enable xtraces, overriding any tracking information.
+	unset XTRACE_DISABLED
+	unset XTRACE_NESTING_LEVEL
 	set -x
 	xtrace_enable
 else

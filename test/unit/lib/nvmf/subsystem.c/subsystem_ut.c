@@ -66,7 +66,9 @@ DEFINE_STUB(spdk_nvmf_transport_stop_listen,
 
 int
 spdk_nvmf_transport_listen(struct spdk_nvmf_transport *transport,
-			   const struct spdk_nvme_transport_id *trid)
+			   const struct spdk_nvme_transport_id *trid,
+			   spdk_nvmf_tgt_listen_done_fn cb_fn,
+			   void *cb_arg)
 {
 	return 0;
 }
@@ -82,10 +84,10 @@ spdk_nvmf_transport_listener_discover(struct spdk_nvmf_transport *transport,
 static struct spdk_nvmf_transport g_transport = {};
 
 struct spdk_nvmf_transport *
-spdk_nvmf_transport_create(enum spdk_nvme_transport_type type,
+spdk_nvmf_transport_create(const char *transport_name,
 			   struct spdk_nvmf_transport_opts *tprt_opts)
 {
-	if (type == SPDK_NVME_TRANSPORT_RDMA) {
+	if (strcasecmp(transport_name, spdk_nvme_transport_id_trtype_str(SPDK_NVME_TRANSPORT_RDMA))) {
 		return &g_transport;
 	}
 
@@ -99,9 +101,9 @@ spdk_nvmf_tgt_find_subsystem(struct spdk_nvmf_tgt *tgt, const char *subnqn)
 }
 
 struct spdk_nvmf_transport *
-spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt, enum spdk_nvme_transport_type trtype)
+spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt, const char *transport_name)
 {
-	if (trtype == SPDK_NVME_TRANSPORT_RDMA) {
+	if (strncmp(transport_name, SPDK_NVME_TRANSPORT_NAME_RDMA, SPDK_NVMF_TRSTRING_MAX_LEN)) {
 		return &g_transport;
 	}
 

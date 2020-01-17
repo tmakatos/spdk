@@ -185,11 +185,6 @@ struct spdk_nvmf_poll_group {
 	struct spdk_nvmf_poll_group_stat		stat;
 };
 
-typedef enum _spdk_nvmf_request_exec_status {
-	SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE,
-	SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS,
-} spdk_nvmf_request_exec_status;
-
 union nvmf_h2c_msg {
 	struct spdk_nvmf_capsule_cmd			nvmf_cmd;
 	struct spdk_nvme_cmd				nvme_cmd;
@@ -371,10 +366,6 @@ struct spdk_nvmf_subsystem {
 
 	TAILQ_ENTRY(spdk_nvmf_subsystem)	entries;
 };
-
-
-struct spdk_nvmf_transport *spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt,
-		enum spdk_nvme_transport_type);
 
 int spdk_nvmf_poll_group_add_transport(struct spdk_nvmf_poll_group *group,
 				       struct spdk_nvmf_transport *transport);

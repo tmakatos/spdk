@@ -90,7 +90,7 @@ static struct spdk_poller *g_perf_timer = NULL;
 
 static void bdevperf_submit_single(struct io_target *target, struct bdevperf_task *task);
 static void performance_dump(uint64_t io_time_in_usec, uint64_t ema_period);
-static void rpc_perform_tests_cb(int rc);
+static void rpc_perform_tests_cb(void);
 
 struct io_target {
 	char				*name;
@@ -120,7 +120,14 @@ struct io_target_group {
 	TAILQ_ENTRY(io_target_group)	link;
 };
 
-TAILQ_HEAD(, io_target_group) g_head = TAILQ_HEAD_INITIALIZER(g_head);
+struct spdk_bdevperf {
+	TAILQ_HEAD(, io_target_group)	groups;
+};
+
+static struct spdk_bdevperf g_bdevperf = {
+	.groups = TAILQ_HEAD_INITIALIZER(g_bdevperf.groups),
+};
+
 struct io_target_group *g_next_tg;
 static uint32_t g_target_count = 0;
 
@@ -238,16 +245,27 @@ blockdev_heads_init(void)
 		}
 		group->lcore = i;
 		TAILQ_INIT(&group->targets);
-		TAILQ_INSERT_TAIL(&g_head, group, link);
+		TAILQ_INSERT_TAIL(&g_bdevperf.groups, group, link);
 	}
 	return 0;
 
 error:
-	TAILQ_FOREACH_SAFE(group, &g_head, link, tmp) {
-		TAILQ_REMOVE(&g_head, group, link);
+	TAILQ_FOREACH_SAFE(group, &g_bdevperf.groups, link, tmp) {
+		TAILQ_REMOVE(&g_bdevperf.groups, group, link);
 		free(group);
 	}
 	return -1;
+}
+
+static void
+blockdev_heads_destroy(void)
+{
+	struct io_target_group *group, *tmp;
+
+	TAILQ_FOREACH_SAFE(group, &g_bdevperf.groups, link, tmp) {
+		TAILQ_REMOVE(&g_bdevperf.groups, group, link);
+		free(group);
+	}
 }
 
 static void
@@ -272,14 +290,23 @@ bdevperf_free_targets(void)
 	struct io_target_group *group, *tmp_group;
 	struct io_target *target, *tmp_target;
 
-	TAILQ_FOREACH_SAFE(group, &g_head, link, tmp_group) {
-		TAILQ_REMOVE(&g_head, group, link);
+	TAILQ_FOREACH_SAFE(group, &g_bdevperf.groups, link, tmp_group) {
 		TAILQ_FOREACH_SAFE(target, &group->targets, link, tmp_target) {
 			TAILQ_REMOVE(&group->targets, target, link);
 			bdevperf_free_target(target);
 		}
-		free(group);
 	}
+}
+
+static void
+_end_target(struct io_target *target)
+{
+	spdk_poller_unregister(&target->run_timer);
+	if (g_reset) {
+		spdk_poller_unregister(&target->reset_timer);
+	}
+
+	target->is_draining = true;
 }
 
 static void
@@ -287,12 +314,7 @@ _target_gone(void *arg1, void *arg2)
 {
 	struct io_target *target = arg1;
 
-	spdk_poller_unregister(&target->run_timer);
-	if (g_reset) {
-		spdk_poller_unregister(&target->reset_timer);
-	}
-
-	target->is_draining = true;
+	_end_target(target);
 }
 
 static void
@@ -384,7 +406,7 @@ bdevperf_construct_target(struct spdk_bdev *bdev)
 
 	/* Mapping each created target to target group */
 	if (g_next_tg == NULL) {
-		g_next_tg = TAILQ_FIRST(&g_head);
+		g_next_tg = TAILQ_FIRST(&g_bdevperf.groups);
 		assert(g_next_tg != NULL);
 	}
 	group = g_next_tg;
@@ -439,10 +461,22 @@ bdevperf_construct_targets(void)
 }
 
 static void
-bdevperf_fini(int rc)
+bdevperf_fini(void)
+{
+	blockdev_heads_destroy();
+	spdk_app_stop(g_run_rc);
+}
+
+static void
+bdevperf_test_done(void)
 {
 	bdevperf_free_targets();
-	spdk_app_stop(rc);
+
+	if (g_request && !g_shutdown) {
+		rpc_perform_tests_cb();
+	} else {
+		bdevperf_fini();
+	}
 }
 
 static void
@@ -469,11 +503,7 @@ end_run(void *arg1, void *arg2)
 			printf("Test time less than one microsecond, no performance data will be shown\n");
 		}
 
-		if (g_request && !g_shutdown) {
-			rpc_perform_tests_cb(g_run_rc);
-		} else {
-			bdevperf_fini(g_run_rc);
-		}
+		bdevperf_test_done();
 	}
 }
 
@@ -503,7 +533,7 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	if (!success) {
 		if (!g_reset && !g_continue_on_failure) {
-			target->is_draining = true;
+			_end_target(target);
 			g_run_rc = -1;
 			printf("task offset: %lu on target bdev=%s fails\n",
 			       task->offset_blocks, target->name);
@@ -518,7 +548,7 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 				 spdk_bdev_get_md_size(target->bdev),
 				 target->io_size_blocks, md_check)) {
 			printf("Buffer mismatch! Disk Offset: %lu\n", task->offset_blocks);
-			target->is_draining = true;
+			_end_target(target);
 			g_run_rc = -1;
 		}
 	}
@@ -573,7 +603,7 @@ bdevperf_verify_submit_read(void *cb_arg)
 		bdevperf_queue_io_wait_with_cb(task, bdevperf_verify_submit_read);
 	} else if (rc != 0) {
 		printf("Failed to submit read: %d\n", rc);
-		target->is_draining = true;
+		_end_target(target);
 		g_run_rc = rc;
 	}
 }
@@ -719,7 +749,7 @@ bdevperf_submit_task(void *arg)
 		return;
 	} else if (rc != 0) {
 		printf("Failed to submit bdev_io: %d\n", rc);
-		target->is_draining = true;
+		_end_target(target);
 		g_run_rc = rc;
 		return;
 	}
@@ -736,7 +766,7 @@ bdevperf_zcopy_get_buf_complete(struct spdk_bdev_io *bdev_io, bool success, void
 	int			iovcnt;
 
 	if (!success) {
-		target->is_draining = true;
+		_end_target(target);
 		g_run_rc = -1;
 		return;
 	}
@@ -867,12 +897,7 @@ end_target(void *arg)
 {
 	struct io_target *target = arg;
 
-	spdk_poller_unregister(&target->run_timer);
-	if (g_reset) {
-		spdk_poller_unregister(&target->reset_timer);
-	}
-
-	target->is_draining = true;
+	_end_target(target);
 
 	return -1;
 }
@@ -887,7 +912,7 @@ reset_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	if (!success) {
 		printf("Reset blockdev=%s failed\n", spdk_bdev_get_name(target->bdev));
-		target->is_draining = true;
+		_end_target(target);
 		g_run_rc = -1;
 	}
 
@@ -913,7 +938,7 @@ reset_target(void *arg)
 			     reset_cb, task);
 	if (rc) {
 		printf("Reset failed: %d\n", rc);
-		target->is_draining = true;
+		_end_target(target);
 		g_run_rc = -1;
 	}
 
@@ -1008,7 +1033,7 @@ performance_dump(uint64_t io_time_in_usec, uint64_t ema_period)
 
 	total_io_per_second = 0;
 	total_mb_per_second = 0;
-	TAILQ_FOREACH(group, &g_head, link) {
+	TAILQ_FOREACH(group, &g_bdevperf.groups, link) {
 		if (!TAILQ_EMPTY(&group->targets)) {
 			lcore_id = group->lcore;
 			printf("\r Logical core: %u\n", lcore_id);
@@ -1096,7 +1121,7 @@ bdevperf_construct_targets_tasks(void)
 	}
 
 	/* Initialize task list for each target */
-	TAILQ_FOREACH(group, &g_head, link) {
+	TAILQ_FOREACH(group, &g_bdevperf.groups, link) {
 		TAILQ_FOREACH(target, &group->targets, link) {
 			for (i = 0; i < task_num; i++) {
 				task = bdevperf_construct_task_on_target(target);
@@ -1286,7 +1311,7 @@ bdevperf_test(void)
 	}
 
 	/* Send events to start all I/O */
-	TAILQ_FOREACH(group, &g_head, link) {
+	TAILQ_FOREACH(group, &g_bdevperf.groups, link) {
 		if (!TAILQ_EMPTY(&group->targets)) {
 			event = spdk_event_allocate(group->lcore, bdevperf_submit_on_core,
 						    group, NULL);
@@ -1318,7 +1343,8 @@ bdevperf_run(void *arg1)
 
 	rc = bdevperf_test();
 	if (rc) {
-		bdevperf_fini(rc);
+		g_run_rc = rc;
+		bdevperf_test_done();
 		return;
 	}
 }
@@ -1343,20 +1369,20 @@ spdk_bdevperf_shutdown_cb(void)
 
 	g_shutdown = true;
 
-	if (g_target_count == 0) {
-		bdevperf_fini(g_run_rc);
+	if (TAILQ_EMPTY(&g_bdevperf.groups)) {
+		spdk_app_stop(0);
 		return;
 	}
 
-	if (TAILQ_EMPTY(&g_head)) {
-		spdk_app_stop(0);
+	if (g_target_count == 0) {
+		bdevperf_test_done();
 		return;
 	}
 
 	g_shutdown_tsc = spdk_get_ticks() - g_shutdown_tsc;
 
 	/* Send events to stop all I/O on each target group */
-	TAILQ_FOREACH(group, &g_head, link) {
+	TAILQ_FOREACH(group, &g_bdevperf.groups, link) {
 		if (!TAILQ_EMPTY(&group->targets)) {
 			event = spdk_event_allocate(group->lcore, bdevperf_stop_io_on_core,
 						    group, NULL);
@@ -1419,23 +1445,24 @@ bdevperf_parse_arg(int ch, char *arg)
 }
 
 static void
-rpc_perform_tests_cb(int rc)
+rpc_perform_tests_cb(void)
 {
 	struct spdk_json_write_ctx *w;
 	struct spdk_jsonrpc_request *request = g_request;
 
 	g_request = NULL;
 
-	if (rc == 0) {
+	if (g_run_rc == 0) {
 		w = spdk_jsonrpc_begin_result(request);
-		spdk_json_write_uint32(w, rc);
+		spdk_json_write_uint32(w, g_run_rc);
 		spdk_jsonrpc_end_result(request, w);
 	} else {
 		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
-						     "bdevperf failed with error %s", spdk_strerror(-rc));
+						     "bdevperf failed with error %s", spdk_strerror(-g_run_rc));
 	}
 
-	bdevperf_free_targets();
+	/* Reset g_run_rc to 0 for the next test run. */
+	g_run_rc = 0;
 }
 
 static void
@@ -1460,7 +1487,8 @@ rpc_perform_tests(struct spdk_jsonrpc_request *request, const struct spdk_json_v
 
 	rc = bdevperf_test();
 	if (rc) {
-		rpc_perform_tests_cb(rc);
+		g_run_rc = rc;
+		bdevperf_test_done();
 	}
 }
 SPDK_RPC_REGISTER("perform_tests", rpc_perform_tests, SPDK_RPC_RUNTIME)

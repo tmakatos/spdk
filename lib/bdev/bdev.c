@@ -124,6 +124,15 @@ static struct spdk_bdev_mgr g_bdev_mgr = {
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
 };
 
+typedef void (*lock_range_cb)(void *ctx, int status);
+
+struct lba_range {
+	uint64_t			offset;
+	uint64_t			length;
+	void				*locked_ctx;
+	struct spdk_bdev_channel	*owner_ch;
+	TAILQ_ENTRY(lba_range)		tailq;
+};
 
 static struct spdk_bdev_opts	g_bdev_opts = {
 	.bdev_io_pool_size = SPDK_BDEV_IO_POOL_SIZE,
@@ -264,6 +273,12 @@ struct spdk_bdev_channel {
 	 */
 	bdev_io_tailq_t		io_submitted;
 
+	/*
+	 * List of spdk_bdev_io that are currently queued because they write to a locked
+	 * LBA range.
+	 */
+	bdev_io_tailq_t		io_locked;
+
 	uint32_t		flags;
 
 	struct spdk_histogram_data *histogram;
@@ -276,6 +291,8 @@ struct spdk_bdev_channel {
 #endif
 
 	bdev_io_tailq_t		queued_resets;
+
+	lba_range_tailq_t	locked_ranges;
 };
 
 struct media_event_entry {
@@ -1894,6 +1911,63 @@ _bdev_io_submit(void *ctx)
 	bdev_io->internal.in_submit_request = false;
 }
 
+bool
+bdev_lba_range_overlapped(struct lba_range *range1, struct lba_range *range2);
+
+bool
+bdev_lba_range_overlapped(struct lba_range *range1, struct lba_range *range2)
+{
+	if (range1->length == 0 || range2->length == 0) {
+		return false;
+	}
+
+	if (range1->offset + range1->length <= range2->offset) {
+		return false;
+	}
+
+	if (range2->offset + range2->length <= range1->offset) {
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+bdev_io_range_is_locked(struct spdk_bdev_io *bdev_io, struct lba_range *range)
+{
+	struct spdk_bdev_channel *ch = bdev_io->internal.ch;
+	struct lba_range r;
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_NVME_IO:
+	case SPDK_BDEV_IO_TYPE_NVME_IO_MD:
+		/* Don't try to decode the NVMe command - just assume worst-case and that
+		 * it overlaps a locked range.
+		 */
+		return true;
+	case SPDK_BDEV_IO_TYPE_WRITE:
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+	case SPDK_BDEV_IO_TYPE_ZCOPY:
+		r.offset = bdev_io->u.bdev.offset_blocks;
+		r.length = bdev_io->u.bdev.num_blocks;
+		if (!bdev_lba_range_overlapped(range, &r)) {
+			/* This I/O doesn't overlap the specified LBA range. */
+			return false;
+		} else if (range->owner_ch == ch && range->locked_ctx == bdev_io->internal.caller_ctx) {
+			/* This I/O overlaps, but the I/O is on the same channel that locked this
+			 * range, and the caller_ctx is the same as the locked_ctx.  This means
+			 * that this I/O is associated with the lock, and is allowed to execute.
+			 */
+			return false;
+		} else {
+			return true;
+		}
+	default:
+		return false;
+	}
+}
+
 void
 bdev_io_submit(struct spdk_bdev_io *bdev_io)
 {
@@ -1903,6 +1977,17 @@ bdev_io_submit(struct spdk_bdev_io *bdev_io)
 
 	assert(thread != NULL);
 	assert(bdev_io->internal.status == SPDK_BDEV_IO_STATUS_PENDING);
+
+	if (!TAILQ_EMPTY(&ch->locked_ranges)) {
+		struct lba_range *range;
+
+		TAILQ_FOREACH(range, &ch->locked_ranges, tailq) {
+			if (bdev_io_range_is_locked(bdev_io, range)) {
+				TAILQ_INSERT_TAIL(&ch->io_locked, bdev_io, internal.ch_link);
+				return;
+			}
+		}
+	}
 
 	/* Add the bdev_io to io_submitted only if it is the original
 	 * submission from the bdev user.  When a bdev_io is split,
@@ -1964,6 +2049,7 @@ bdev_io_init(struct spdk_bdev_io *bdev_io,
 	bdev_io->internal.orig_iovcnt = 0;
 	bdev_io->internal.orig_md_buf = NULL;
 	bdev_io->internal.error.nvme.cdw0 = 0;
+	bdev_io->num_retries = 0;
 }
 
 static bool
@@ -2075,11 +2161,19 @@ static void
 bdev_channel_destroy_resource(struct spdk_bdev_channel *ch)
 {
 	struct spdk_bdev_shared_resource *shared_resource;
+	struct lba_range *range;
+
+	while (!TAILQ_EMPTY(&ch->locked_ranges)) {
+		range = TAILQ_FIRST(&ch->locked_ranges);
+		TAILQ_REMOVE(&ch->locked_ranges, range, tailq);
+		free(range);
+	}
 
 	spdk_put_io_channel(ch->channel);
 
 	shared_resource = ch->shared_resource;
 
+	assert(TAILQ_EMPTY(&ch->io_locked));
 	assert(TAILQ_EMPTY(&ch->io_submitted));
 	assert(ch->io_outstanding == 0);
 	assert(shared_resource->ref > 0);
@@ -2280,6 +2374,7 @@ bdev_channel_create(void *io_device, void *ctx_buf)
 	struct spdk_io_channel		*mgmt_io_ch;
 	struct spdk_bdev_mgmt_channel	*mgmt_ch;
 	struct spdk_bdev_shared_resource *shared_resource;
+	struct lba_range		*range;
 
 	ch->bdev = bdev;
 	ch->channel = bdev->fn_table->get_io_channel(bdev->ctxt);
@@ -2331,10 +2426,12 @@ bdev_channel_create(void *io_device, void *ctx_buf)
 	ch->stat.ticks_rate = spdk_get_ticks_hz();
 	ch->io_outstanding = 0;
 	TAILQ_INIT(&ch->queued_resets);
+	TAILQ_INIT(&ch->locked_ranges);
 	ch->flags = 0;
 	ch->shared_resource = shared_resource;
 
 	TAILQ_INIT(&ch->io_submitted);
+	TAILQ_INIT(&ch->io_locked);
 
 #ifdef SPDK_CONFIG_VTUNE
 	{
@@ -2355,6 +2452,21 @@ bdev_channel_create(void *io_device, void *ctx_buf)
 
 	pthread_mutex_lock(&bdev->internal.mutex);
 	bdev_enable_qos(bdev, ch);
+
+	TAILQ_FOREACH(range, &bdev->internal.locked_ranges, tailq) {
+		struct lba_range *new_range;
+
+		new_range = calloc(1, sizeof(*new_range));
+		if (new_range == NULL) {
+			pthread_mutex_unlock(&bdev->internal.mutex);
+			bdev_channel_destroy_resource(ch);
+			return -1;
+		}
+		new_range->length = range->length;
+		new_range->offset = range->offset;
+		TAILQ_INSERT_TAIL(&ch->locked_ranges, new_range, tailq);
+	}
+
 	pthread_mutex_unlock(&bdev->internal.mutex);
 
 	return 0;
@@ -3264,6 +3376,318 @@ spdk_bdev_writev_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_chan
 }
 
 static void
+bdev_compare_do_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_bdev_io *parent_io = cb_arg;
+	uint8_t *read_buf = bdev_io->u.bdev.iovs[0].iov_base;
+	int i, rc = 0;
+
+	if (!success) {
+		parent_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
+		parent_io->internal.cb(parent_io, false, parent_io->internal.caller_ctx);
+		spdk_bdev_free_io(bdev_io);
+		return;
+	}
+
+	for (i = 0; i < parent_io->u.bdev.iovcnt; i++) {
+		rc = memcmp(read_buf,
+			    parent_io->u.bdev.iovs[i].iov_base,
+			    parent_io->u.bdev.iovs[i].iov_len);
+		if (rc) {
+			break;
+		}
+		read_buf += parent_io->u.bdev.iovs[i].iov_len;
+	}
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (rc == 0) {
+		parent_io->internal.status = SPDK_BDEV_IO_STATUS_SUCCESS;
+		parent_io->internal.cb(parent_io, true, parent_io->internal.caller_ctx);
+	} else {
+		parent_io->internal.status = SPDK_BDEV_IO_STATUS_MISCOMPARE;
+		parent_io->internal.cb(parent_io, false, parent_io->internal.caller_ctx);
+	}
+}
+
+static void
+bdev_compare_do_read(void *_bdev_io)
+{
+	struct spdk_bdev_io *bdev_io = _bdev_io;
+	int rc;
+
+	rc = spdk_bdev_read_blocks(bdev_io->internal.desc,
+				   spdk_io_channel_from_ctx(bdev_io->internal.ch), NULL,
+				   bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
+				   bdev_compare_do_read_done, bdev_io);
+
+	if (rc == -ENOMEM) {
+		bdev_queue_io_wait_with_cb(bdev_io, bdev_compare_do_read);
+	} else if (rc != 0) {
+		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
+		bdev_io->internal.cb(bdev_io, false, bdev_io->internal.caller_ctx);
+	}
+}
+
+static int
+bdev_comparev_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			     struct iovec *iov, int iovcnt, void *md_buf,
+			     uint64_t offset_blocks, uint64_t num_blocks,
+			     spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(desc);
+	struct spdk_bdev_io *bdev_io;
+	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
+
+	if (!bdev_io_valid_blocks(bdev, offset_blocks, num_blocks)) {
+		return -EINVAL;
+	}
+
+	bdev_io = bdev_channel_get_io(channel);
+	if (!bdev_io) {
+		return -ENOMEM;
+	}
+
+	bdev_io->internal.ch = channel;
+	bdev_io->internal.desc = desc;
+	bdev_io->type = SPDK_BDEV_IO_TYPE_COMPARE;
+	bdev_io->u.bdev.iovs = iov;
+	bdev_io->u.bdev.iovcnt = iovcnt;
+	bdev_io->u.bdev.md_buf = md_buf;
+	bdev_io->u.bdev.num_blocks = num_blocks;
+	bdev_io->u.bdev.offset_blocks = offset_blocks;
+	bdev_io_init(bdev_io, bdev, cb_arg, cb);
+
+	if (bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_COMPARE)) {
+		bdev_io_submit(bdev_io);
+		return 0;
+	}
+
+	bdev_compare_do_read(bdev_io);
+
+	return 0;
+}
+
+int
+spdk_bdev_comparev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			  struct iovec *iov, int iovcnt,
+			  uint64_t offset_blocks, uint64_t num_blocks,
+			  spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	return bdev_comparev_blocks_with_md(desc, ch, iov, iovcnt, NULL, offset_blocks,
+					    num_blocks, cb, cb_arg);
+}
+
+int
+spdk_bdev_comparev_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+				  struct iovec *iov, int iovcnt, void *md_buf,
+				  uint64_t offset_blocks, uint64_t num_blocks,
+				  spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	if (!spdk_bdev_is_md_separate(spdk_bdev_desc_get_bdev(desc))) {
+		return -EINVAL;
+	}
+
+	if (!_bdev_io_check_md_buf(iov, md_buf)) {
+		return -EINVAL;
+	}
+
+	return bdev_comparev_blocks_with_md(desc, ch, iov, iovcnt, md_buf, offset_blocks,
+					    num_blocks, cb, cb_arg);
+}
+
+static int
+bdev_compare_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			    void *buf, void *md_buf, uint64_t offset_blocks, uint64_t num_blocks,
+			    spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(desc);
+	struct spdk_bdev_io *bdev_io;
+	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
+
+	if (!bdev_io_valid_blocks(bdev, offset_blocks, num_blocks)) {
+		return -EINVAL;
+	}
+
+	bdev_io = bdev_channel_get_io(channel);
+	if (!bdev_io) {
+		return -ENOMEM;
+	}
+
+	bdev_io->internal.ch = channel;
+	bdev_io->internal.desc = desc;
+	bdev_io->type = SPDK_BDEV_IO_TYPE_COMPARE;
+	bdev_io->u.bdev.iovs = &bdev_io->iov;
+	bdev_io->u.bdev.iovs[0].iov_base = buf;
+	bdev_io->u.bdev.iovs[0].iov_len = num_blocks * bdev->blocklen;
+	bdev_io->u.bdev.iovcnt = 1;
+	bdev_io->u.bdev.md_buf = md_buf;
+	bdev_io->u.bdev.num_blocks = num_blocks;
+	bdev_io->u.bdev.offset_blocks = offset_blocks;
+	bdev_io_init(bdev_io, bdev, cb_arg, cb);
+
+	if (bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_COMPARE)) {
+		bdev_io_submit(bdev_io);
+		return 0;
+	}
+
+	bdev_compare_do_read(bdev_io);
+
+	return 0;
+}
+
+int
+spdk_bdev_compare_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			 void *buf, uint64_t offset_blocks, uint64_t num_blocks,
+			 spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	return bdev_compare_blocks_with_md(desc, ch, buf, NULL, offset_blocks, num_blocks,
+					   cb, cb_arg);
+}
+
+int
+spdk_bdev_compare_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+				 void *buf, void *md_buf, uint64_t offset_blocks, uint64_t num_blocks,
+				 spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	struct iovec iov = {
+		.iov_base = buf,
+	};
+
+	if (!spdk_bdev_is_md_separate(spdk_bdev_desc_get_bdev(desc))) {
+		return -EINVAL;
+	}
+
+	if (!_bdev_io_check_md_buf(&iov, md_buf)) {
+		return -EINVAL;
+	}
+
+	return bdev_compare_blocks_with_md(desc, ch, buf, md_buf, offset_blocks, num_blocks,
+					   cb, cb_arg);
+}
+
+static void
+bdev_compare_and_write_do_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_bdev_io *parent_io = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (success) {
+		parent_io->internal.status = SPDK_BDEV_IO_STATUS_SUCCESS;
+	} else {
+		parent_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
+	}
+
+	parent_io->internal.cb(parent_io, false, parent_io->internal.caller_ctx);
+}
+
+static void
+bdev_compare_and_write_do_write(void *_bdev_io)
+{
+	struct spdk_bdev_io *bdev_io = _bdev_io;
+	int rc;
+
+	rc = spdk_bdev_writev_blocks(bdev_io->internal.desc,
+				     spdk_io_channel_from_ctx(bdev_io->internal.ch),
+				     bdev_io->u.bdev.fused_iovs, bdev_io->u.bdev.fused_iovcnt,
+				     bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
+				     bdev_compare_and_write_do_write_done, bdev_io);
+
+
+	if (rc == -ENOMEM) {
+		bdev_queue_io_wait_with_cb(bdev_io, bdev_compare_and_write_do_write);
+	} else if (rc != 0) {
+		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
+		bdev_io->internal.cb(bdev_io, false, bdev_io->internal.caller_ctx);
+	}
+}
+
+static void
+bdev_compare_and_write_do_compare_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct spdk_bdev_io *parent_io = cb_arg;
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (!success) {
+		parent_io->internal.status = SPDK_BDEV_IO_STATUS_MISCOMPARE;
+		parent_io->internal.cb(parent_io, false, parent_io->internal.caller_ctx);
+		return;
+	}
+
+	bdev_compare_and_write_do_write(parent_io);
+}
+
+static void
+bdev_compare_and_write_do_compare(void *_bdev_io)
+{
+	struct spdk_bdev_io *bdev_io = _bdev_io;
+	int rc;
+
+	rc = spdk_bdev_comparev_blocks(bdev_io->internal.desc,
+				       spdk_io_channel_from_ctx(bdev_io->internal.ch), bdev_io->u.bdev.iovs,
+				       bdev_io->u.bdev.iovcnt, bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
+				       bdev_compare_and_write_do_compare_done, bdev_io);
+
+	if (rc == -ENOMEM) {
+		bdev_queue_io_wait_with_cb(bdev_io, bdev_compare_and_write_do_compare);
+	} else if (rc != 0) {
+		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
+		bdev_io->internal.cb(bdev_io, false, bdev_io->internal.caller_ctx);
+	}
+}
+
+int
+spdk_bdev_comparev_and_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+				     struct iovec *compare_iov, int compare_iovcnt,
+				     struct iovec *write_iov, int write_iovcnt,
+				     uint64_t offset_blocks, uint64_t num_blocks,
+				     spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(desc);
+	struct spdk_bdev_io *bdev_io;
+	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
+
+	if (!desc->write) {
+		return -EBADF;
+	}
+
+	if (!bdev_io_valid_blocks(bdev, offset_blocks, num_blocks)) {
+		return -EINVAL;
+	}
+
+	if (num_blocks > bdev->acwu) {
+		return -EINVAL;
+	}
+
+	bdev_io = bdev_channel_get_io(channel);
+	if (!bdev_io) {
+		return -ENOMEM;
+	}
+
+	bdev_io->internal.ch = channel;
+	bdev_io->internal.desc = desc;
+	bdev_io->type = SPDK_BDEV_IO_TYPE_COMPARE_AND_WRITE;
+	bdev_io->u.bdev.iovs = compare_iov;
+	bdev_io->u.bdev.iovcnt = compare_iovcnt;
+	bdev_io->u.bdev.fused_iovs = write_iov;
+	bdev_io->u.bdev.fused_iovcnt = write_iovcnt;
+	bdev_io->u.bdev.md_buf = NULL;
+	bdev_io->u.bdev.num_blocks = num_blocks;
+	bdev_io->u.bdev.offset_blocks = offset_blocks;
+	bdev_io_init(bdev_io, bdev, cb_arg, cb);
+
+	if (bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_COMPARE_AND_WRITE)) {
+		bdev_io_submit(bdev_io);
+		return 0;
+	}
+
+	bdev_compare_and_write_do_compare(bdev_io);
+	return 0;
+}
+
+static void
 bdev_zcopy_get_buf(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, bool success)
 {
 	if (!success) {
@@ -3885,6 +4309,7 @@ bdev_ch_retry_io(struct spdk_bdev_channel *bdev_ch)
 		shared_resource->io_outstanding++;
 		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_PENDING;
 		bdev_io->internal.error.nvme.cdw0 = 0;
+		bdev_io->num_retries++;
 		bdev->fn_table->submit_request(spdk_bdev_io_get_io_channel(bdev_io), bdev_io);
 		if (bdev_io->internal.status == SPDK_BDEV_IO_STATUS_NOMEM) {
 			break;
@@ -4329,7 +4754,14 @@ bdev_init(struct spdk_bdev *bdev)
 		bdev->write_unit_size = 1;
 	}
 
+	/* Set ACWU value to 1 if bdev module did not set it (does not support it natively) */
+	if (bdev->acwu == 0) {
+		bdev->acwu = 1;
+	}
+
 	TAILQ_INIT(&bdev->internal.open_descs);
+	TAILQ_INIT(&bdev->internal.locked_ranges);
+	TAILQ_INIT(&bdev->internal.pending_locked_ranges);
 
 	TAILQ_INIT(&bdev->aliases);
 
@@ -5431,6 +5863,334 @@ spdk_bdev_notify_media_management(struct spdk_bdev *bdev)
 		}
 	}
 	pthread_mutex_unlock(&bdev->internal.mutex);
+}
+
+struct locked_lba_range_ctx {
+	struct lba_range		range;
+	struct spdk_bdev		*bdev;
+	struct lba_range		*current_range;
+	struct lba_range		*owner_range;
+	struct spdk_poller		*poller;
+	lock_range_cb			cb_fn;
+	void				*cb_arg;
+};
+
+static void
+bdev_lock_error_cleanup_cb(struct spdk_io_channel_iter *i, int status)
+{
+	struct locked_lba_range_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	ctx->cb_fn(ctx->cb_arg, -ENOMEM);
+	free(ctx);
+}
+
+static void
+bdev_unlock_lba_range_get_channel(struct spdk_io_channel_iter *i);
+
+static void
+bdev_lock_lba_range_cb(struct spdk_io_channel_iter *i, int status)
+{
+	struct locked_lba_range_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_bdev *bdev = ctx->bdev;
+
+	if (status == -ENOMEM) {
+		/* One of the channels could not allocate a range object.
+		 * So we have to go back and clean up any ranges that were
+		 * allocated successfully before we return error status to
+		 * the caller.  We can reuse the unlock function to do that
+		 * clean up.
+		 */
+		spdk_for_each_channel(__bdev_to_io_dev(bdev),
+				      bdev_unlock_lba_range_get_channel, ctx,
+				      bdev_lock_error_cleanup_cb);
+		return;
+	}
+
+	/* All channels have locked this range and no I/O overlapping the range
+	 * are outstanding!  Set the owner_ch for the range object for the
+	 * locking channel, so that this channel will know that it is allowed
+	 * to write to this range.
+	 */
+	ctx->owner_range->owner_ch = ctx->range.owner_ch;
+	ctx->cb_fn(ctx->cb_arg, status);
+
+	/* Don't free the ctx here.  Its range is in the bdev's global list of
+	 * locked ranges still, and will be removed and freed when this range
+	 * is later unlocked.
+	 */
+}
+
+static int
+bdev_lock_lba_range_check_io(void *_i)
+{
+	struct spdk_io_channel_iter *i = _i;
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bdev_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct locked_lba_range_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct lba_range *range = ctx->current_range;
+	struct spdk_bdev_io *bdev_io;
+
+	spdk_poller_unregister(&ctx->poller);
+
+	/* The range is now in the locked_ranges, so no new IO can be submitted to this
+	 * range.  But we need to wait until any outstanding IO overlapping with this range
+	 * are completed.
+	 */
+	TAILQ_FOREACH(bdev_io, &ch->io_submitted, internal.ch_link) {
+		if (bdev_io_range_is_locked(bdev_io, range)) {
+			ctx->poller = spdk_poller_register(bdev_lock_lba_range_check_io, i, 100);
+			return 1;
+		}
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+	return 1;
+}
+
+static void
+bdev_lock_lba_range_get_channel(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bdev_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct locked_lba_range_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct lba_range *range;
+
+	TAILQ_FOREACH(range, &ch->locked_ranges, tailq) {
+		if (range->length == ctx->range.length && range->offset == ctx->range.offset) {
+			/* This range already exists on this channel, so don't add
+			 * it again.  This can happen when a new channel is created
+			 * while the for_each_channel operation is in progress.
+			 * Do not check for outstanding I/O in that case, since the
+			 * range was locked before any I/O could be submitted to the
+			 * new channel.
+			 */
+			spdk_for_each_channel_continue(i, 0);
+			return;
+		}
+	}
+
+	range = calloc(1, sizeof(*range));
+	if (range == NULL) {
+		spdk_for_each_channel_continue(i, -ENOMEM);
+		return;
+	}
+
+	range->length = ctx->range.length;
+	range->offset = ctx->range.offset;
+	range->locked_ctx = ctx->range.locked_ctx;
+	ctx->current_range = range;
+	if (ctx->range.owner_ch == ch) {
+		/* This is the range object for the channel that will hold
+		 * the lock.  Store it in the ctx object so that we can easily
+		 * set its owner_ch after the lock is finally acquired.
+		 */
+		ctx->owner_range = range;
+	}
+	TAILQ_INSERT_TAIL(&ch->locked_ranges, range, tailq);
+	bdev_lock_lba_range_check_io(i);
+}
+
+static void
+bdev_lock_lba_range_ctx(struct spdk_bdev *bdev, struct locked_lba_range_ctx *ctx)
+{
+	/* We will add a copy of this range to each channel now. */
+	spdk_for_each_channel(__bdev_to_io_dev(bdev), bdev_lock_lba_range_get_channel, ctx,
+			      bdev_lock_lba_range_cb);
+}
+
+static bool
+bdev_lba_range_overlaps_tailq(struct lba_range *range, lba_range_tailq_t *tailq)
+{
+	struct lba_range *r;
+
+	TAILQ_FOREACH(r, tailq, tailq) {
+		if (bdev_lba_range_overlapped(range, r)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+int
+bdev_lock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
+		    uint64_t offset, uint64_t length,
+		    lock_range_cb cb_fn, void *cb_arg);
+
+int
+bdev_lock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
+		    uint64_t offset, uint64_t length,
+		    lock_range_cb cb_fn, void *cb_arg)
+{
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(desc);
+	struct spdk_bdev_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct locked_lba_range_ctx *ctx;
+
+	if (cb_arg == NULL) {
+		SPDK_ERRLOG("cb_arg must not be NULL\n");
+		return -EINVAL;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+
+	ctx->range.offset = offset;
+	ctx->range.length = length;
+	ctx->range.owner_ch = ch;
+	ctx->range.locked_ctx = cb_arg;
+	ctx->bdev = bdev;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	pthread_mutex_lock(&bdev->internal.mutex);
+	if (bdev_lba_range_overlaps_tailq(&ctx->range, &bdev->internal.locked_ranges)) {
+		/* There is an active lock overlapping with this range.
+		 * Put it on the pending list until this range no
+		 * longer overlaps with another.
+		 */
+		TAILQ_INSERT_TAIL(&bdev->internal.pending_locked_ranges, &ctx->range, tailq);
+	} else {
+		TAILQ_INSERT_TAIL(&bdev->internal.locked_ranges, &ctx->range, tailq);
+		bdev_lock_lba_range_ctx(bdev, ctx);
+	}
+	pthread_mutex_unlock(&bdev->internal.mutex);
+	return 0;
+}
+
+static void
+bdev_unlock_lba_range_cb(struct spdk_io_channel_iter *i, int status)
+{
+	struct locked_lba_range_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct locked_lba_range_ctx *pending_ctx;
+	struct spdk_bdev_channel *ch = ctx->range.owner_ch;
+	struct spdk_bdev *bdev = ch->bdev;
+	struct lba_range *range, *tmp;
+
+	pthread_mutex_lock(&bdev->internal.mutex);
+	/* Check if there are any pending locked ranges that overlap with this range
+	 * that was just unlocked.  If there are, check that it doesn't overlap with any
+	 * other locked ranges before calling bdev_lock_lba_range_ctx which will start
+	 * the lock process.
+	 */
+	TAILQ_FOREACH_SAFE(range, &bdev->internal.pending_locked_ranges, tailq, tmp) {
+		if (bdev_lba_range_overlapped(range, &ctx->range) &&
+		    !bdev_lba_range_overlaps_tailq(range, &bdev->internal.locked_ranges)) {
+			TAILQ_REMOVE(&bdev->internal.pending_locked_ranges, range, tailq);
+			pending_ctx = SPDK_CONTAINEROF(range, struct locked_lba_range_ctx, range);
+			TAILQ_INSERT_TAIL(&bdev->internal.locked_ranges, range, tailq);
+			bdev_lock_lba_range_ctx(bdev, pending_ctx);
+		}
+	}
+	pthread_mutex_unlock(&bdev->internal.mutex);
+
+	ctx->cb_fn(ctx->cb_arg, status);
+	free(ctx);
+}
+
+static void
+bdev_unlock_lba_range_get_channel(struct spdk_io_channel_iter *i)
+{
+	struct spdk_io_channel *_ch = spdk_io_channel_iter_get_channel(i);
+	struct spdk_bdev_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct locked_lba_range_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	TAILQ_HEAD(, spdk_bdev_io) io_locked;
+	struct spdk_bdev_io *bdev_io;
+	struct lba_range *range;
+
+	TAILQ_FOREACH(range, &ch->locked_ranges, tailq) {
+		if (ctx->range.offset == range->offset &&
+		    ctx->range.length == range->length) {
+			TAILQ_REMOVE(&ch->locked_ranges, range, tailq);
+			free(range);
+			break;
+		}
+	}
+
+	/* Note: we should almost always be able to assert that the range specified
+	 * was found.  But there are some very rare corner cases where a new channel
+	 * gets created simultaneously with a range unlock, where this function
+	 * would execute on that new channel and wouldn't have the range.
+	 * We also use this to clean up range allocations when a later allocation
+	 * fails in the locking path.
+	 * So we can't actually assert() here.
+	 */
+
+	/* Swap the locked IO into a temporary list, and then try to submit them again.
+	 * We could hyper-optimize this to only resubmit locked I/O that overlap
+	 * with the range that was just unlocked, but this isn't a performance path so
+	 * we go for simplicity here.
+	 */
+	TAILQ_INIT(&io_locked);
+	TAILQ_SWAP(&ch->io_locked, &io_locked, spdk_bdev_io, internal.ch_link);
+	while (!TAILQ_EMPTY(&io_locked)) {
+		bdev_io = TAILQ_FIRST(&io_locked);
+		TAILQ_REMOVE(&io_locked, bdev_io, internal.ch_link);
+		bdev_io_submit(bdev_io);
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+int
+bdev_unlock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
+		      uint64_t offset, uint64_t length,
+		      lock_range_cb cb_fn, void *cb_arg);
+
+int
+bdev_unlock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
+		      uint64_t offset, uint64_t length,
+		      lock_range_cb cb_fn, void *cb_arg)
+{
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(desc);
+	struct spdk_bdev_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct locked_lba_range_ctx *ctx;
+	struct lba_range *range;
+	bool range_found = false;
+
+	/* Let's make sure the specified channel actually has a lock on
+	 * the specified range.  Note that the range must match exactly.
+	 */
+	TAILQ_FOREACH(range, &ch->locked_ranges, tailq) {
+		if (range->offset == offset && range->length == length &&
+		    range->owner_ch == ch && range->locked_ctx == cb_arg) {
+			range_found = true;
+			break;
+		}
+	}
+
+	if (!range_found) {
+		return -EINVAL;
+	}
+
+	pthread_mutex_lock(&bdev->internal.mutex);
+	/* We confirmed that this channel has locked the specified range.  To
+	 * start the unlock the process, we find the range in the bdev's locked_ranges
+	 * and remove it.  This ensures new channels don't inherit the locked range.
+	 * Then we will send a message to each channel (including the one specified
+	 * here) to remove the range from its per-channel list.
+	 */
+	TAILQ_FOREACH(range, &bdev->internal.locked_ranges, tailq) {
+		if (range->offset == offset && range->length == length &&
+		    range->locked_ctx == cb_arg) {
+			break;
+		}
+	}
+	if (range == NULL) {
+		assert(false);
+		pthread_mutex_unlock(&bdev->internal.mutex);
+		return -EINVAL;
+	}
+	TAILQ_REMOVE(&bdev->internal.locked_ranges, range, tailq);
+	ctx = SPDK_CONTAINEROF(range, struct locked_lba_range_ctx, range);
+	pthread_mutex_unlock(&bdev->internal.mutex);
+
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	spdk_for_each_channel(__bdev_to_io_dev(bdev), bdev_unlock_lba_range_get_channel, ctx,
+			      bdev_unlock_lba_range_cb);
+	return 0;
 }
 
 SPDK_LOG_REGISTER_COMPONENT("bdev", SPDK_LOG_BDEV)

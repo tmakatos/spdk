@@ -122,7 +122,20 @@ struct spdk_nvmf_transport_poll_group_stat {
  */
 typedef void (*new_qpair_fn)(struct spdk_nvmf_qpair *qpair, void *cb_arg);
 
+/**
+ * Function to be called once the target is listening.
+ *
+ * \param ctx Context argument passed to this function.
+ * \param status 0 if it completed successfully, or negative errno if it failed.
+ */
+typedef void (*spdk_nvmf_tgt_listen_done_fn)(void *ctx, int status);
+
 struct spdk_nvmf_transport_ops {
+	/**
+	 * Transport name
+	 */
+	char name[SPDK_NVMF_TRSTRING_MAX_LEN];
+
 	/**
 	 * Transport type
 	 */
@@ -148,7 +161,9 @@ struct spdk_nvmf_transport_ops {
 	  * provided. This may be called multiple times.
 	  */
 	int (*listen)(struct spdk_nvmf_transport *transport,
-		      const struct spdk_nvme_transport_id *trid);
+		      const struct spdk_nvme_transport_id *trid,
+		      spdk_nvmf_tgt_listen_done_fn cb_fn,
+		      void *cb_arg);
 
 	/**
 	  * Stop accepting new connections at the given address.
@@ -323,14 +338,6 @@ struct spdk_nvmf_tgt *spdk_nvmf_get_next_tgt(struct spdk_nvmf_tgt *prev);
  * \param tgt The NVMe-oF target
  */
 void spdk_nvmf_tgt_write_config_json(struct spdk_json_write_ctx *w, struct spdk_nvmf_tgt *tgt);
-
-/**
- * Function to be called once the target is listening.
- *
- * \param ctx Context argument passed to this function.
- * \param status 0 if it completed successfully, or negative errno if it failed.
- */
-typedef void (*spdk_nvmf_tgt_listen_done_fn)(void *ctx, int status);
 
 /**
  * Begin accepting new connections at the address provided.
@@ -970,25 +977,25 @@ enum spdk_nvmf_subtype spdk_nvmf_subsystem_get_type(struct spdk_nvmf_subsystem *
 /**
  * Initialize transport options
  *
- * \param type The transport type to create
+ * \param transport_name The transport type to create
  * \param opts The transport options (e.g. max_io_size)
  *
  * \return bool. true if successful, false if transport type
  *	   not found.
  */
 bool
-spdk_nvmf_transport_opts_init(enum spdk_nvme_transport_type type,
+spdk_nvmf_transport_opts_init(const char *transport_name,
 			      struct spdk_nvmf_transport_opts *opts);
 
 /**
  * Create a protocol transport
  *
- * \param type The transport type to create
+ * \param transport_name The transport type to create
  * \param opts The transport options (e.g. max_io_size)
  *
  * \return new transport or NULL if create fails
  */
-struct spdk_nvmf_transport *spdk_nvmf_transport_create(enum spdk_nvme_transport_type type,
+struct spdk_nvmf_transport *spdk_nvmf_transport_create(const char *transport_name,
 		struct spdk_nvmf_transport_opts *opts);
 
 /**
@@ -1004,12 +1011,12 @@ int spdk_nvmf_transport_destroy(struct spdk_nvmf_transport *transport);
  * Get an existing transport from the target
  *
  * \param tgt The NVMe-oF target
- * \param type The transport type to get
+ * \param transport_name The name of the transport type to get.
  *
  * \return the transport or NULL if not found
  */
 struct spdk_nvmf_transport *spdk_nvmf_tgt_get_transport(struct spdk_nvmf_tgt *tgt,
-		enum spdk_nvme_transport_type type);
+		const char *transport_name);
 
 /**
  * Get the first transport registered with the given target
@@ -1078,12 +1085,16 @@ void spdk_nvmf_tgt_add_transport(struct spdk_nvmf_tgt *tgt,
  *
  * \param transport The transport to add listener to
  * \param trid Address to listen at
+ * \param cb_fn A callback that will be called once the listener is created
+ * \param cb_arg A context argument passed to cb_fn.
  *
  * \return int. 0 if it completed successfully, or negative errno if it failed.
  */
 
 int spdk_nvmf_transport_listen(struct spdk_nvmf_transport *transport,
-			       const struct spdk_nvme_transport_id *trid);
+			       const struct spdk_nvme_transport_id *trid,
+			       spdk_nvmf_tgt_listen_done_fn cb_fn,
+			       void *cb_arg);
 
 /**
  * Write NVMe-oF target's transport configurations into provided JSON context.
@@ -1140,6 +1151,25 @@ spdk_nvmf_transport_poll_group_free_stat(struct spdk_nvmf_transport *transport,
  * \param hooks for initializing global hooks
  */
 void spdk_nvmf_rdma_init_hooks(struct spdk_nvme_rdma_hooks *hooks);
+
+/**
+ * Register the operations for a given transport type.
+ *
+ * This function should be invoked by referencing the macro
+ * SPDK_NVMF_TRANSPORT_REGISTER macro in the transport's .c file.
+ *
+ * \param ops The operations associated with an NVMe-oF transport.
+ */
+void spdk_nvmf_transport_register(const struct spdk_nvmf_transport_ops *ops);
+
+/*
+ * Macro used to register new transports.
+ */
+#define SPDK_NVMF_TRANSPORT_REGISTER(name, transport_ops) \
+static void __attribute__((constructor)) spdk_nvmf_transport_register_##name(void) \
+{ \
+	spdk_nvmf_transport_register(transport_ops); \
+}\
 
 #ifdef __cplusplus
 }
