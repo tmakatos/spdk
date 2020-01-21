@@ -1510,8 +1510,9 @@ handle_cmd_rsp(struct muser_qpair *qpair, struct muser_req *req)
 
 	return post_completion(qpair->ctrlr, &req->req.cmd->nvme_cmd,
 	                      &qpair->ctrlr->qp[req->req.qpair->qid]->cq,
-	                      req->req.rsp->nvme_cpl.cdw0, SPDK_NVME_SC_SUCCESS,
-	                      SPDK_NVME_SCT_GENERIC);
+	                      req->req.rsp->nvme_cpl.cdw0,
+	                      req->req.rsp->nvme_cpl.status.sc,
+	                      req->req.rsp->nvme_cpl.status.sct);
 }
 
 static int
