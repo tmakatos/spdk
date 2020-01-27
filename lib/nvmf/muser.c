@@ -351,7 +351,7 @@ err:
 
 static void
 mdev_remove(const char *uuid)
-{ /* TODO: Implement me */ }
+{ /* FIXME: Implement me */ }
 
 static int
 mdev_create(const char *uuid)
@@ -378,6 +378,7 @@ mdev_create(const char *uuid)
 	sleep(1);
 
 	/* TODO: Wait until ctrlr appears on /ctrlr/muser/<uuid> */
+	/* FIXME don't sleep, use a more intelligent way */
 
 	return err;
 }
@@ -1068,7 +1069,6 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	cq_tail_advance(cq);
 
 	/*
-	 * FIXME check STS.IS "Indicates the interrupt status of the device (‘1’ = asserted)."
 	 * FIXME this function now executes at SPDK thread context, we
 	 * might be triggerring interrupts from MUSER thread context so
 	 * check for race conditions.
@@ -2204,6 +2204,70 @@ muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
 	return (size_t)ret >= SPDK_NVME_NQN_FIELD_SIZE ? -1 : 0;
 }
 
+static void
+destroy_pci_dev(struct muser_ctrlr *ctrlr) {
+	if (ctrlr != NULL) {
+		lm_ctx_destroy(ctrlr->lm_ctx);
+	}
+	/* FIXME destroy pthread */
+}
+
+static int
+init_pci_dev(struct muser_ctrlr *ctrlr)
+{
+	int err = 0;
+	lm_dev_info_t dev_info = { 0 };
+
+	/* LM setup */
+	nvme_dev_info_fill(&dev_info, ctrlr);
+
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
+
+	/* PM */
+	ctrlr->pmcap.pmcs.nsfrst = 0x1;
+
+	/*
+	 * MSI-X
+	 *
+	 * TODO for now we put table BIR and PBA BIR in BAR4 because
+	 * it's just easier, otherwise in order to put it in BAR0 we'd
+	 * have to figure out where exactly doorbells end.
+	 */
+	ctrlr->msixcap.mxc.ts = 0x3;
+	ctrlr->msixcap.mtab.tbir = 0x4;
+	ctrlr->msixcap.mtab.to = 0x0;
+	ctrlr->msixcap.mpba.pbir = 0x5;
+	ctrlr->msixcap.mpba.pbao = 0x0;
+
+	/* EXP */
+	ctrlr->pxcap.pxcaps.ver = 0x2;
+	ctrlr->pxcap.pxdcap.per = 0x1;
+	ctrlr->pxcap.pxdcap.flrc = 0x1;
+	ctrlr->pxcap.pxdcap2.ctds = 0x1;
+	/* FIXME check PXCAPS.DPT */
+
+	ctrlr->lm_ctx = lm_ctx_create(&dev_info);
+	if (ctrlr->lm_ctx == NULL) {
+		/* TODO: lm_create doesn't set errno */
+		SPDK_ERRLOG("Error creating libmuser ctx: %m\n");
+		return -1;
+	}
+
+	ctrlr->pci_config_space = lm_get_pci_config_space(ctrlr->lm_ctx);
+	init_pci_config_space(ctrlr->pci_config_space);
+
+	err = pthread_create(&ctrlr->lm_thr, NULL, drive, ctrlr->lm_ctx);
+	if (err != 0) {
+		/* TODO: pthread_create doesn't set errno */
+		SPDK_ERRLOG("Error creating lm_drive thread: %m\n");
+	}
+
+	return 0;
+}
+
 static int
 muser_listen(struct spdk_nvmf_transport *transport,
 	     const struct spdk_nvme_transport_id *trid,
@@ -2211,7 +2275,6 @@ muser_listen(struct spdk_nvmf_transport *transport,
 {
 	struct muser_transport *muser_transport;
 	struct muser_ctrlr *muser_ctrlr;
-	lm_dev_info_t dev_info = { 0 };
 	int err;
 	uint8_t	subnqn[SPDK_NVME_NQN_FIELD_SIZE];
 
@@ -2219,14 +2282,15 @@ muser_listen(struct spdk_nvmf_transport *transport,
 					   transport);
 
 	err = mdev_create(trid->traddr);
-	if (err == -1) {
-		return -1;
+	if (err != 0) {
+		goto out;
 	}
 
 	muser_ctrlr = calloc(1, sizeof(*muser_ctrlr));
 	if (muser_ctrlr == NULL) {
 		SPDK_ERRLOG("Error allocating ctrlr: %m\n");
-		goto err;
+		err = -ENOMEM;
+		goto out;
 	}
 	muser_ctrlr->cntlid = 0xffff;
 	assert(muser_transport->group != NULL);
@@ -2240,17 +2304,23 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 	err = sem_init(&muser_ctrlr->sem, 0, 0);
 	if (err != 0) {
-		goto err_free_dev;
+		goto out;
 	}
 
 	err = muser_snprintf_subnqn(muser_ctrlr, subnqn);
 	if (err != 0) {
-		goto err_free_dev;
+		goto out;
 	}
 	muser_ctrlr->subsys = spdk_nvmf_tgt_find_subsystem(transport->tgt,
 	                                                   subnqn);
 	if (muser_ctrlr->subsys == NULL) {
-		goto err_free_dev;
+		err = -1;
+		goto out;
+	}
+
+	err = init_pci_dev(muser_ctrlr);
+	if (err != 0) {
+		goto out;
 	}
 
 	/*
@@ -2270,80 +2340,23 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	 * controller (everything after add_qp) in handle_connect_rsp?
 	 */
 	err = add_qp(muser_ctrlr, transport, MUSER_DEFAULT_AQ_DEPTH, 0, NULL);
-	if (err) {
-		goto err_free_dev;
-	}
-
-	/*
-	 * TODO move the rest in separate function as they're specific to
-	 * MUSER/PCI.
-	 */
-
-	/* LM setup */
-	nvme_dev_info_fill(&dev_info, muser_ctrlr);
-
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
-
-	/* PM */
-	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
-
-	/*
-	 * MSI-X
-	 *
-	 * TODO for now we put table BIR and PBA BIR in BAR4 because
-	 * it's just easier, otherwise in order to put it in BAR0 we'd
-	 * have to figure out where exactly doorbells end.
-	 */
-	muser_ctrlr->msixcap.mxc.ts = 0x3;
-	muser_ctrlr->msixcap.mtab.tbir = 0x4;
-	muser_ctrlr->msixcap.mtab.to = 0x0;
-	muser_ctrlr->msixcap.mpba.pbir = 0x5;
-	muser_ctrlr->msixcap.mpba.pbao = 0x0;
-
-	/* EXP */
-	muser_ctrlr->pxcap.pxcaps.ver = 0x2;
-	muser_ctrlr->pxcap.pxdcap.per = 0x1;
-	muser_ctrlr->pxcap.pxdcap.flrc = 0x1;
-	muser_ctrlr->pxcap.pxdcap2.ctds = 0x1;
-	/* FIXME check PXCAPS.DPT */
-
-	muser_ctrlr->lm_ctx = lm_ctx_create(&dev_info);
-	if (muser_ctrlr->lm_ctx == NULL) {
-		/* TODO: lm_create doesn't set errno */
-		SPDK_ERRLOG("Error creating libmuser ctx: %m\n");
-		goto err_destroy_qp;
-	}
-
-	muser_ctrlr->pci_config_space = lm_get_pci_config_space(muser_ctrlr->lm_ctx);
-	init_pci_config_space(muser_ctrlr->pci_config_space);
-
-	err = pthread_create(&muser_ctrlr->lm_thr, NULL,
-			     drive, muser_ctrlr->lm_ctx);
 	if (err != 0) {
-		/* TODO: pthread_create doesn't set errno */
-		SPDK_ERRLOG("Error creating lm_drive thread: %m\n");
-		goto err_destroy;
+		goto out;
 	}
 
+	/* FIXME move to handle_connect_rsp */
+	/* TODO should we call the callback regardless with non-zero status code? */
 	TAILQ_INSERT_TAIL(&muser_transport->ctrlrs, muser_ctrlr, link);
-
 	cb_fn(cb_arg, 0);
 
-	return 0;
-
-err_destroy:
-	lm_ctx_destroy(muser_ctrlr->lm_ctx);
-err_destroy_qp:
-	destroy_qp(muser_ctrlr, 0);
-err_free_dev:
-	free(muser_ctrlr);
-err:
-	mdev_remove(trid->traddr);
-
-	return -1;
+out:
+	if (err != 0) {
+		destroy_qp(muser_ctrlr, 0);
+		destroy_pci_dev(muser_ctrlr);
+		free(muser_ctrlr);
+		mdev_remove(trid->traddr);
+	}
+	return err;
 }
 
 static int
