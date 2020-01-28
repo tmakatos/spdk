@@ -363,6 +363,27 @@ mdev_remove(const char *uuid)
 { /* FIXME: Implement me */ }
 
 static int
+mdev_wait(const char *uuid)
+{
+	char *s;
+	int err;
+
+	if (asprintf(&s, "/dev/muser/%s", uuid) == -1) {
+		return -errno;
+	}
+
+	while ((err = access(s, F_OK)) == -1) {
+		if (errno != ENOENT) {
+			break;
+		}
+		/* FIXME don't sleep, use a more intelligent way, e.g. inotify */
+		sleep(1);
+	}
+	free(s);
+	return err;
+}
+
+static int
 mdev_create(const char *uuid)
 {
 	int fd;
@@ -381,15 +402,12 @@ mdev_create(const char *uuid)
 	} else {
 		err = 0;
 	}
-
 	(void)close(fd);
+	if (err != 0) {
+		return err;
+	}
 
-	sleep(1);
-
-	/* TODO: Wait until ctrlr appears on /ctrlr/muser/<uuid> */
-	/* FIXME don't sleep, use a more intelligent way */
-
-	return err;
+	return mdev_wait(uuid);
 }
 
 static bool
