@@ -2414,6 +2414,7 @@ out:
 		destroy_pci_dev(muser_ctrlr);
 		free(muser_ctrlr);
 		mdev_remove(trid->traddr);
+		cb_fn(cb_arg, err);
 	}
 	return err;
 }
