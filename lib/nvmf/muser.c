@@ -1214,7 +1214,9 @@ destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid)
 {
 	struct muser_qpair *qpair;
 
-	assert(ctrlr != NULL);
+	if (ctrlr == NULL) {
+		return;
+	}
 
 	qpair = ctrlr->qp[qid];
 	if (qpair == NULL) {
