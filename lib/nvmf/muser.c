@@ -257,9 +257,18 @@ struct muser_ctrlr {
 	bool					start; /* start subsys */
 	bool					del_admin_qp; /* del admin qp */
 	sem_t					sem;
-	int					err; /* error code set by handle_admin_q_connect_rsp */
 	struct spdk_nvmf_subsystem		*subsys;
 	struct muser_nvmf_prop_req		prop_req; /* read/write BAR0 */
+
+	/* error code set by handle_admin_q_connect_rsp */
+	/*
+	 * TODO no that we have handle_admin_q_connect_rsp_cb_fn, we can
+	 * probably get rid of err?
+	 */
+	int					err;
+	int					(*handle_admin_q_connect_rsp_cb_fn)(void*, int);
+	void					*handle_admin_q_connect_rsp_cb_arg;
+
 
 	/* PCI capabilities */
 	struct pmcap				pmcap;
@@ -403,6 +412,22 @@ muser_spdk_nvmf_subsystem_is_active(struct muser_ctrlr *ctrlr)
 static void
 destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid);
 
+/*
+ * TODO err is ignored here because handle_admin_q_connect_rsp (the fucntion
+ * exectuing this callback) will set err in ctrlr->err. Again, since we now
+ * have callbacks we can get rid of ctrlr->err.
+ */
+static int
+muser_request_spdk_nvmf_subsystem_resumed(void *cb_arg, int err) {
+	assert(cb_arg != NULL);
+	if (sem_post((sem_t*)cb_arg) != 0) {
+		if (err == 0) {
+			err = -errno;
+		}
+	}
+	return err;
+}
+
 static int
 muser_request_spdk_nvmf_subsystem_resume(struct muser_ctrlr *ctrlr)
 {
@@ -416,6 +441,9 @@ muser_request_spdk_nvmf_subsystem_resume(struct muser_ctrlr *ctrlr)
 	if (err != 0) {
 		return err;
 	}
+	ctrlr->handle_admin_q_connect_rsp_cb_fn = muser_request_spdk_nvmf_subsystem_resumed;
+	ctrlr->handle_admin_q_connect_rsp_cb_arg = &ctrlr->sem;
+
 	ctrlr->start = true;
 	spdk_wmb();
 	do {
@@ -2268,15 +2296,40 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 	return 0;
 }
 
+struct muser_listen_cb_arg {
+	struct muser_transport *muser_transport;
+	struct muser_ctrlr *muser_ctrlr;
+	spdk_nvmf_tgt_listen_done_fn cb_fn;
+	void *cb_arg;
+};
+
+static int
+muser_listen_done(void *cb_arg, int err)
+{
+	struct muser_listen_cb_arg *muser_listen_cb_arg;
+
+	assert(cb_arg != NULL);
+
+	muser_listen_cb_arg = (struct muser_listen_cb_arg*)cb_arg;
+
+	TAILQ_INSERT_TAIL(&muser_listen_cb_arg->muser_transport->ctrlrs,
+			  muser_listen_cb_arg->muser_ctrlr, link);
+	muser_listen_cb_arg->cb_fn(muser_listen_cb_arg->cb_arg, err);
+	free(muser_listen_cb_arg);
+
+	return err;
+}
+
 static int
 muser_listen(struct spdk_nvmf_transport *transport,
 	     const struct spdk_nvme_transport_id *trid,
              spdk_nvmf_tgt_listen_done_fn cb_fn, void *cb_arg)
 {
-	struct muser_transport *muser_transport;
-	struct muser_ctrlr *muser_ctrlr;
+	struct muser_transport *muser_transport = NULL;
+	struct muser_ctrlr *muser_ctrlr = NULL;
 	int err;
 	uint8_t	subnqn[SPDK_NVME_NQN_FIELD_SIZE];
+	struct muser_listen_cb_arg *muser_listen_cb_arg = NULL;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -2328,29 +2381,35 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	 * send NVMe requests to it, and SPDK expects them to be associated with
 	 * a QP. Therefore we have to create the admin QP very early.
 	 */
-	/*
-	 * FIXME adding a queue is asynchronous: as soon as this function
-	 * returns muser_accept will add it. Eventually handle_connect_rsp will
-	 * be executed and it's there where we can check for potential errors
-	 * returned by NVMf. This code assumes that creating the admin queue
-	 * succeeds, which is wrong. We can't synchronously wait for NVMf to
-	 * serve the connect request in order to get the return value because
-	 * there's only one thread. Do we really have to create the admin queue
-	 * here? Maybe we should continue with the addition of the MUSER
-	 * controller (everything after add_qp) in handle_connect_rsp?
-	 */
+	muser_listen_cb_arg = calloc(1, sizeof(*muser_listen_cb_arg));
+	if (muser_listen_cb_arg == NULL) {
+		err = -ENOMEM;
+		goto out;
+	}
+	muser_listen_cb_arg->muser_transport = muser_transport;
+	muser_listen_cb_arg->muser_ctrlr = muser_ctrlr;
+	muser_listen_cb_arg->cb_fn = cb_fn;
+	muser_listen_cb_arg->cb_arg = cb_arg;
+	muser_ctrlr->handle_admin_q_connect_rsp_cb_fn = muser_listen_done;
+	muser_ctrlr->handle_admin_q_connect_rsp_cb_arg = muser_listen_cb_arg;
+
 	err = add_qp(muser_ctrlr, transport, MUSER_DEFAULT_AQ_DEPTH, 0, NULL);
 	if (err != 0) {
 		goto out;
 	}
 
-	/* FIXME move to handle_connect_rsp */
-	/* TODO should we call the callback regardless with non-zero status code? */
-	TAILQ_INSERT_TAIL(&muser_transport->ctrlrs, muser_ctrlr, link);
-	cb_fn(cb_arg, 0);
+	/*
+	 * FIXME once https://review.gerrithub.io/c/spdk/spdk/+/481409 is merged
+	 * we can delete the following lines, otherwise it fails with:
+	 * spdk_nvmf_ctrlr_connect: *ERROR*: Subsystem 'nqn.2019-07.io.spdk.muser:00000000-0000-0000-0000-000000000000' is not ready
+	 */
+	muser_listen_done(muser_listen_cb_arg, 0);
+	muser_ctrlr->handle_admin_q_connect_rsp_cb_fn = NULL;
+	muser_ctrlr->handle_admin_q_connect_rsp_cb_arg = NULL;
 
 out:
 	if (err != 0) {
+		free(muser_listen_cb_arg);
 		destroy_qp(muser_ctrlr, 0);
 		destroy_pci_dev(muser_ctrlr);
 		free(muser_ctrlr);
@@ -2532,21 +2591,23 @@ muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 
 static int
 handle_admin_q_connect_rsp(struct spdk_nvmf_request *req,
-                           struct muser_qpair *muser_qpair)
+                           struct muser_qpair *qp)
 {
 	assert(req != NULL);
-	assert(muser_qpair != NULL);
+	assert(qp != NULL);
 
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "fabric connect command completed\n");
-	muser_qpair->ctrlr->err = spdk_nvme_cpl_is_error(&req->rsp->nvme_cpl);
-	if (!muser_qpair->ctrlr->err && req->rsp->connect_rsp.status_code_specific.success.cntlid != 0) {
-		muser_qpair->ctrlr->cntlid = req->rsp->connect_rsp.status_code_specific.success.cntlid;
+	qp->ctrlr->err = spdk_nvme_cpl_is_error(&req->rsp->nvme_cpl);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+	              "fabric connect command completed with %d\n",
+	              qp->ctrlr->err);
+	if (!qp->ctrlr->err && req->rsp->connect_rsp.status_code_specific.success.cntlid != 0) {
+		qp->ctrlr->cntlid = req->rsp->connect_rsp.status_code_specific.success.cntlid;
 	}
-	/*
-	 * Unblocks muser_request_spdk_nvmf_subsystem_resume, add_qp called
-	 * by muser_listen does not wait for this semaphore.
-	 */
-	return sem_post(&muser_qpair->ctrlr->sem);
+	if (qp->ctrlr->handle_admin_q_connect_rsp_cb_fn != NULL) {
+		return qp->ctrlr->handle_admin_q_connect_rsp_cb_fn(qp->ctrlr->handle_admin_q_connect_rsp_cb_arg,
+		                                                   spdk_nvme_cpl_is_error(&req->rsp->nvme_cpl));
+	}
+	return 0;
 }
 
 /*
