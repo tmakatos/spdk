@@ -30,6 +30,8 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <stdint.h>
+
 #include <muser/muser.h>
 #include <muser/caps/pm.h>
 #include <muser/caps/px.h>
@@ -312,10 +314,13 @@ struct muser_transport {
 	TAILQ_HEAD(, muser_qpair)		new_qps;
 };
 
+/* called when process exits */
 static int
 muser_destroy(struct spdk_nvmf_transport *transport)
 {
 	struct muser_transport *muser_transport;
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "destroy transport\n");
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -360,7 +365,24 @@ err:
 
 static void
 mdev_remove(const char *uuid)
-{ /* FIXME: Implement me */ }
+{
+	char *s;
+	FILE *fp;
+
+	if(asprintf(&s, "/sys/class/muser/muser/%s/remove", uuid) == -1) {
+		return;
+	}
+
+	fp = fopen(s, "a");
+	if (fp == NULL) {
+		SPDK_ERRLOG("failed to open %s: %m\n", s);
+		return;
+	}
+	if (fprintf(fp, "1\n") < 0) {
+		SPDK_ERRLOG("failed to remove %s: %m\n", uuid);
+	}
+	fclose(fp);
+}
 
 static int
 mdev_wait(const char *uuid)
@@ -1087,7 +1109,7 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 
 	cpl = ((struct spdk_nvme_cpl *)cq->addr) + cq->tail;
 
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "request complete SQ%d cid=%d status=%#x SQ head=%#x CQ tail=%#x\n",
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "request complete  SQ%d cid=%d status=%#x SQ head=%#x CQ tail=%#x\n",
 	              qid, cmd->cid, sc, ctrlr->qp[qid]->sq.head, cq->tail);
 
 	if (qid == 0) {
@@ -2200,14 +2222,31 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 	dev_info->log_lvl = LM_DBG;
 }
 
+/*
+ * Returns (void*)0 on success, (void*)-errno on error.
+ */
 static void *
 drive(void *arg)
 {
+	int err;
 	lm_ctx_t *lm_ctx = arg;
 
-	lm_ctx_drive(lm_ctx);
+	assert(arg != NULL);
 
-	return NULL;
+	err = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+	if (err != 0)  {
+		SPDK_ERRLOG("failed to set pthread cancel state: %s\n",
+		            strerror(err));
+		return (void*)((long)-err);
+	}
+	err = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	if (err != 0)  {
+		SPDK_ERRLOG("failed to set pthread cancel type: %s\n",
+		            strerror(err));
+		return (void*)((long)-err);
+	}
+
+	return (void*)((long)lm_ctx_drive(lm_ctx));
 }
 
 static void
@@ -2252,12 +2291,33 @@ muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
 	return (size_t)ret >= SPDK_NVME_NQN_FIELD_SIZE ? -1 : 0;
 }
 
-static void
+static int
 destroy_pci_dev(struct muser_ctrlr *ctrlr) {
-	if (ctrlr != NULL) {
-		lm_ctx_destroy(ctrlr->lm_ctx);
+
+	int err;
+	void *res;
+
+	if (ctrlr == NULL || ctrlr->lm_ctx == NULL) {
+		return 0;
 	}
-	/* FIXME destroy pthread */
+	err = pthread_cancel(ctrlr->lm_thr);
+	if (err != 0) {
+		SPDK_ERRLOG("failed to cancel thread: %s\n",  strerror(err));
+		return -err;
+	}
+	err = pthread_join(ctrlr->lm_thr, &res);
+	if (err != 0) {
+		SPDK_ERRLOG("failed to join thread: %s\n",
+		            strerror(err));
+		return -err;
+	}
+	if (res != PTHREAD_CANCELED) {
+		SPDK_ERRLOG("thread exited: %s\n", strerror(-(intptr_t)res));
+		/* thread died, not much we can do here */
+	}
+	lm_ctx_destroy(ctrlr->lm_ctx);
+	ctrlr->lm_ctx = NULL;
+	return 0;
 }
 
 static int
@@ -2309,8 +2369,9 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 
 	err = pthread_create(&ctrlr->lm_thr, NULL, drive, ctrlr->lm_ctx);
 	if (err != 0) {
-		/* TODO: pthread_create doesn't set errno */
-		SPDK_ERRLOG("Error creating lm_drive thread: %m\n");
+		SPDK_ERRLOG("Error creating lm_drive thread: %s\n",
+		            strerror(err));
+		return -err;
 	}
 
 	return 0;
@@ -2341,6 +2402,26 @@ muser_listen_done(void *cb_arg, int err)
 }
 
 static int
+destroy_ctrlr(struct muser_ctrlr *ctrlr)
+{
+	int err;
+
+	if (ctrlr == NULL) {
+		return 0;
+	}
+	destroy_qp(ctrlr, 0);
+	err = destroy_pci_dev(ctrlr);
+	if (err != 0) {
+		SPDK_ERRLOG("failed to tear down PCI device: %s\n",
+		            strerror(-err));
+		return err;
+	}
+	mdev_remove(ctrlr->uuid);
+	free(ctrlr);
+	return 0;
+}
+
+static int
 muser_listen(struct spdk_nvmf_transport *transport,
 	     const struct spdk_nvme_transport_id *trid,
              spdk_nvmf_tgt_listen_done_fn cb_fn, void *cb_arg)
@@ -2354,14 +2435,8 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
 
-	err = mdev_create(trid->traddr);
-	if (err != 0) {
-		goto out;
-	}
-
 	muser_ctrlr = calloc(1, sizeof(*muser_ctrlr));
 	if (muser_ctrlr == NULL) {
-		SPDK_ERRLOG("Error allocating ctrlr: %m\n");
 		err = -ENOMEM;
 		goto out;
 	}
@@ -2388,6 +2463,11 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	                                                   subnqn);
 	if (muser_ctrlr->subsys == NULL) {
 		err = -1;
+		goto out;
+	}
+
+	err = mdev_create(muser_ctrlr->uuid);
+	if (err != 0) {
 		goto out;
 	}
 
@@ -2429,11 +2509,12 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 out:
 	if (err != 0) {
+		SPDK_ERRLOG("failed to create MUSER controller: %s\n",
+		            strerror(-err));
 		free(muser_listen_cb_arg);
-		destroy_qp(muser_ctrlr, 0);
-		destroy_pci_dev(muser_ctrlr);
-		free(muser_ctrlr);
-		mdev_remove(trid->traddr);
+		if (destroy_ctrlr(muser_ctrlr) != 0) {
+			SPDK_ERRLOG("failed to clean up\n");
+		}
 		cb_fn(cb_arg, err);
 	}
 	return err;
@@ -2443,8 +2524,30 @@ static int
 muser_stop_listen(struct spdk_nvmf_transport *transport,
 		  const struct spdk_nvme_transport_id *trid)
 {
+	struct muser_transport *muser_transport;
+	struct muser_ctrlr *ctrlr, *tmp;
 
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "stop listen\n");
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "stop listen traddr=%s\n", trid->traddr);
+
+	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
+					   transport);
+
+	/* FIXME should acquire lock */
+
+	TAILQ_FOREACH_SAFE(ctrlr, &muser_transport->ctrlrs, link, tmp) {
+		if (strcmp(trid->traddr, ctrlr->trid.traddr) == 0) {
+			int err;
+			TAILQ_REMOVE(&muser_transport->ctrlrs, ctrlr, link);
+			err = destroy_ctrlr(ctrlr);
+			if (err != 0 ) {
+				SPDK_ERRLOG("failed destroy controller: %s\n",
+				            strerror(-err));
+			}
+			return err;
+		}
+	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "traddr=%s not found\n", trid->traddr);
 	return -1;
 }
 
@@ -2482,12 +2585,14 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn,
 	}
 }
 
+/* TODO what does this do? */
 static void
 muser_discover(struct spdk_nvmf_transport *transport,
 	       struct spdk_nvme_transport_id *trid,
 	       struct spdk_nvmf_discovery_log_page_entry *entry)
 { }
 
+/* TODO when is this called? */
 static struct spdk_nvmf_transport_poll_group *
 muser_poll_group_create(struct spdk_nvmf_transport *transport)
 {
@@ -2511,6 +2616,7 @@ muser_poll_group_create(struct spdk_nvmf_transport *transport)
 	return &muser_group->group;
 }
 
+/* called when process exits */
 static void
 muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 {
