@@ -482,10 +482,10 @@ enum spdk_nvme_cc_ams {
  * Fused Operation
  */
 enum spdk_nvme_cmd_fuse {
-	SPDK_NVMF_CMD_FUSE_NONE		= 0x0,	/**< normal operation */
+	SPDK_NVME_CMD_FUSE_NONE		= 0x0,	/**< normal operation */
 	SPDK_NVME_CMD_FUSE_FIRST	= 0x1,	/**< fused operation, first command */
 	SPDK_NVME_CMD_FUSE_SECOND	= 0x2,	/**< fused operation, second command */
-	/* 0x3 - reserved */
+	SPDK_NVME_CMD_FUSE_MASK		= 0x3,  /**< fused operation flags mask */
 };
 
 /**
@@ -1235,6 +1235,8 @@ enum spdk_nvme_path_status_code {
 	SPDK_NVME_SC_ABORTED_BY_HOST			= 0x71,
 };
 
+#define SPDK_NVME_MAX_OPC 0xff
+
 /**
  * Admin opcodes
  */
@@ -1275,6 +1277,8 @@ enum spdk_nvme_admin_opcode {
 	SPDK_NVME_OPC_SECURITY_RECEIVE			= 0x82,
 
 	SPDK_NVME_OPC_SANITIZE				= 0x84,
+
+	SPDK_NVME_OPC_GET_LBA_STATUS			= 0x86,
 };
 
 /**
@@ -1600,7 +1604,10 @@ struct __attribute__((packed)) __attribute__((aligned)) spdk_nvme_ctrlr_data {
 		/** Supports SPDK_NVME_OPC_DOORBELL_BUFFER_CONFIG */
 		uint16_t	doorbell_buffer_config : 1;
 
-		uint16_t	oacs_rsvd : 7;
+		/** Supports SPDK_NVME_OPC_GET_LBA_STATUS */
+		uint16_t	get_lba_status : 1;
+
+		uint16_t	oacs_rsvd : 6;
 	} oacs;
 
 	/** abort command limit */
@@ -2846,9 +2853,9 @@ SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_fw_commit) == 4, "Incorrect size");
 	  (cpl)->status.sc == SPDK_NVME_SC_REFERENCE_TAG_CHECK_ERROR))
 
 /** Set fused operation */
-#define SPDK_NVME_IO_FLAGS_FUSE_FIRST (1U << 0)
-#define SPDK_NVME_IO_FLAGS_FUSE_SECOND (1U << 1)
-#define SPDK_NVME_IO_FLAGS_FUSE_MASK (3U << 0)
+#define SPDK_NVME_IO_FLAGS_FUSE_FIRST (SPDK_NVME_CMD_FUSE_FIRST << 0)
+#define SPDK_NVME_IO_FLAGS_FUSE_SECOND (SPDK_NVME_CMD_FUSE_SECOND << 0)
+#define SPDK_NVME_IO_FLAGS_FUSE_MASK (SPDK_NVME_CMD_FUSE_MASK << 0)
 /** Enable protection information checking of the Logical Block Reference Tag field */
 #define SPDK_NVME_IO_FLAGS_PRCHK_REFTAG (1U << 26)
 /** Enable protection information checking of the Application Tag field */

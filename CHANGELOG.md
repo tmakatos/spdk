@@ -1,6 +1,55 @@
 # Changelog
 
-## v20.01: (Upcoming Release)
+## v20.04: (Upcoming Release)
+
+## v20.01
+
+### bdev
+
+A new function, `spdk_bdev_set_timeout`, has been added to set per descriptor I/O timeouts.
+
+A new class of functions `spdk_bdev_compare*`, have been added to allow native bdev support
+of block comparisons and compare-and-write.
+
+A new class of bdev events, `SPDK_BDEV_EVENT_MEDIA_MANAGEMENT`, has been added to allow bdevs
+which expose raw media to alert all I/O channels of pending media management events.
+
+A new API was added `spdk_bdev_io_get_aux_buf` allowing the caller to request
+an auxiliary buffer for its own private use. The API is used in the same manner that
+`spdk_bdev_io_get_buf` is used and the length of the buffer is always the same as the
+bdev_io primary buffer. 'spdk_bdev_io_put_aux_buf' frees the allocated auxiliary
+buffer.
+
+### blobfs
+
+Added boolean return value for function spdk_fs_set_cache_size to indicate its operation result.
+
+Added `blobfs_set_cache_size` RPC method to set cache size for blobstore filesystem.
+
+### blobstore
+
+Added new `use_extent_table` option to `spdk_blob_opts` for creating blobs with Extent Table descriptor.
+Using this metadata format, dramatically decreases number of writes required to persist each cluster allocation
+for thin provisioned blobs. Extent Table descriptor is enabled by default.
+See the [Blobstore Programmer's Guide](https://spdk.io/doc/blob.html#blob_pg_cluster_layout) for more details.
+
+### dpdk
+
+Updated DPDK submodule to DPDK 19.11.
+
+### env_dpdk
+
+`spdk_env_dpdk_post_init` now takes a boolean, `legacy_mem`, as an argument.
+
+A new function, `spdk_env_dpdk_dump_mem_stats`, prints information about the memory consumed by DPDK to a file specified by
+the user. A new utility, `scripts/dpdk_mem_info.py`, wraps this function and prints the output in an easy to read way.
+
+### event
+
+The functions `spdk_reactor_enable_framework_monitor_context_switch()` and
+`spdk_reactor_framework_monitor_context_switch_enabled()` have been changed to
+`spdk_framework_enable_context_switch_monitor()` and
+`spdk_framework_context_switch_monitor_enabled()`, respectively.
 
 ### ftl
 
@@ -18,54 +67,12 @@ parameter.
 
 `spdk_ftl_punit_range` and `ftl_module_init_opts` structures were removed.
 
-### sock
-
-Added spdk_sock_writev_async for performing asynchronous writes to sockets. This call will
-never return EAGAIN, instead queueing internally until the data has all been sent. This can
-simplify many code flows that create pollers to continue attempting to flush writes
-on sockets.
-
-Added `impl_name` parameter in spdk_sock_listen and spdk_sock_connect functions. Users may now
-specify the sock layer implementation they'd prefer to use. Valid implementations are currently
-"vpp" and "posix" and NULL, where NULL results in the previous behavior of the functions.
-
 ### isa-l
 
 Updated ISA-L submodule to commit f3993f5c0b6911 which includes implementation and
 optimization for aarch64.
 
 Enabled ISA-L on aarch64 by default in addition to x86.
-
-### thread
-
-`spdk_thread_send_msg` now returns int indicating if the message was successfully
-sent.
-
-### blobfs
-
-Added boolean return value for function spdk_fs_set_cache_size to indicate its operation result.
-
-Added `blobfs_set_cache_size` RPC method to set cache size for blobstore filesystem.
-
-### nvmf
-
-Add SockPriority option in [Transport] section, this can be used for NVMe-oF target
-on TCP transport to set sock priority for the incomming TCP connections.
-
-The NVMe-oF target now supports plugging out of tree NVMe-oF transports. In order
-to facilitate this feature, several small API changes have been made:
-
-The `spdk_nvme_transport_id` struct now contains a trstring member used to identify the transport.
-`spdk_nvmf_tgt_get_transport`, `spdk_nvmf_transport_opts_init`, and `spdk_nvmf_transport_create` all have been
-modified to take a string.
-A function table, `spdk_nvmf_transport_ops`, and macro, `SPDK_NVMF_TRANSPORT_REGISTER`, have been added which
-enable registering out of tree transports.
-
-
-### util
-
-`spdk_pipe`, a new utility for buffering data from sockets or files for parsing
-has been added. The public API is available at `include/spdk/pipe.h`.
 
 ### nvme
 
@@ -84,22 +91,103 @@ A new function, `spdk_nvme_transport_available_by_name`, has been added.
 A function table, `spdk_nvme_transport_ops`, and macro, `SPDK_NVME_TRANSPORT_REGISTER`, have been added which
 enable registering out of tree transports.
 
+A new function, `spdk_nvme_ns_supports_compare`, allows a user to check whether a given namespace supports the compare
+operation.
+
+A new family of functions, `spdk_nvme_ns_compare*`, give the user access to submitting compare commands to NVMe namespaces.
+
+A new function, `spdk_nvme_ctrlr_cmd_get_log_page_ext`, gives users more granular control over the command dwords sent in
+log page requests.
+
+### nvmf
+
+Add SockPriority option in [Transport] section, this can be used for NVMe-oF target
+on TCP transport to set sock priority for the incomming TCP connections.
+
+The NVMe-oF target now supports plugging out of tree NVMe-oF transports. In order
+to facilitate this feature, several small API changes have been made:
+
+The `spdk_nvme_transport_id` struct now contains a trstring member used to identify the transport.
+`spdk_nvmf_tgt_get_transport`, `spdk_nvmf_transport_opts_init`, and `spdk_nvmf_transport_create` all have been
+modified to take a string.
+A function table, `spdk_nvmf_transport_ops`, and macro, `SPDK_NVMF_TRANSPORT_REGISTER`, have been added which
+enable registering out of tree transports.
+
+Add `spdk_nvmf_tgt_stop_listen()` that can be used to stop listening for
+incoming connections for specified target and trid. Listener is not stopped
+implicitly upon destruction of a subsystem any more.
+
+A custom NVMe admin command handler has been added which allows the user to use the real drive
+attributes from one of the target NVMe drives when reporting drive attributes to the initiator.
+This handler can be enabled via the `nvmf_set_config` RPC.
+Note: In a future version of SPDK, this handler will be enabled by default.
+
+The SPDK target and initiator both now include compare-and-write functionality with one caveat. If using the RDMA transport,
+the target expects the initiator to send both the compare command and write command either with, or without inline data. The
+SPDK initiator currently respects this requirement, but this note is included as a flag for other initiators attempting
+compatibility with this version of SPDK.
+
 ### rpc
 
-Added optional 'delay_cmd_submit' parameter to 'bdev_nvme_set_options' RPC method.
+A new RPC, `bdev_zone_block_create`, enables creating an emulated zoned bdev on top of a standard block device.
 
-An new RPC `framework_get_reactors` has been added to retrieve list of all reactors.
+A new RPC, `bdev_ocssd_create`, enables creating an emulated zoned bdev on top of an Open Channel SSD.
 
-### dpdk
+A new RPC, `blobfs_set_cache_size`, enables managing blobfs cache size.
 
-Updated DPDK submodule to DPDK 19.11.
+A new RPC, `env_dpdk_get_mem_stats`, has been added to facilitate reading DPDK related memory
+consumption stats. Please see the env_dpdk section above for more details.
 
-### event
+A new RPC, `framework_get_reactors`, has been added to retrieve a list of all reactors.
 
-The functions `spdk_reactor_enable_framework_monitor_context_switch()` and
-`spdk_reactor_framework_monitor_context_switch_enabled()` have been changed to
-`spdk_framework_enable_context_switch_monitor()` and
-`spdk_framework_context_switch_monitor_enabled()`, respectively.
+`bdev_ftl_create` now takes a `base_bdev` argument in lieu of `trtype`, `traddr`, and `punits`.
+
+`bdev_nvme_set_options` now allows users to disable I/O submission batching with the `-d` flag
+
+`bdev_nvme_cuse_register` now accepts a `name` parameter.
+
+`bdev_uring_create` now takes arguments for `bdev_name` and `block_size`
+
+`nvmf_set_config` now takes an argument to enable passthru of identify commands to base NVMe devices.
+Please see the nvmf section above for more details.
+
+### scsi
+
+`spdk_scsi_lun_get_dif_ctx` now takes an additional argument of type `spdk_scsi_task`.
+
+### sock
+
+Added spdk_sock_writev_async for performing asynchronous writes to sockets. This call will
+never return EAGAIN, instead queueing internally until the data has all been sent. This can
+simplify many code flows that create pollers to continue attempting to flush writes
+on sockets.
+
+Added `impl_name` parameter in spdk_sock_listen and spdk_sock_connect functions. Users may now
+specify the sock layer implementation they'd prefer to use. Valid implementations are currently
+"vpp" and "posix" and NULL, where NULL results in the previous behavior of the functions.
+
+### thread
+
+`spdk_thread_send_msg` now returns int indicating if the message was successfully
+sent.
+
+A new function `spdk_thread_send_critical_msg`, has been added to support sending a single message from
+a context that may be interrupted, e.g. a signal handler.
+
+Two new functions, `spdk_poller_pause`, and `spdk_poller_resume`, have been added to give greater control
+of pollers to the application owner.
+
+### util
+
+`spdk_pipe`, a new utility for buffering data from sockets or files for parsing
+has been added. The public API is available at `include/spdk/pipe.h`.
+
+### bdev
+
+Added spdk_bdev_io_get_nvme_fused_status function for translating bdev_io status to NVMe status
+code for fused compare-and-write operation.
+
+Added spdk_bdev_get_acwu function for getting block device atomic compare and write unit size.
 
 ## v19.10:
 

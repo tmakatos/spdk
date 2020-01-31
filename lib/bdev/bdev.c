@@ -359,6 +359,16 @@ bdev_writev_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *
 			   uint64_t offset_blocks, uint64_t num_blocks,
 			   spdk_bdev_io_completion_cb cb, void *cb_arg);
 
+static int
+bdev_lock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
+		    uint64_t offset, uint64_t length,
+		    lock_range_cb cb_fn, void *cb_arg);
+
+static int
+bdev_unlock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
+		      uint64_t offset, uint64_t length,
+		      lock_range_cb cb_fn, void *cb_arg);
+
 void
 spdk_bdev_get_opts(struct spdk_bdev_opts *opts)
 {
@@ -595,12 +605,33 @@ _bdev_io_set_bounce_md_buf(struct spdk_bdev_io *bdev_io, void *md_buf, size_t le
 }
 
 static void
+bdev_io_get_buf_complete(struct spdk_bdev_io *bdev_io, void *buf, bool status)
+{
+	struct spdk_io_channel *ch = spdk_bdev_io_get_io_channel(bdev_io);
+
+	if (spdk_unlikely(bdev_io->internal.get_aux_buf_cb != NULL)) {
+		bdev_io->internal.get_aux_buf_cb(ch, bdev_io, buf);
+		bdev_io->internal.get_aux_buf_cb = NULL;
+	} else {
+		assert(bdev_io->internal.get_buf_cb != NULL);
+		bdev_io->internal.buf = buf;
+		bdev_io->internal.get_buf_cb(ch, bdev_io, status);
+		bdev_io->internal.get_buf_cb = NULL;
+	}
+}
+
+static void
 _bdev_io_set_buf(struct spdk_bdev_io *bdev_io, void *buf, uint64_t len)
 {
 	struct spdk_bdev *bdev = bdev_io->bdev;
 	bool buf_allocated;
 	uint64_t md_len, alignment;
 	void *aligned_buf;
+
+	if (spdk_unlikely(bdev_io->internal.get_aux_buf_cb != NULL)) {
+		bdev_io_get_buf_complete(bdev_io, buf, true);
+		return;
+	}
 
 	alignment = spdk_bdev_get_buf_align(bdev);
 	buf_allocated = _is_buf_allocated(bdev_io->u.bdev.iovs);
@@ -624,29 +655,22 @@ _bdev_io_set_buf(struct spdk_bdev_io *bdev_io, void *buf, uint64_t len)
 			spdk_bdev_io_set_md_buf(bdev_io, aligned_buf, md_len);
 		}
 	}
-
-	bdev_io->internal.buf = buf;
-	bdev_io->internal.get_buf_cb(spdk_bdev_io_get_io_channel(bdev_io), bdev_io, true);
+	bdev_io_get_buf_complete(bdev_io, buf, true);
 }
 
 static void
-bdev_io_put_buf(struct spdk_bdev_io *bdev_io)
+_bdev_io_put_buf(struct spdk_bdev_io *bdev_io, void *buf, uint64_t buf_len)
 {
 	struct spdk_bdev *bdev = bdev_io->bdev;
 	struct spdk_mempool *pool;
 	struct spdk_bdev_io *tmp;
 	bdev_io_stailq_t *stailq;
 	struct spdk_bdev_mgmt_channel *ch;
-	uint64_t buf_len, md_len, alignment;
-	void *buf;
+	uint64_t md_len, alignment;
 
-	buf = bdev_io->internal.buf;
-	buf_len = bdev_io->internal.buf_len;
 	md_len = spdk_bdev_is_md_separate(bdev) ? bdev_io->u.bdev.num_blocks * bdev->md_len : 0;
 	alignment = spdk_bdev_get_buf_align(bdev);
 	ch = bdev_io->internal.ch->shared_resource->mgmt_ch;
-
-	bdev_io->internal.buf = NULL;
 
 	if (buf_len + alignment + md_len <= SPDK_BDEV_BUF_SIZE_WITH_MD(SPDK_BDEV_SMALL_BUF_MAX_SIZE) +
 	    SPDK_BDEV_POOL_ALIGNMENT) {
@@ -667,6 +691,23 @@ bdev_io_put_buf(struct spdk_bdev_io *bdev_io)
 }
 
 static void
+bdev_io_put_buf(struct spdk_bdev_io *bdev_io)
+{
+	assert(bdev_io->internal.buf != NULL);
+	_bdev_io_put_buf(bdev_io, bdev_io->internal.buf, bdev_io->internal.buf_len);
+	bdev_io->internal.buf = NULL;
+}
+
+void
+spdk_bdev_io_put_aux_buf(struct spdk_bdev_io *bdev_io, void *buf)
+{
+	uint64_t len = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+
+	assert(buf != NULL);
+	_bdev_io_put_buf(bdev_io, buf, len);
+}
+
+static void
 _bdev_io_unset_bounce_buf(struct spdk_bdev_io *bdev_io)
 {
 	if (spdk_likely(bdev_io->internal.orig_iovcnt == 0)) {
@@ -682,7 +723,7 @@ _bdev_io_unset_bounce_buf(struct spdk_bdev_io *bdev_io)
 				  bdev_io->internal.bounce_iov.iov_base,
 				  bdev_io->internal.bounce_iov.iov_len);
 	}
-	/* set orignal buffer for this io */
+	/* set original buffer for this io */
 	bdev_io->u.bdev.iovcnt = bdev_io->internal.orig_iovcnt;
 	bdev_io->u.bdev.iovs = bdev_io->internal.orig_iovs;
 	/* disable bouncing buffer for this io */
@@ -703,11 +744,14 @@ _bdev_io_unset_bounce_buf(struct spdk_bdev_io *bdev_io)
 		bdev_io->internal.orig_md_buf = NULL;
 	}
 
+	/* We want to free the bounce buffer here since we know we're done with it (as opposed
+	 * to waiting for the conditional free of internal.buf in spdk_bdev_free_io()).
+	 */
 	bdev_io_put_buf(bdev_io);
 }
 
-void
-spdk_bdev_io_get_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_buf_cb cb, uint64_t len)
+static void
+bdev_io_get_buf(struct spdk_bdev_io *bdev_io, uint64_t len)
 {
 	struct spdk_bdev *bdev = bdev_io->bdev;
 	struct spdk_mempool *pool;
@@ -716,30 +760,20 @@ spdk_bdev_io_get_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_buf_cb cb, u
 	uint64_t alignment, md_len;
 	void *buf;
 
-	assert(cb != NULL);
-
 	alignment = spdk_bdev_get_buf_align(bdev);
 	md_len = spdk_bdev_is_md_separate(bdev) ? bdev_io->u.bdev.num_blocks * bdev->md_len : 0;
-
-	if (_is_buf_allocated(bdev_io->u.bdev.iovs) &&
-	    _are_iovs_aligned(bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, alignment)) {
-		/* Buffer already present and aligned */
-		cb(spdk_bdev_io_get_io_channel(bdev_io), bdev_io, true);
-		return;
-	}
 
 	if (len + alignment + md_len > SPDK_BDEV_BUF_SIZE_WITH_MD(SPDK_BDEV_LARGE_BUF_MAX_SIZE) +
 	    SPDK_BDEV_POOL_ALIGNMENT) {
 		SPDK_ERRLOG("Length + alignment %" PRIu64 " is larger than allowed\n",
 			    len + alignment);
-		cb(spdk_bdev_io_get_io_channel(bdev_io), bdev_io, false);
+		bdev_io_get_buf_complete(bdev_io, NULL, false);
 		return;
 	}
 
 	mgmt_ch = bdev_io->internal.ch->shared_resource->mgmt_ch;
 
 	bdev_io->internal.buf_len = len;
-	bdev_io->internal.get_buf_cb = cb;
 
 	if (len + alignment + md_len <= SPDK_BDEV_BUF_SIZE_WITH_MD(SPDK_BDEV_SMALL_BUF_MAX_SIZE) +
 	    SPDK_BDEV_POOL_ALIGNMENT) {
@@ -756,6 +790,38 @@ spdk_bdev_io_get_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_buf_cb cb, u
 	} else {
 		_bdev_io_set_buf(bdev_io, buf, len);
 	}
+}
+
+void
+spdk_bdev_io_get_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_buf_cb cb, uint64_t len)
+{
+	struct spdk_bdev *bdev = bdev_io->bdev;
+	uint64_t alignment;
+
+	assert(cb != NULL);
+	bdev_io->internal.get_buf_cb = cb;
+
+	alignment = spdk_bdev_get_buf_align(bdev);
+
+	if (_is_buf_allocated(bdev_io->u.bdev.iovs) &&
+	    _are_iovs_aligned(bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt, alignment)) {
+		/* Buffer already present and aligned */
+		cb(spdk_bdev_io_get_io_channel(bdev_io), bdev_io, true);
+		return;
+	}
+
+	bdev_io_get_buf(bdev_io, len);
+}
+
+void
+spdk_bdev_io_get_aux_buf(struct spdk_bdev_io *bdev_io, spdk_bdev_io_get_aux_buf_cb cb)
+{
+	uint64_t len = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
+
+	assert(cb != NULL);
+	assert(bdev_io->internal.get_aux_buf_cb == NULL);
+	bdev_io->internal.get_aux_buf_cb = cb;
+	bdev_io_get_buf(bdev_io, len);
 }
 
 static int
@@ -2050,6 +2116,8 @@ bdev_io_init(struct spdk_bdev_io *bdev_io,
 	bdev_io->internal.orig_md_buf = NULL;
 	bdev_io->internal.error.nvme.cdw0 = 0;
 	bdev_io->num_retries = 0;
+	bdev_io->internal.get_buf_cb = NULL;
+	bdev_io->internal.get_aux_buf_cb = NULL;
 }
 
 static bool
@@ -2464,6 +2532,7 @@ bdev_channel_create(void *io_device, void *ctx_buf)
 		}
 		new_range->length = range->length;
 		new_range->offset = range->offset;
+		new_range->locked_ctx = range->locked_ctx;
 		TAILQ_INSERT_TAIL(&ch->locked_ranges, new_range, tailq);
 	}
 
@@ -2795,6 +2864,12 @@ const struct spdk_uuid *
 spdk_bdev_get_uuid(const struct spdk_bdev *bdev)
 {
 	return &bdev->uuid;
+}
+
+uint16_t
+spdk_bdev_get_acwu(const struct spdk_bdev *bdev)
+{
+	return bdev->acwu;
 }
 
 uint32_t
@@ -3567,19 +3642,41 @@ spdk_bdev_compare_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_cha
 }
 
 static void
+bdev_comparev_and_writev_blocks_unlocked(void *ctx, int unlock_status)
+{
+	struct spdk_bdev_io *bdev_io = ctx;
+
+	if (unlock_status) {
+		SPDK_ERRLOG("LBA range unlock failed\n");
+	}
+
+	bdev_io->internal.cb(bdev_io, bdev_io->internal.status == SPDK_BDEV_IO_STATUS_SUCCESS ? true :
+			     false, bdev_io->internal.caller_ctx);
+}
+
+static void
+bdev_comparev_and_writev_blocks_unlock(struct spdk_bdev_io *bdev_io, int status)
+{
+	bdev_io->internal.status = status;
+
+	bdev_unlock_lba_range(bdev_io->internal.desc, spdk_io_channel_from_ctx(bdev_io->internal.ch),
+			      bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks,
+			      bdev_comparev_and_writev_blocks_unlocked, bdev_io);
+}
+
+static void
 bdev_compare_and_write_do_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
 	struct spdk_bdev_io *parent_io = cb_arg;
 
-	spdk_bdev_free_io(bdev_io);
-
-	if (success) {
-		parent_io->internal.status = SPDK_BDEV_IO_STATUS_SUCCESS;
-	} else {
-		parent_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
+	if (!success) {
+		SPDK_ERRLOG("Compare and write operation failed\n");
 	}
 
-	parent_io->internal.cb(parent_io, false, parent_io->internal.caller_ctx);
+	spdk_bdev_free_io(bdev_io);
+
+	bdev_comparev_and_writev_blocks_unlock(parent_io,
+					       success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED);
 }
 
 static void
@@ -3598,8 +3695,7 @@ bdev_compare_and_write_do_write(void *_bdev_io)
 	if (rc == -ENOMEM) {
 		bdev_queue_io_wait_with_cb(bdev_io, bdev_compare_and_write_do_write);
 	} else if (rc != 0) {
-		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
-		bdev_io->internal.cb(bdev_io, false, bdev_io->internal.caller_ctx);
+		bdev_comparev_and_writev_blocks_unlock(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
 }
 
@@ -3611,8 +3707,7 @@ bdev_compare_and_write_do_compare_done(struct spdk_bdev_io *bdev_io, bool succes
 	spdk_bdev_free_io(bdev_io);
 
 	if (!success) {
-		parent_io->internal.status = SPDK_BDEV_IO_STATUS_MISCOMPARE;
-		parent_io->internal.cb(parent_io, false, parent_io->internal.caller_ctx);
+		bdev_comparev_and_writev_blocks_unlock(parent_io, SPDK_BDEV_IO_STATUS_MISCOMPARE);
 		return;
 	}
 
@@ -3633,9 +3728,21 @@ bdev_compare_and_write_do_compare(void *_bdev_io)
 	if (rc == -ENOMEM) {
 		bdev_queue_io_wait_with_cb(bdev_io, bdev_compare_and_write_do_compare);
 	} else if (rc != 0) {
-		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_FAILED;
+		bdev_comparev_and_writev_blocks_unlock(bdev_io, SPDK_BDEV_IO_STATUS_FIRST_FUSED_FAILED);
+	}
+}
+
+static void
+bdev_comparev_and_writev_blocks_locked(void *ctx, int status)
+{
+	struct spdk_bdev_io *bdev_io = ctx;
+
+	if (status) {
+		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_FIRST_FUSED_FAILED;
 		bdev_io->internal.cb(bdev_io, false, bdev_io->internal.caller_ctx);
 	}
+
+	bdev_compare_and_write_do_compare(bdev_io);
 }
 
 int
@@ -3683,8 +3790,8 @@ spdk_bdev_comparev_and_writev_blocks(struct spdk_bdev_desc *desc, struct spdk_io
 		return 0;
 	}
 
-	bdev_compare_and_write_do_compare(bdev_io);
-	return 0;
+	return bdev_lock_lba_range(desc, ch, offset_blocks, num_blocks,
+				   bdev_comparev_and_writev_blocks_locked, bdev_io);
 }
 
 static void
@@ -4576,6 +4683,54 @@ spdk_bdev_io_get_nvme_status(const struct spdk_bdev_io *bdev_io, uint32_t *cdw0,
 	} else {
 		*sct = SPDK_NVME_SCT_GENERIC;
 		*sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+	}
+
+	*cdw0 = bdev_io->internal.error.nvme.cdw0;
+}
+
+void
+spdk_bdev_io_get_nvme_fused_status(const struct spdk_bdev_io *bdev_io, uint32_t *cdw0,
+				   int *first_sct, int *first_sc, int *second_sct, int *second_sc)
+{
+	assert(first_sct != NULL);
+	assert(first_sc != NULL);
+	assert(second_sct != NULL);
+	assert(second_sc != NULL);
+	assert(cdw0 != NULL);
+
+	if (bdev_io->internal.status == SPDK_BDEV_IO_STATUS_NVME_ERROR) {
+		if (bdev_io->internal.error.nvme.sct == SPDK_NVME_SCT_MEDIA_ERROR &&
+		    bdev_io->internal.error.nvme.sc == SPDK_NVME_SC_COMPARE_FAILURE) {
+			*first_sct = bdev_io->internal.error.nvme.sct;
+			*first_sc = bdev_io->internal.error.nvme.sc;
+			*second_sct = SPDK_NVME_SCT_GENERIC;
+			*second_sc = SPDK_NVME_SC_ABORTED_FAILED_FUSED;
+		} else {
+			*first_sct = SPDK_NVME_SCT_GENERIC;
+			*first_sc = SPDK_NVME_SC_SUCCESS;
+			*second_sct = bdev_io->internal.error.nvme.sct;
+			*second_sc = bdev_io->internal.error.nvme.sc;
+		}
+	} else if (bdev_io->internal.status == SPDK_BDEV_IO_STATUS_SUCCESS) {
+		*first_sct = SPDK_NVME_SCT_GENERIC;
+		*first_sc = SPDK_NVME_SC_SUCCESS;
+		*second_sct = SPDK_NVME_SCT_GENERIC;
+		*second_sc = SPDK_NVME_SC_SUCCESS;
+	} else if (bdev_io->internal.status == SPDK_BDEV_IO_STATUS_FIRST_FUSED_FAILED) {
+		*first_sct = SPDK_NVME_SCT_GENERIC;
+		*first_sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		*second_sct = SPDK_NVME_SCT_GENERIC;
+		*second_sc = SPDK_NVME_SC_ABORTED_FAILED_FUSED;
+	} else if (bdev_io->internal.status == SPDK_BDEV_IO_STATUS_MISCOMPARE) {
+		*first_sct = SPDK_NVME_SCT_MEDIA_ERROR;
+		*first_sc = SPDK_NVME_SC_COMPARE_FAILURE;
+		*second_sct = SPDK_NVME_SCT_GENERIC;
+		*second_sc = SPDK_NVME_SC_ABORTED_FAILED_FUSED;
+	} else {
+		*first_sct = SPDK_NVME_SCT_GENERIC;
+		*first_sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		*second_sct = SPDK_NVME_SCT_GENERIC;
+		*second_sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 	}
 
 	*cdw0 = bdev_io->internal.error.nvme.cdw0;
@@ -5956,7 +6111,9 @@ bdev_lock_lba_range_get_channel(struct spdk_io_channel_iter *i)
 	struct lba_range *range;
 
 	TAILQ_FOREACH(range, &ch->locked_ranges, tailq) {
-		if (range->length == ctx->range.length && range->offset == ctx->range.offset) {
+		if (range->length == ctx->range.length &&
+		    range->offset == ctx->range.offset &&
+		    range->locked_ctx == ctx->range.locked_ctx) {
 			/* This range already exists on this channel, so don't add
 			 * it again.  This can happen when a new channel is created
 			 * while the for_each_channel operation is in progress.
@@ -5993,6 +6150,8 @@ bdev_lock_lba_range_get_channel(struct spdk_io_channel_iter *i)
 static void
 bdev_lock_lba_range_ctx(struct spdk_bdev *bdev, struct locked_lba_range_ctx *ctx)
 {
+	assert(spdk_get_thread() == ctx->range.owner_ch->channel->thread);
+
 	/* We will add a copy of this range to each channel now. */
 	spdk_for_each_channel(__bdev_to_io_dev(bdev), bdev_lock_lba_range_get_channel, ctx,
 			      bdev_lock_lba_range_cb);
@@ -6011,12 +6170,7 @@ bdev_lba_range_overlaps_tailq(struct lba_range *range, lba_range_tailq_t *tailq)
 	return false;
 }
 
-int
-bdev_lock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
-		    uint64_t offset, uint64_t length,
-		    lock_range_cb cb_fn, void *cb_arg);
-
-int
+static int
 bdev_lock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
 		    uint64_t offset, uint64_t length,
 		    lock_range_cb cb_fn, void *cb_arg)
@@ -6059,6 +6213,14 @@ bdev_lock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
 }
 
 static void
+bdev_lock_lba_range_ctx_msg(void *_ctx)
+{
+	struct locked_lba_range_ctx *ctx = _ctx;
+
+	bdev_lock_lba_range_ctx(ctx->bdev, ctx);
+}
+
+static void
 bdev_unlock_lba_range_cb(struct spdk_io_channel_iter *i, int status)
 {
 	struct locked_lba_range_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
@@ -6079,7 +6241,8 @@ bdev_unlock_lba_range_cb(struct spdk_io_channel_iter *i, int status)
 			TAILQ_REMOVE(&bdev->internal.pending_locked_ranges, range, tailq);
 			pending_ctx = SPDK_CONTAINEROF(range, struct locked_lba_range_ctx, range);
 			TAILQ_INSERT_TAIL(&bdev->internal.locked_ranges, range, tailq);
-			bdev_lock_lba_range_ctx(bdev, pending_ctx);
+			spdk_thread_send_msg(pending_ctx->range.owner_ch->channel->thread,
+					     bdev_lock_lba_range_ctx_msg, pending_ctx);
 		}
 	}
 	pthread_mutex_unlock(&bdev->internal.mutex);
@@ -6100,7 +6263,8 @@ bdev_unlock_lba_range_get_channel(struct spdk_io_channel_iter *i)
 
 	TAILQ_FOREACH(range, &ch->locked_ranges, tailq) {
 		if (ctx->range.offset == range->offset &&
-		    ctx->range.length == range->length) {
+		    ctx->range.length == range->length &&
+		    ctx->range.locked_ctx == range->locked_ctx) {
 			TAILQ_REMOVE(&ch->locked_ranges, range, tailq);
 			free(range);
 			break;
@@ -6132,12 +6296,7 @@ bdev_unlock_lba_range_get_channel(struct spdk_io_channel_iter *i)
 	spdk_for_each_channel_continue(i, 0);
 }
 
-int
-bdev_unlock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
-		      uint64_t offset, uint64_t length,
-		      lock_range_cb cb_fn, void *cb_arg);
-
-int
+static int
 bdev_unlock_lba_range(struct spdk_bdev_desc *desc, struct spdk_io_channel *_ch,
 		      uint64_t offset, uint64_t length,
 		      lock_range_cb cb_fn, void *cb_arg)

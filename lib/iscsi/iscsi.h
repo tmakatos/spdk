@@ -41,6 +41,7 @@
 #include "spdk/iscsi_spec.h"
 #include "spdk/event.h"
 #include "spdk/thread.h"
+#include "spdk/sock.h"
 
 #include "spdk/scsi.h"
 #include "iscsi/param.h"
@@ -161,6 +162,14 @@ struct spdk_mobj {
 	void *buf;
 };
 
+/*
+ * Maximum number of SGL elements, i.e.,
+ * BHS, AHS, Header Digest, Data Segment and Data Digest.
+ */
+#define SPDK_ISCSI_MAX_SGL_DESCRIPTORS	(5)
+
+typedef void (*iscsi_conn_xfer_complete_cb)(void *cb_arg);
+
 struct spdk_iscsi_pdu {
 	struct iscsi_bhs bhs;
 	struct spdk_mobj *mobj;
@@ -183,6 +192,17 @@ struct spdk_iscsi_pdu {
 	uint32_t data_buf_len;
 	bool dif_insert_or_strip;
 	struct spdk_dif_ctx dif_ctx;
+	struct spdk_iscsi_conn *conn;
+
+	iscsi_conn_xfer_complete_cb		cb_fn;
+	void					*cb_arg;
+
+	/* The sock request ends with a 0 length iovec. Place the actual iovec immediately
+	 * after it. There is a static assert below to check if the compiler inserted
+	 * any unwanted padding */
+	int32_t						mapped_length;
+	struct spdk_sock_request			sock_req;
+	struct iovec					iov[SPDK_ISCSI_MAX_SGL_DESCRIPTORS];
 	TAILQ_ENTRY(spdk_iscsi_pdu)	tailq;
 
 
@@ -198,6 +218,9 @@ struct spdk_iscsi_pdu {
 		uint8_t data[32];
 	} sense;
 };
+SPDK_STATIC_ASSERT(offsetof(struct spdk_iscsi_pdu,
+			    sock_req) + sizeof(struct spdk_sock_request) == offsetof(struct spdk_iscsi_pdu, iov),
+		   "Compiler inserted padding between iov and sock_req");
 
 enum iscsi_connection_state {
 	ISCSI_CONN_STATE_INVALID = 0,
@@ -432,7 +455,7 @@ uint32_t spdk_iscsi_pdu_calc_data_digest(struct spdk_iscsi_pdu *pdu);
 
 /* Memory management */
 void spdk_put_pdu(struct spdk_iscsi_pdu *pdu);
-struct spdk_iscsi_pdu *spdk_get_pdu(void);
+struct spdk_iscsi_pdu *spdk_get_pdu(struct spdk_iscsi_conn *conn);
 int spdk_iscsi_conn_handle_queued_datain_tasks(struct spdk_iscsi_conn *conn);
 void spdk_iscsi_op_abort_task_set(struct spdk_iscsi_task *task,
 				  uint8_t function);

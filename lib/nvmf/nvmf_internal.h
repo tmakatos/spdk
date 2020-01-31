@@ -45,6 +45,8 @@
 #include "spdk/util.h"
 #include "spdk/thread.h"
 
+#include "spdk_internal/nvmf.h"
+
 #define SPDK_NVMF_MAX_SGL_ENTRIES	16
 
 /* The maximum number of buffers per request */
@@ -221,6 +223,8 @@ struct spdk_nvmf_request {
 	bool				data_from_pool;
 	struct spdk_bdev_io_wait_entry	bdev_io_wait;
 	struct spdk_nvmf_dif_info	dif;
+	spdk_nvmf_nvme_passthru_cmd_cb	cmd_cb_fn;
+	struct spdk_nvmf_request	*first_fused_req;
 
 	STAILQ_ENTRY(spdk_nvmf_request)	buf_link;
 	TAILQ_ENTRY(spdk_nvmf_request)	link;
@@ -269,6 +273,8 @@ struct spdk_nvmf_qpair {
 	uint16_t				qid;
 	uint16_t				sq_head;
 	uint16_t				sq_head_max;
+
+	struct spdk_nvmf_request		*first_fused_req;
 
 	TAILQ_HEAD(, spdk_nvmf_request)		outstanding;
 	TAILQ_ENTRY(spdk_nvmf_qpair)		link;
@@ -416,6 +422,10 @@ int spdk_nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc 
 				  struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
 int spdk_nvmf_bdev_ctrlr_write_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 				   struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
+int spdk_nvmf_bdev_ctrlr_compare_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
+				     struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
+int spdk_nvmf_bdev_ctrlr_compare_and_write_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
+		struct spdk_io_channel *ch, struct spdk_nvmf_request *cmp_req, struct spdk_nvmf_request *write_req);
 int spdk_nvmf_bdev_ctrlr_write_zeroes_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 		struct spdk_io_channel *ch, struct spdk_nvmf_request *req);
 int spdk_nvmf_bdev_ctrlr_flush_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
@@ -431,6 +441,8 @@ int spdk_nvmf_subsystem_add_ctrlr(struct spdk_nvmf_subsystem *subsystem,
 				  struct spdk_nvmf_ctrlr *ctrlr);
 void spdk_nvmf_subsystem_remove_ctrlr(struct spdk_nvmf_subsystem *subsystem,
 				      struct spdk_nvmf_ctrlr *ctrlr);
+void spdk_nvmf_subsystem_remove_all_listeners(struct spdk_nvmf_subsystem *subsystem,
+		bool stop);
 struct spdk_nvmf_ctrlr *spdk_nvmf_subsystem_get_ctrlr(struct spdk_nvmf_subsystem *subsystem,
 		uint16_t cntlid);
 int spdk_nvmf_ctrlr_async_event_ns_notice(struct spdk_nvmf_ctrlr *ctrlr);

@@ -5,6 +5,7 @@ function xtrace_disable() {
 			XTRACE_DISABLED="yes"
 		fi
 		set +x
+		shopt -u extdebug
         elif [ -z $XTRACE_NESTING_LEVEL ]; then
                 XTRACE_NESTING_LEVEL=1
         else
@@ -30,7 +31,7 @@ function xtrace_enable() {
 alias xtrace_restore=\
 'if [ -z $XTRACE_NESTING_LEVEL ]; then
         if [[ "$PREV_BASH_OPTS" == *"x"* ]]; then
-		XTRACE_DISABLED="no"; PREV_BASH_OPTS=""; set -x; xtrace_enable;
+		XTRACE_DISABLED="no"; PREV_BASH_OPTS=""; shopt -s extdebug; set -x; xtrace_enable;
 	fi
 else
 	XTRACE_NESTING_LEVEL=$((--XTRACE_NESTING_LEVEL));
@@ -337,6 +338,24 @@ function create_test_list() {
 	sed 's/\"//g' | sort > $output_dir/all_tests.txt || true
 }
 
+function gdb_attach() {
+	gdb -q --batch \
+		-ex 'handle SIGHUP nostop pass' \
+		-ex 'handle SIGQUIT nostop pass' \
+		-ex 'handle SIGPIPE nostop pass' \
+		-ex 'handle SIGALRM nostop pass' \
+		-ex 'handle SIGTERM nostop pass' \
+		-ex 'handle SIGUSR1 nostop pass' \
+		-ex 'handle SIGUSR2 nostop pass' \
+		-ex 'handle SIGCHLD nostop pass' \
+		-ex 'set print thread-events off' \
+		-ex 'cont' \
+		-ex 'thread apply all bt' \
+		-ex 'quit' \
+		--tty=/dev/stdout \
+		-p $1
+}
+
 function process_core() {
 	ret=0
 	while IFS= read -r -d '' core;
@@ -591,6 +610,12 @@ function run_test() {
 	local test_name="$1"
 	shift
 
+	if [ -n "$test_domain" ]; then
+		export test_domain="${test_domain}.${test_name}"
+	else
+		export test_domain="$test_name"
+	fi
+
 	timing_enter $test_name
 	echo "************************************"
 	echo "START TEST $test_name"
@@ -601,15 +626,26 @@ function run_test() {
 	echo "************************************"
 	echo "END TEST $test_name"
 	echo "************************************"
-
-	echo "$test_name" >> $output_dir/test_completions.txt
 	timing_exit $test_name
+
+	export test_domain=${test_domain%"$test_name"}
+	if [ -n "$test_domain" ]; then
+		export test_domain=${test_domain%?}
+	fi
+
+	if [ -z "$test_domain" ]; then
+		echo "top_level $test_name" >> $output_dir/test_completions.txt
+	else
+		echo "$test_domain $test_name" >> $output_dir/test_completions.txt
+	fi
 	xtrace_restore
 }
 
 function print_backtrace() {
 	# if errexit is not enabled, don't print a backtrace
 	[[ "$-" =~ e ]] || return 0
+
+	local args=("${BASH_ARGV[@]}")
 
 	xtrace_disable
 	echo "========== Backtrace start: =========="
@@ -618,10 +654,26 @@ function print_backtrace() {
 		local func="${FUNCNAME[$i]}"
 		local line_nr="${BASH_LINENO[$((i - 1))]}"
 		local src="${BASH_SOURCE[$i]}"
-		echo "in $src:$line_nr -> $func()"
+		local bt="" cmdline=()
+
+		if [[ -f $src ]]; then
+			bt=$(nl -w 4 -ba -nln $src | grep -B 5 -A 5 "^${line_nr}[^0-9]" | \
+			  sed "s/^/   /g" | sed "s/^   $line_nr /=> $line_nr /g")
+		fi
+
+		# If extdebug set the BASH_ARGC[i], try to fetch all the args
+		if (( BASH_ARGC[i] > 0 )); then
+			# Use argc as index to reverse the stack
+			local argc=${BASH_ARGC[i]} arg
+			for arg in "${args[@]::BASH_ARGC[i]}"; do
+				cmdline[argc--]="[\"$arg\"]"
+			done
+			args=("${args[@]:BASH_ARGC[i]}")
+		fi
+
+		echo "in $src:$line_nr -> $func($(IFS=","; printf '%s\n' "${cmdline[*]:-[]}"))"
 		echo "     ..."
-		nl -w 4 -ba -nln $src | grep -B 5 -A 5 "^${line_nr}[^0-9]" | \
-			sed "s/^/   /g" | sed "s/^   $line_nr /=> $line_nr /g"
+		echo "${bt:-backtrace unavailable}"
 		echo "     ..."
 	done
 	echo ""
@@ -715,6 +767,45 @@ function discover_bdevs()
 	kill $stubpid
 	wait $stubpid
 	rm -f /var/run/spdk_bdev0
+}
+
+function waitforserial()
+{
+	local i=0
+	local nvme_device_counter=1
+	if [[ -n "$2" ]]; then
+		nvme_device_counter=$2
+	fi
+
+	while [ $(lsblk -l -o NAME,SERIAL | grep -c $1) -lt $nvme_device_counter ]; do
+		[ $i -lt 15 ] || break
+		i=$((i+1))
+		echo "Waiting for devices"
+		sleep 1
+	done
+
+	if [[ $(lsblk -l -o NAME,SERIAL | grep -c $1) -lt $nvme_device_counter ]]; then
+		return 1
+	fi
+
+        return 0
+}
+
+function waitforserial_disconnect()
+{
+	local i=0
+	while lsblk -o NAME,SERIAL | grep -q -w $1; do
+		[ $i -lt 15 ] || break
+		i=$((i+1))
+		echo "Waiting for disconnect devices"
+		sleep 1
+	done
+
+	if lsblk -l -o NAME | grep -q -w $1; then
+		return 1
+	fi
+
+	return 0
 }
 
 function waitforblk()

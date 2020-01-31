@@ -3305,12 +3305,6 @@ muser_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 	return 0;
 }
 
-static int
-muser_qpair_set_sq_size(struct spdk_nvmf_qpair *qpair)
-{
-	return 0;
-}
-
 static void
 muser_opts_init(struct spdk_nvmf_transport_opts *opts)
 {
@@ -3349,7 +3343,6 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_muser = {
 	.qpair_get_local_trid = muser_qpair_get_local_trid,
 	.qpair_get_peer_trid = muser_qpair_get_peer_trid,
 	.qpair_get_listen_trid = muser_qpair_get_listen_trid,
-	.qpair_set_sqsize = muser_qpair_set_sq_size,
 };
 
 /* TODO s/resume/start */

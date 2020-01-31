@@ -251,11 +251,6 @@ struct spdk_nvmf_transport_ops {
 				     struct spdk_nvme_transport_id *trid);
 
 	/*
-	 * set the submission queue size of the queue pair
-	 */
-	int (*qpair_set_sqsize)(struct spdk_nvmf_qpair *qpair);
-
-	/*
 	 * Get transport poll group statistics
 	 */
 	int (*poll_group_get_stat)(struct spdk_nvmf_tgt *tgt,
@@ -358,6 +353,19 @@ void spdk_nvmf_tgt_listen(struct spdk_nvmf_tgt *tgt,
 			  struct spdk_nvme_transport_id *trid,
 			  spdk_nvmf_tgt_listen_done_fn cb_fn,
 			  void *cb_arg);
+
+/**
+ * Stop accepting new connections at the provided address.
+ *
+ * This is a counterpart to spdk_nvmf_tgt_listen().
+ *
+ * \param tgt The target associated with the listen address.
+ * \param trid The address to stop listening at.
+ *
+ * \return int. 0 on success or a negated errno on failure.
+ */
+int spdk_nvmf_tgt_stop_listen(struct spdk_nvmf_tgt *tgt,
+			      struct spdk_nvme_transport_id *trid);
 
 /**
  * Poll the target for incoming connections.
@@ -687,6 +695,8 @@ const char *spdk_nvmf_host_get_nqn(struct spdk_nvmf_host *host);
 /**
  * Accept new connections on the address provided.
  *
+ * This does not start the listener. Use spdk_nvmf_tgt_listen() for that.
+ *
  * May only be performed on subsystems in the PAUSED or INACTIVE states.
  *
  * \param subsystem Subsystem to add listener to.
@@ -698,7 +708,11 @@ int spdk_nvmf_subsystem_add_listener(struct spdk_nvmf_subsystem *subsystem,
 				     struct spdk_nvme_transport_id *trid);
 
 /**
- * Stop accepting new connections on the address provided
+ * Remove the listener from subsystem.
+ *
+ * New connections to the address won't be propagated to the subsystem.
+ * However to stop listening at target level one must use the
+ * spdk_nvmf_tgt_stop_listen().
  *
  * May only be performed on subsystems in the PAUSED or INACTIVE states.
  *
@@ -975,6 +989,15 @@ const char *spdk_nvmf_subsystem_get_nqn(struct spdk_nvmf_subsystem *subsystem);
 enum spdk_nvmf_subtype spdk_nvmf_subsystem_get_type(struct spdk_nvmf_subsystem *subsystem);
 
 /**
+ * Get maximum namespace id of the specified subsystem.
+ *
+ * \param subsystem Subsystem to query.
+ *
+ * \return maximum namespace id
+ */
+uint32_t spdk_nvmf_subsystem_get_max_nsid(struct spdk_nvmf_subsystem *subsystem);
+
+/**
  * Initialize transport options
  *
  * \param transport_name The transport type to create
@@ -1054,6 +1077,15 @@ const struct spdk_nvmf_transport_opts *spdk_nvmf_get_transport_opts(struct spdk_
  * \return the transport type for the given transport
  */
 spdk_nvme_transport_type_t spdk_nvmf_get_transport_type(struct spdk_nvmf_transport *transport);
+
+/**
+ * Get the transport name for a given transport.
+ *
+ * \param transport The transport to query
+ *
+ * \return the transport name for the given transport
+ */
+const char *spdk_nvmf_get_transport_name(struct spdk_nvmf_transport *transport);
 
 /**
  * Function to be called once transport add is complete
