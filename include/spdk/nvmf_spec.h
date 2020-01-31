@@ -133,9 +133,6 @@ enum spdk_nvmf_trtype {
 	/** TCP */
 	SPDK_NVMF_TRTYPE_TCP		= 0x3,
 
-	/** Kernel mdev-based */
-	SPDK_NVMF_TRTYPE_MUSER		= 0x4,
-
 	/** Intra-host transport (loopback) */
 	SPDK_NVMF_TRTYPE_INTRA_HOST	= 0xfe,
 };

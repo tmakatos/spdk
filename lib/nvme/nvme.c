@@ -796,8 +796,6 @@ spdk_nvme_transport_id_parse_trtype(enum spdk_nvme_transport_type *trtype, const
 		*trtype = SPDK_NVME_TRANSPORT_FC;
 	} else if (strcasecmp(str, "TCP") == 0) {
 		*trtype = SPDK_NVME_TRANSPORT_TCP;
-	} else if (strcasecmp(str, "MUSER") == 0) {
-		*trtype = SPDK_NVME_TRANSPORT_MUSER;
 	} else {
 		*trtype = SPDK_NVME_TRANSPORT_CUSTOM;
 	}
@@ -816,8 +814,6 @@ spdk_nvme_transport_id_trtype_str(enum spdk_nvme_transport_type trtype)
 		return "FC";
 	case SPDK_NVME_TRANSPORT_TCP:
 		return "TCP";
-	case SPDK_NVME_TRANSPORT_MUSER:
-		return "MUSER";
 	default:
 		return NULL;
 	}

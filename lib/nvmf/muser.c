@@ -3326,7 +3326,6 @@ muser_opts_init(struct spdk_nvmf_transport_opts *opts)
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_muser = {
 	.name = "muser",
-	.type = SPDK_NVME_TRANSPORT_MUSER,
 	.opts_init = muser_opts_init,
 	.create = muser_create,
 	.destroy = muser_destroy,

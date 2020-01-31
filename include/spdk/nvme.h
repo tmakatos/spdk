@@ -286,11 +286,6 @@ enum spdk_nvme_transport_type {
 	SPDK_NVME_TRANSPORT_TCP = SPDK_NVMF_TRTYPE_TCP,
 
 	/**
-	 * Kernel mdev-based Transport
-	 */
-	SPDK_NVME_TRANSPORT_MUSER = SPDK_NVMF_TRTYPE_MUSER,
-
-	/**
 	 * Custom Transport (Not spec defined)
 	 */
 	SPDK_NVME_TRANSPORT_CUSTOM = 4096,
