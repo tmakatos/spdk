@@ -381,6 +381,10 @@ mdev_remove(const char *uuid)
 	if (fprintf(fp, "1\n") < 0) {
 		SPDK_ERRLOG("failed to remove %s: %m\n", uuid);
 	}
+	/*
+	 * FIXME we get no information whether the remove has succeeded, maybe
+	 * check whehter the directory entry exists?
+	 */
 	fclose(fp);
 }
 
@@ -2423,6 +2427,12 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 		SPDK_ERRLOG("failed to tear down PCI device: %s\n",
 		            strerror(-err));
 		return err;
+	}
+	if (ctrlr->doorbells != NULL) { /* TODO does it work if it's NULL? */
+		if (munmap(ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
+			/* TODO shall return the error */
+			SPDK_ERRLOG("failed to unmap doorbells: %m\n");
+		}
 	}
 	mdev_remove(ctrlr->uuid);
 	free(ctrlr);
