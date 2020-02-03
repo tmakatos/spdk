@@ -1646,9 +1646,9 @@ consume_req(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
  * (3) post a completion with specified status code and status code type
  *     (8+3 bits) type and continue processing requsts.
  */
-static int
-consume_reqs(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
-	     struct muser_qpair *qpair)
+static ssize_t
+handle_sq_tdbl_write(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
+                     struct muser_qpair *qpair)
 {
 	struct spdk_nvme_cmd *queue;
 
@@ -1678,19 +1678,6 @@ consume_reqs(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
 		}
 	}
 	return 0;
-}
-
-/*
- * TODO consume_reqs is redundant, move its body in handle_sq_tdbl_write
- * XXX SPDK thread context
- */
-static ssize_t
-handle_sq_tdbl_write(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
-		     struct muser_qpair *qpair)
-{
-	assert(ctrlr != NULL);
-	assert(qpair != NULL);
-	return consume_reqs(ctrlr, new_tail, qpair);
 }
 
 /*
