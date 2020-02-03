@@ -233,6 +233,7 @@ io_q_id(struct io_q *q) {
 	return muser_qpair->qpair.qid;
 }
 
+/* TODO is there a poll_group per muser_ctrlr? */
 struct muser_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
 	struct muser_ctrlr			*ctrlr;
@@ -2435,6 +2436,7 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 		}
 	}
 	mdev_remove(ctrlr->uuid);
+	ctrlr->muser_group->ctrlr = NULL;
 	free(ctrlr);
 	return 0;
 }
