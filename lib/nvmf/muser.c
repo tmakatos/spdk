@@ -1101,6 +1101,13 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 
 	qid = io_q_id(cq);
 
+	if (ctrlr->qp[0]->qpair.ctrlr->vcprop.csts.bits.shst != SPDK_NVME_SHST_NORMAL) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+		              "ignore completion SQ%d cid=%d status=%#x\n",
+		              qid, cmd->cid, sc);
+		return 0;
+	}
+
 	if (cq_is_full(ctrlr, cq)) {
 		SPDK_ERRLOG("CQ%d full (tail=%d, head=%d)\n",
 			    qid, cq->tail, *hdbl(ctrlr, cq));
