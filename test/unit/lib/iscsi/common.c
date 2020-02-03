@@ -95,10 +95,11 @@ spdk_put_pdu(struct spdk_iscsi_pdu *pdu)
 }
 
 struct spdk_iscsi_pdu *
-spdk_get_pdu(void)
+spdk_get_pdu(struct spdk_iscsi_conn *conn)
 {
 	struct spdk_iscsi_pdu *pdu;
 
+	assert(conn != NULL);
 	if (g_pdu_pool_is_empty) {
 		return NULL;
 	}
@@ -110,6 +111,7 @@ spdk_get_pdu(void)
 
 	memset(pdu, 0, offsetof(struct spdk_iscsi_pdu, ahs));
 	pdu->ref = 1;
+	pdu->conn = conn;
 
 	return pdu;
 }
@@ -188,7 +190,8 @@ DEFINE_STUB(spdk_iscsi_conn_readv_data, int,
 	    (struct spdk_iscsi_conn *conn, struct iovec *iov, int iovcnt), 0);
 
 void
-spdk_iscsi_conn_write_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu)
+spdk_iscsi_conn_write_pdu(struct spdk_iscsi_conn *conn, struct spdk_iscsi_pdu *pdu,
+			  iscsi_conn_xfer_complete_cb cb_fn, void *cb_arg)
 {
 	TAILQ_INSERT_TAIL(&g_write_pdu_list, pdu, tailq);
 }

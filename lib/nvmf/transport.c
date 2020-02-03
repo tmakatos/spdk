@@ -39,6 +39,7 @@
 #include "spdk/config.h"
 #include "spdk/log.h"
 #include "spdk/nvmf.h"
+#include "spdk/nvmf_transport.h"
 #include "spdk/queue.h"
 #include "spdk/util.h"
 
@@ -97,6 +98,12 @@ spdk_nvme_transport_type_t
 spdk_nvmf_get_transport_type(struct spdk_nvmf_transport *transport)
 {
 	return transport->ops->type;
+}
+
+const char *
+spdk_nvmf_get_transport_name(struct spdk_nvmf_transport *transport)
+{
+	return transport->ops->name;
 }
 
 struct spdk_nvmf_transport *
@@ -350,16 +357,6 @@ spdk_nvmf_transport_opts_init(const char *transport_name,
 
 	ops->opts_init(opts);
 	return true;
-}
-
-int
-spdk_nvmf_transport_qpair_set_sqsize(struct spdk_nvmf_qpair *qpair)
-{
-	if (qpair->transport->ops->qpair_set_sqsize) {
-		return qpair->transport->ops->qpair_set_sqsize(qpair);
-	}
-
-	return 0;
 }
 
 int

@@ -59,8 +59,12 @@
 		(1ULL << VIRTIO_BLK_F_BARRIER)  | (1ULL << VIRTIO_BLK_F_SCSI))
 
 /* Vhost-blk support protocol features */
+#ifndef SPDK_CONFIG_VHOST_INTERNAL_LIB
 #define SPDK_VHOST_BLK_PROTOCOL_FEATURES ((1ULL << VHOST_USER_PROTOCOL_F_CONFIG) | \
 		(1ULL << VHOST_USER_PROTOCOL_F_INFLIGHT_SHMFD))
+#else
+#define SPDK_VHOST_BLK_PROTOCOL_FEATURES (1ULL << VHOST_USER_PROTOCOL_F_CONFIG)
+#endif
 
 struct spdk_vhost_blk_task {
 	struct spdk_bdev_io *bdev_io;
@@ -113,6 +117,15 @@ blk_task_finish(struct spdk_vhost_blk_task *task)
 	assert(task->bvsession->vsession.task_cnt > 0);
 	task->bvsession->vsession.task_cnt--;
 	task->used = false;
+}
+
+static void
+blk_task_init(struct spdk_vhost_blk_task *task)
+{
+	task->used = true;
+	task->iovcnt = SPDK_COUNTOF(task->iovs);
+	task->status = NULL;
+	task->used_len = 0;
 }
 
 static void
@@ -232,6 +245,8 @@ blk_request_resubmit(void *arg)
 {
 	struct spdk_vhost_blk_task *task = (struct spdk_vhost_blk_task *)arg;
 	int rc = 0;
+
+	blk_task_init(task);
 
 	rc = process_blk_request(task, task->bvsession, task->vq);
 	if (rc == 0) {
@@ -472,10 +487,7 @@ submit_inflight_desc(struct spdk_vhost_blk_session *bvsession,
 
 		vsession->task_cnt++;
 
-		task->used = true;
-		task->iovcnt = SPDK_COUNTOF(task->iovs);
-		task->status = NULL;
-		task->used_len = 0;
+		blk_task_init(task);
 
 		rc = process_blk_request(task, bvsession, vq);
 		if (rc == 0) {
@@ -530,10 +542,7 @@ process_vq(struct spdk_vhost_blk_session *bvsession, struct spdk_vhost_virtqueue
 
 		vsession->task_cnt++;
 
-		task->used = true;
-		task->iovcnt = SPDK_COUNTOF(task->iovs);
-		task->status = NULL;
-		task->used_len = 0;
+		blk_task_init(task);
 
 		rc = process_blk_request(task, bvsession, vq);
 		if (rc == 0) {

@@ -1149,7 +1149,7 @@ void spdk_nvme_ctrlr_get_default_io_qpair_opts(struct spdk_nvme_ctrlr *ctrlr,
  *
  * \param ctrlr NVMe controller for which to allocate the I/O queue pair.
  * \param opts I/O qpair creation options, or NULL to use the defaults as returned
- * by spdk_nvme_ctrlr_alloc_io_qpair().
+ * by spdk_nvme_ctrlr_get_default_io_qpair_opts().
  * \param opts_size Must be set to sizeof(struct spdk_nvme_io_qpair_opts), or 0
  * if opts is NULL.
  *
@@ -2841,8 +2841,8 @@ int spdk_nvme_cuse_register(struct spdk_nvme_ctrlr *ctrlr);
 void spdk_nvme_cuse_unregister(struct spdk_nvme_ctrlr *ctrlr);
 
 int spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
-                   uint32_t len, size_t mps,
-                   void* (*gpa_to_vva)(void* prv, uint64_t addr, uint64_t len));
+		       uint32_t len, size_t mps,
+		       void *(*gpa_to_vva)(void *prv, uint64_t addr, uint64_t len));
 
 struct nvme_request;
 

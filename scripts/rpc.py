@@ -174,12 +174,13 @@ if __name__ == "__main__":
     p.add_argument('name', help='compress bdev name')
     p.set_defaults(func=bdev_compress_delete)
 
-    def set_compress_pmd(args):
-        rpc.bdev.set_compress_pmd(args.client,
+    def compress_set_pmd(args):
+        rpc.bdev.compress_set_pmd(args.client,
                                   pmd=args.pmd)
-    p = subparsers.add_parser('set_compress_pmd', help='Set pmd option for a compress disk')
+    p = subparsers.add_parser('compress_set_pmd', aliases=['set_compress_pmd'],
+                              help='Set pmd option for a compress disk')
     p.add_argument('-p', '--pmd', type=int, help='0 = auto-select, 1= QAT only, 2 = ISAL only')
-    p.set_defaults(func=set_compress_pmd)
+    p.set_defaults(func=compress_set_pmd)
 
     def bdev_compress_get_orphans(args):
         print_dict(rpc.bdev.bdev_compress_get_orphans(args.client,
@@ -1651,7 +1652,8 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     def nvmf_set_config(args):
         rpc.nvmf.nvmf_set_config(args.client,
                                  acceptor_poll_rate=args.acceptor_poll_rate,
-                                 conn_sched=args.conn_sched)
+                                 conn_sched=args.conn_sched,
+                                 passthru_identify_ctrlr=args.passthru_identify_ctrlr)
 
     p = subparsers.add_parser('nvmf_set_config', aliases=['set_nvmf_target_config'],
                               help='Set NVMf target config')
@@ -1660,6 +1662,8 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     on the cores in a round robin manner (Default). 'hostip' - Schedule all the incoming connections from a
     specific host IP on to the same core. Connections from different IP will be assigned to cores in a round
     robin manner. 'transport' - Schedule the connection according to the transport characteristics.""")
+    p.add_argument('-i', '--passthru-identify-ctrlr', help="""Passthrough fields like serial number and model number
+    when the controller has a single namespace that is an NVMe bdev""", action='store_true')
     p.set_defaults(func=nvmf_set_config)
 
     def nvmf_create_transport(args):

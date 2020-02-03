@@ -249,12 +249,12 @@ spdk_vhost_nvme_get_queue_head(struct spdk_vhost_nvme_dev *nvme, uint32_t offset
 
 static int
 spdk_vhost_nvme_map_prps(struct spdk_vhost_nvme_dev *nvme, struct spdk_nvme_cmd *cmd,
-		   struct spdk_vhost_nvme_task *task, uint32_t len)
+			 struct spdk_vhost_nvme_task *task, uint32_t len)
 {
 	int err;
 
 	err = spdk_nvme_map_prps(nvme->session, cmd, task->iovs, len, 4096,
-	                         vhost_gpa_to_vva);
+				 vhost_gpa_to_vva);
 	if (spedk_unlikely(err < 0)) {
 		return err;
 	}

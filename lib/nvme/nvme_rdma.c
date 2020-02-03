@@ -1529,7 +1529,8 @@ nvme_rdma_req_init(struct nvme_rdma_qpair *rqpair, struct nvme_request *req,
 		 * targets use icdoff = 0.  For targets with non-zero icdoff, we
 		 * will currently just not use inline data for now.
 		 */
-		if (req->cmd.opc == SPDK_NVME_OPC_WRITE &&
+		if (spdk_nvme_opc_get_data_transfer(req->cmd.opc) ==
+		    SPDK_NVME_DATA_HOST_TO_CONTROLLER &&
 		    req->payload_size <= nvme_rdma_icdsz_bytes(ctrlr) &&
 		    (ctrlr->cdata.nvmf_specific.icdoff == 0)) {
 			rc = nvme_rdma_build_contig_inline_request(rqpair, rdma_req);
@@ -1537,7 +1538,8 @@ nvme_rdma_req_init(struct nvme_rdma_qpair *rqpair, struct nvme_request *req,
 			rc = nvme_rdma_build_contig_request(rqpair, rdma_req);
 		}
 	} else if (nvme_payload_type(&req->payload) == NVME_PAYLOAD_TYPE_SGL) {
-		if (req->cmd.opc == SPDK_NVME_OPC_WRITE &&
+		if (spdk_nvme_opc_get_data_transfer(req->cmd.opc) ==
+		    SPDK_NVME_DATA_HOST_TO_CONTROLLER &&
 		    req->payload_size <= nvme_rdma_icdsz_bytes(ctrlr) &&
 		    ctrlr->cdata.nvmf_specific.icdoff == 0) {
 			rc = nvme_rdma_build_sgl_inline_request(rqpair, rdma_req);
@@ -1626,6 +1628,8 @@ void
 nvme_rdma_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
 	struct nvme_rdma_qpair *rqpair = nvme_rdma_qpair(qpair);
+	struct nvme_rdma_ctrlr *rctrlr;
+	struct nvme_rdma_cm_event_entry *entry, *tmp;
 
 	nvme_qpair_set_state(qpair, NVME_QPAIR_DISABLED);
 	nvme_rdma_unregister_mem(rqpair);
@@ -1635,6 +1639,21 @@ nvme_rdma_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 	if (rqpair->evt) {
 		rdma_ack_cm_event(rqpair->evt);
 		rqpair->evt = NULL;
+	}
+
+	/*
+	 * This works because we have the controller lock both in
+	 * this function and in the function where we add new events.
+	 */
+	if (qpair->ctrlr != NULL) {
+		rctrlr = nvme_rdma_ctrlr(qpair->ctrlr);
+		STAILQ_FOREACH_SAFE(entry, &rctrlr->pending_cm_events, link, tmp) {
+			if (nvme_rdma_qpair(entry->evt->id->context) == rqpair) {
+				STAILQ_REMOVE(&rctrlr->pending_cm_events, entry, nvme_rdma_cm_event_entry, link);
+				rdma_ack_cm_event(entry->evt);
+				STAILQ_INSERT_HEAD(&rctrlr->free_cm_events, entry, link);
+			}
+		}
 	}
 
 	if (rqpair->cm_id) {

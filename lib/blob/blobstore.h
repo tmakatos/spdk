@@ -77,6 +77,18 @@ struct spdk_blob_mut_data {
 	 */
 	size_t		cluster_array_size;
 
+	/* Number of extent pages */
+	uint64_t	num_extent_pages;
+
+	/* Array of page offsets into the metadata region,
+	 * containing extents. Can contain entries for not yet
+	 * allocated pages. */
+	uint32_t	*extent_pages;
+
+	/* The size of the extent page array. This is greater than or
+	 * equal to 'num_extent_pages'. */
+	size_t		extent_pages_array_size;
+
 	/* Number of metadata pages */
 	uint32_t	num_pages;
 
@@ -150,6 +162,13 @@ struct spdk_blob {
 	uint32_t frozen_refcnt;
 	bool locked_operation_in_progress;
 	enum blob_clear_method clear_method;
+	bool extent_rle_found;
+	bool extent_table_found;
+	bool use_extent_table;
+
+	/* Number of data clusters retrived from extent table,
+	 * that many have to be read from extent pages. */
+	uint64_t	remaining_clusters_in_et;
 };
 
 struct spdk_blob_store {
@@ -242,10 +261,29 @@ struct spdk_bs_md_mask {
 };
 
 #define SPDK_MD_DESCRIPTOR_TYPE_PADDING 0
-#define SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE 1
 #define SPDK_MD_DESCRIPTOR_TYPE_XATTR 2
 #define SPDK_MD_DESCRIPTOR_TYPE_FLAGS 3
 #define SPDK_MD_DESCRIPTOR_TYPE_XATTR_INTERNAL 4
+
+/* Following descriptors define cluster layout in a blob.
+ * EXTENT_RLE cannot be present in blobs metadata,
+ * at the same time as EXTENT_TABLE and EXTENT_PAGE descriptors. */
+
+/* EXTENT_RLE descriptor holds an array of LBA that points to
+ * beginning of allocated clusters. The array is run-length encoded,
+ * with 0's being unallocated clusters. It is part of serialized
+ * metadata chain for a blob. */
+#define SPDK_MD_DESCRIPTOR_TYPE_EXTENT_RLE 1
+/* EXTENT_TABLE descriptor holds array of md page offsets that
+ * point to pages with EXTENT_PAGE descriptor. The 0's in the array
+ * are run-length encoded, non-zero values are unallocated pages.
+ * It is part of serialized metadata chain for a blob. */
+#define SPDK_MD_DESCRIPTOR_TYPE_EXTENT_TABLE 5
+/* EXTENT_PAGE descriptor holds an array of LBAs that point to
+ * beginning of allocated clusters. The array is run-length encoded,
+ * with 0's being unallocated clusters. It is NOT part of
+ * serialized metadata chain for a blob. */
+#define SPDK_MD_DESCRIPTOR_TYPE_EXTENT_PAGE 6
 
 struct spdk_blob_md_descriptor_xattr {
 	uint8_t		type;
@@ -268,13 +306,40 @@ struct spdk_blob_md_descriptor_extent_rle {
 	} extents[0];
 };
 
+struct spdk_blob_md_descriptor_extent_table {
+	uint8_t		type;
+	uint32_t	length;
+
+	/* Number of data clusters in the blob */
+	uint64_t	num_clusters;
+
+	struct {
+		uint32_t	page_idx;
+		uint32_t	num_pages; /* In units of pages */
+	} extent_page[0];
+};
+
+struct spdk_blob_md_descriptor_extent_page {
+	uint8_t		type;
+	uint32_t	length;
+
+	/* First cluster index in this extent page */
+	uint32_t	start_cluster_idx;
+
+	uint32_t        cluster_idx[0];
+};
+
 #define SPDK_BLOB_THIN_PROV (1ULL << 0)
 #define SPDK_BLOB_INTERNAL_XATTR (1ULL << 1)
-#define SPDK_BLOB_INVALID_FLAGS_MASK	(SPDK_BLOB_THIN_PROV | SPDK_BLOB_INTERNAL_XATTR)
+#define SPDK_BLOB_EXTENT_TABLE (1ULL << 2)
+#define SPDK_BLOB_INVALID_FLAGS_MASK	(SPDK_BLOB_THIN_PROV | SPDK_BLOB_INTERNAL_XATTR | SPDK_BLOB_EXTENT_TABLE)
 
 #define SPDK_BLOB_READ_ONLY (1ULL << 0)
 #define SPDK_BLOB_DATA_RO_FLAGS_MASK	SPDK_BLOB_READ_ONLY
-#define SPDK_BLOB_MD_RO_FLAGS_MASK	0
+
+#define SPDK_BLOB_CLEAR_METHOD_SHIFT 0
+#define SPDK_BLOB_CLEAR_METHOD (3ULL << SPDK_BLOB_CLEAR_METHOD_SHIFT)
+#define SPDK_BLOB_MD_RO_FLAGS_MASK	SPDK_BLOB_CLEAR_METHOD
 
 struct spdk_blob_md_descriptor_flags {
 	uint8_t		type;
@@ -322,6 +387,11 @@ struct spdk_blob_md_page {
 SPDK_STATIC_ASSERT(SPDK_BS_PAGE_SIZE == sizeof(struct spdk_blob_md_page), "Invalid md page size");
 
 #define SPDK_BS_MAX_DESC_SIZE sizeof(((struct spdk_blob_md_page*)0)->descriptors)
+
+/* Maximum number of extents a single Extent Page can fit.
+ * For an SPDK_BS_PAGE_SIZE of 4K SPDK_EXTENTS_PER_EP would be 512. */
+#define SPDK_EXTENTS_PER_EP_MAX ((SPDK_BS_MAX_DESC_SIZE - sizeof(struct spdk_blob_md_descriptor_extent_page)) / sizeof(uint32_t))
+#define SPDK_EXTENTS_PER_EP (spdk_align64pow2(SPDK_EXTENTS_PER_EP_MAX + 1) >> 1u)
 
 #define SPDK_BS_SUPER_BLOCK_SIG "SPDKBLOB"
 
@@ -463,6 +533,23 @@ static inline uint64_t
 _spdk_bs_back_dev_lba_to_io_unit(struct spdk_blob *blob, uint64_t lba)
 {
 	return lba * (blob->back_bs_dev->blocklen / blob->bs->io_unit_size);
+}
+
+static inline uint64_t
+_spdk_bs_cluster_to_extent_table_id(uint64_t cluster_num)
+{
+	return cluster_num / SPDK_EXTENTS_PER_EP;
+}
+
+static inline uint32_t *
+_spdk_bs_cluster_to_extent_page(struct spdk_blob *blob, uint64_t cluster_num)
+{
+	uint64_t extent_table_id = _spdk_bs_cluster_to_extent_table_id(cluster_num);
+
+	assert(blob->use_extent_table);
+	assert(extent_table_id < blob->active.extent_pages_array_size);
+
+	return &blob->active.extent_pages[extent_table_id];
 }
 
 /* End basic conversions */
