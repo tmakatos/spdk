@@ -233,9 +233,10 @@ io_q_id(struct io_q *q) {
 	return muser_qpair->qpair.qid;
 }
 
+/* TODO is there a poll_group per muser_ctrlr? */
 struct muser_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
-	struct muser_transport			*transport;
+	struct muser_ctrlr			*ctrlr;
 	TAILQ_HEAD(, muser_qpair)		qps;
 };
 
@@ -2422,9 +2423,7 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 		}
 	}
 	mdev_remove(ctrlr->uuid);
-	assert(ctrlr->muser_group != NULL);
-	assert(ctrlr->muser_group->transport != NULL);
-	TAILQ_REMOVE(&ctrlr->muser_group->transport->ctrlrs, ctrlr, link);
+	ctrlr->muser_group->ctrlr = NULL;
 	free(ctrlr);
 	return 0;
 }
@@ -2451,6 +2450,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	muser_ctrlr->cntlid = 0xffff;
 	assert(muser_transport->group != NULL);
 	muser_ctrlr->muser_group = muser_transport->group;
+	muser_ctrlr->muser_group->ctrlr = muser_ctrlr;
 	memcpy(muser_ctrlr->uuid, trid->traddr, sizeof(muser_ctrlr->uuid));
 	memcpy(&muser_ctrlr->trid, trid, sizeof(muser_ctrlr->trid));
 
@@ -2619,7 +2619,6 @@ muser_poll_group_create(struct spdk_nvmf_transport *transport)
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
 	muser_transport->group = muser_group;
-	muser_group->transport = muser_transport;
 
 	return &muser_group->group;
 }
@@ -3234,7 +3233,6 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 {
 	struct muser_poll_group *muser_group;
 	struct muser_qpair *muser_qpair, *tmp;
-	struct muser_ctrlr *ctrlr;
 	int err;
 
 	assert(group != NULL);
@@ -3243,12 +3241,10 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 
-	assert(muser_group->transport != NULL);
-	TAILQ_FOREACH(ctrlr, &muser_group->transport->ctrlrs, link) {
-		err = check_ctrlr(ctrlr);
-		if (err != 0) {
-			fail_ctrlr(ctrlr);
-		}
+	err = check_ctrlr(muser_group->ctrlr);
+	if (err != 0) {
+		fail_ctrlr(muser_group->ctrlr);
+		return err;
 	}
 
 	TAILQ_FOREACH_SAFE(muser_qpair, &muser_group->qps, link, tmp) {
