@@ -1377,6 +1377,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	uint16_t sc = SPDK_NVME_SC_SUCCESS;
 	uint16_t sct = SPDK_NVME_SCT_GENERIC;
 	int err = 0;
+	const char c = is_cq ? 'C' : 'S';
 
 	/*
 	 * XXX don't call io_q_id on this. Maybe operate directly on the
@@ -1401,7 +1402,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	}
 
 	if (lookup_io_q(ctrlr, cmd->cdw10_bits.create_io_q.qid, is_cq)) {
-		SPDK_ERRLOG("%cQ%d already exists\n", is_cq ? 'C' : 'S',
+		SPDK_ERRLOG("%cQ%d already exists\n", c,
 			    cmd->cdw10_bits.create_io_q.qid);
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
@@ -1459,6 +1460,8 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		SPDK_ERRLOG("failed to map I/O queue: %m\n");
 		goto out;
 	}
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%cQ addr=%#llx\n", c,
+	              (unsigned long long)io_q.addr);
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
