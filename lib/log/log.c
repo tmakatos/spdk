@@ -31,6 +31,8 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <sys/time.h>
+
 #include "spdk/stdinc.h"
 
 #include "spdk_internal/log.h"
@@ -115,6 +117,7 @@ spdk_log(enum spdk_log_level level, const char *file, const int line, const char
 	int severity = LOG_INFO;
 	char buf[MAX_TMPBUF];
 	va_list ap;
+	struct timeval tv;
 
 	if (g_log) {
 		va_start(ap, format);
@@ -149,13 +152,15 @@ spdk_log(enum spdk_log_level level, const char *file, const int line, const char
 
 	vsnprintf(buf, sizeof(buf), format, ap);
 
+	gettimeofday(&tv, NULL);
+
 	if (level <= g_spdk_log_print_level) {
-		fprintf(stderr, "%s:%4d:%s: *%s*: %s", file, line, func, spdk_level_names[level], buf);
+		fprintf(stderr, "%ld.%ld %s:%4d:%s: *%s*: %s", tv.tv_sec, tv.tv_usec, file, line, func, spdk_level_names[level], buf);
 		spdk_log_unwind_stack(stderr, level);
 	}
 
 	if (level <= g_spdk_log_level) {
-		syslog(severity, "%s:%4d:%s: *%s*: %s", file, line, func, spdk_level_names[level], buf);
+		syslog(severity, "%ld.%ld %s:%4d:%s: *%s*: %s", tv.tv_sec, tv.tv_usec, file, line, func, spdk_level_names[level], buf);
 	}
 
 	va_end(ap);
