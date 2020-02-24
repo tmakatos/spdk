@@ -2142,7 +2142,7 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 	}
 
 	ctrlr->doorbells = lm_mmap(ctrlr->lm_ctx, off, len);
-	if (ctrlr->doorbells == NULL) {
+	if (ctrlr->doorbells == MAP_FAILED) {
 		SPDK_ERRLOG("failed to allocate device memory: %m\n");
 	}
 out:
