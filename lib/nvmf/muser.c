@@ -74,6 +74,12 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define PAGE_MASK (~(PAGE_SIZE-1))
 #define PAGE_ALIGN(x) ((x + PAGE_SIZE - 1) & PAGE_MASK)
 
+/*
+ * Define TRAP_DOORBELLS to disable memory mapping the doorbells and trap instead.
+ * This will incur significant performance penalty and is intended for debug
+ * purposes.
+ */
+
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define MUSER_DEFAULT_AQ_DEPTH 32
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
@@ -2120,6 +2126,7 @@ pxcap_access(void *pvt, const uint8_t id, char * const buf, size_t count,
 	return count;
 }
 
+#ifndef TRAP_DOORBELLS
 static unsigned long
 bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 {
@@ -2148,6 +2155,7 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 out:
 	return (unsigned long)ctrlr->doorbells;
 }
+#endif
 
 static void
 nvme_reg_info_fill(lm_reg_info_t *reg_info)
@@ -2156,10 +2164,13 @@ nvme_reg_info_fill(lm_reg_info_t *reg_info)
 
 	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
 
-	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW | LM_REG_FLAG_MMAP;
+	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
+#ifndef TRAP_DOORBELLS
+	reg_info[LM_DEV_BAR0_REG_IDX].flags |= LM_REG_FLAG_MMAP;
+	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
+#endif
 	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
 	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar_fn;
-	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
 
 	reg_info[LM_DEV_BAR4_REG_IDX].flags = LM_REG_FLAG_RW;
 	reg_info[LM_DEV_BAR4_REG_IDX].size  = PAGE_SIZE;
@@ -2334,10 +2345,17 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 	/* LM setup */
 	nvme_dev_info_fill(&dev_info, ctrlr);
 
+#ifdef TRAP_DOORBELLS
+	ctrlr->doorbells = calloc(1, MUSER_DOORBELLS_SIZE);
+	if (ctrlr->doorbells == NULL) {
+		return -ENOMEM;
+	}
+#else
 	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
 	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
 	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
 	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
+#endif
 
 	/* PM */
 	ctrlr->pmcap.pmcs.nsfrst = 0x1;
@@ -2422,10 +2440,14 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 		return err;
 	}
 	if (ctrlr->doorbells != NULL) { /* TODO does it work if it's NULL? */
+#ifdef TRAP_DOORBELLS
+		free(ctrlr->doorbells);
+#else
 		if (munmap(ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
 			/* TODO shall return the error */
 			SPDK_ERRLOG("failed to unmap doorbells: %m\n");
 		}
+#endif
 	}
 	mdev_remove(ctrlr->uuid);
 	ctrlr->muser_group->ctrlr = NULL;
