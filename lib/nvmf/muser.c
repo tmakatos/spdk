@@ -2125,7 +2125,7 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 {
 	struct muser_ctrlr *ctrlr;
 
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "map doorbells %#lx@%#lx\n", len, off);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "map doorbells %#lx-%#lx\n", off, off + len);
 
 	ctrlr = pvt;
 
