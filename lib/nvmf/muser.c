@@ -3107,10 +3107,10 @@ handle_cmd_req(struct muser_ctrlr * ctrlr, struct spdk_nvme_cmd * cmd,
 	assert(cmd != NULL);
 
 	/*
-	 * FIXME this means that there are not free requests available,
+	 * FIXME this means that there are no free requests available,
 	 * returning -1 will fail the controller. Theoretically this error can
-	 * be avoided completely by ensuring we have as many requests as slots
-	 * in the SQ, plus one for the the property request.
+	 * be avoided completely by ensuring that we have as many requests as
+	 * slots in the SQ, plus one for the the property request.
 	 */
 	if (req == NULL) {
 		return -1;
