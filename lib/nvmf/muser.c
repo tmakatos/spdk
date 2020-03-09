@@ -427,13 +427,6 @@ mdev_create(const char *uuid)
 	return mdev_wait(uuid);
 }
 
-static bool
-is_nvme_cap(const loff_t pos)
-{
-	static const size_t off = offsetof(struct spdk_nvme_registers, cap);
-	return (size_t)pos >= off && (size_t)pos < off + sizeof(uint64_t);
-}
-
 static int
 handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
 		  const size_t count, loff_t pos, const bool is_write);
@@ -455,7 +448,6 @@ do_prop_req(struct muser_ctrlr *ctrlr, char *buf, size_t count, loff_t pos,
 	}
 	ctrlr->prop_req.ret = 0;
 	ctrlr->prop_req.buf = buf;
-	/* TODO: count must never be more than 8, otherwise we need to split it */
 	ctrlr->prop_req.count = count;
 	ctrlr->prop_req.pos = pos;
 	spdk_wmb();
@@ -475,8 +467,6 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 {
 	struct muser_ctrlr *ctrlr = pvt;
 	int err;
-	char *_buf = NULL;
-	size_t _count;
 
 	SPDK_NOTICELOG("ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
 		       ctrlr, count, pos);
@@ -486,35 +476,6 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 					 pos, false);
 	}
 
-	if (pos == offsetof(struct spdk_nvme_registers, csts) && ctrlr->cfs == 1U) {
-		/*
-		 * FIXME Do the rest of the registers in CSTS need to be
-		 * correctly set?
-		 */
-		union spdk_nvme_csts_register csts = {.bits.cfs = 1U};
-		if (count != sizeof(csts)) {
-			return -EINVAL;
-		}
-		memcpy(buf, &csts, count);
-		return 0;
-	}
-
-	/*
-	 * NVMe CAP is 8 bytes long however the driver reads it 4 bytes at a
-	 * time. NVMf doesn't like this.
-	 */
-	if (is_nvme_cap(pos)) {
-		if (count != 4 && count != 8) {
-			return -EINVAL;
-		}
-		if (count == 4) {
-			_buf = buf;
-			_count = count;
-			count = 8;
-			buf = alloca(count);
-		}
-	}
-
 	/*
 	 * This is a PCI read from the guest so we must synchronously wait for
 	 * NVMf to respond with the data.
@@ -522,12 +483,6 @@ read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
 	err = do_prop_req(ctrlr, buf, count, pos, false);
 	if (err != 0) {
 		return err;
-	}
-
-	if (_buf != NULL) {
-		memcpy(_buf,
-		       buf + pos - offsetof(struct spdk_nvme_registers, cap),
-		       _count);
 	}
 
 	return err;
