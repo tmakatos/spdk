@@ -79,6 +79,7 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
  * This will incur significant performance penalty and is intended for debug
  * purposes.
  */
+#define TRAP_DOORBELLS
 
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define MUSER_DEFAULT_AQ_DEPTH 32
@@ -300,6 +301,8 @@ struct muser_ctrlr {
 
 	/* internal CSTS.CFS register for MUSER fatal errors */
 	uint32_t				cfs : 1;
+
+	lm_trans_t				lm_trans;
 };
 
 static void
@@ -2342,6 +2345,8 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 	int err = 0;
 	lm_dev_info_t dev_info = { 0 };
 
+	dev_info.trans = ctrlr->lm_trans;
+
 	/* LM setup */
 	nvme_dev_info_fill(&dev_info, ctrlr);
 
@@ -2449,7 +2454,9 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 		}
 #endif
 	}
-	mdev_remove(ctrlr->uuid);
+	if (ctrlr->lm_trans == LM_TRANS_KERNEL) {
+		mdev_remove(ctrlr->uuid);
+	}
 	ctrlr->muser_group->ctrlr = NULL;
 	free(ctrlr);
 	return 0;
@@ -2500,9 +2507,21 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
-	err = mdev_create(muser_ctrlr->uuid);
-	if (err != 0) {
+	/* XXX */
+	muser_ctrlr->lm_trans = LM_TRANS_SOCK;
+#ifndef TRAP_DOORBELLS
+	if (muser_ctrlr->lm_trans == LM_TRANS_SOCK) {
+		SPDK_ERRLOG("memory-mappable doorbells only work with kernel MUSER transport\n");
+		err = -EOPNOTSUPP;
 		goto out;
+	}
+#endif
+
+	if (muser_ctrlr->lm_trans == LM_TRANS_KERNEL) {
+		err = mdev_create(muser_ctrlr->uuid);
+		if (err != 0) {
+			goto out;
+		}
 	}
 
 	err = init_pci_dev(muser_ctrlr);
