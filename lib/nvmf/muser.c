@@ -783,7 +783,10 @@ map_one(void *prv, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 
 	ret = lm_addr_to_sg(ctx, addr, len, sg, 1);
 	if (ret != 1) {
-		SPDK_ERRLOG("failed to map 0x%lx-0x%lx\n", addr, addr + len);
+		SPDK_ERRLOG("failed to map %#lx-%#lx: %d\n", addr, addr + len, ret);
+#ifdef DEBUG
+		abort();
+#endif
 		errno = ret;
 		return NULL;
 	}
@@ -791,6 +794,9 @@ map_one(void *prv, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 	ret = lm_map_sg(ctx, sg, iov, 1);
 	if (ret != 0) {
 		SPDK_ERRLOG("failed to map segment: %d\n", ret);
+#ifdef DEBUG
+		abort();
+#endif
 		errno = ret;
 		return NULL;
 	}
@@ -1926,13 +1932,57 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 }
 
 static ssize_t
+handle_pc_write(struct muser_ctrlr *ctrlr, const struct pc * const pc) {
+	/* FIXME IIUC these are RO fields, figure out how to handle */
+	assert(false);
+}
+
+static ssize_t
+handle_pmcs_write(struct muser_ctrlr *ctrlr, const struct pmcs * const pmcs) {
+
+	if (ctrlr->pmcap.pmcs.ps != pmcs->ps) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "power state set to %#x\n", pmcs->ps);
+	}
+	if (ctrlr->pmcap.pmcs.pmee != pmcs->pmee) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "PME enable set to %#x\n", pmcs->pmee);
+	}
+	if (ctrlr->pmcap.pmcs.dse != pmcs->dse) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "data select set to %#x\n", pmcs->dse);
+	}
+	if (ctrlr->pmcap.pmcs.pmes != pmcs->pmes) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "PME status set to %#x\n", pmcs->pmes);
+	}
+	ctrlr->pmcap.pmcs = *pmcs;
+	return 0;
+}
+
+static ssize_t
+handle_pmcap_write(struct muser_ctrlr *ctrlr, char * const buf,
+                   const size_t count, const loff_t offset)
+{
+	switch (offset) {
+		case offsetof(struct pmcap, pc):
+			if (count != sizeof(struct pc)) {
+				return -EINVAL;
+			}
+			return handle_pc_write(ctrlr, (struct pc*)buf);
+		case offsetof(struct pmcap, pmcs):
+			if (count != sizeof(struct pmcs)) {
+				return -EINVAL;
+			}
+			return handle_pmcs_write(ctrlr, (struct pmcs*)buf);
+	}
+	return -EINVAL;
+}
+
+static ssize_t
 pmcap_access(void *pvt, const uint8_t id, char * const buf, const size_t count,
              const loff_t offset, const bool is_write)
 {
 	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
 
 	if (is_write)
-		assert(false); /* TODO */
+		return handle_pmcap_write(ctrlr, buf, count, offset);
 
 	memcpy(buf, ((char*)&ctrlr->pmcap) + offset, count);
 
@@ -2509,6 +2559,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 	/* XXX */
 	muser_ctrlr->lm_trans = LM_TRANS_SOCK;
+#if 0
 #ifndef TRAP_DOORBELLS
 	if (muser_ctrlr->lm_trans == LM_TRANS_SOCK) {
 		SPDK_ERRLOG("memory-mappable doorbells only work with kernel MUSER transport\n");
@@ -2516,7 +2567,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 #endif
-
+#endif
 	if (muser_ctrlr->lm_trans == LM_TRANS_KERNEL) {
 		err = mdev_create(muser_ctrlr->uuid);
 		if (err != 0) {
