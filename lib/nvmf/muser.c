@@ -79,7 +79,7 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
  * This will incur significant performance penalty and is intended for debug
  * purposes.
  */
-#define TRAP_DOORBELLS
+//#define TRAP_DOORBELLS
 
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define MUSER_DEFAULT_AQ_DEPTH 32
@@ -303,6 +303,9 @@ struct muser_ctrlr {
 	uint32_t				cfs : 1;
 
 	lm_trans_t				lm_trans;
+
+	/* for LM_TRAS_SOCK */
+	int					fd;
 };
 
 static void
@@ -850,6 +853,7 @@ asq_map(struct muser_ctrlr *ctrlr)
 
 	assert(ctrlr != NULL);
 	assert(ctrlr->qp[0]->sq.addr == NULL);
+	assert(ctrlr->doorbells != NULL);
 	/* XXX ctrlr->asq == 0 is a valid memory address */
 
 	q.size = ctrlr->aqa.bits.asqs + 1;
@@ -2192,7 +2196,7 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 	assert(ctrlr != NULL);
 
 	if (off != DOORBELLS || len != MUSER_DOORBELLS_SIZE) {
-		SPDK_ERRLOG("bad map region %#lx@%#lx\n", len, off);
+		SPDK_ERRLOG("bad map region %#lx-%#lx\n", off, off + len);
 		errno = EINVAL;
 		return (unsigned long)MAP_FAILED;
 	}
@@ -2206,6 +2210,9 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 		SPDK_ERRLOG("failed to allocate device memory: %m\n");
 	}
 out:
+	if (ctrlr->lm_trans == LM_TRANS_SOCK) { /* FIXME */
+		return (unsigned long)ctrlr->fd;
+	}
 	return (unsigned long)ctrlr->doorbells;
 }
 #endif
@@ -2513,6 +2520,55 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 }
 
 static int
+muser_init_dev_mem(struct muser_ctrlr *ctrlr)
+{
+	char *path = NULL;
+	int fd = -1;
+	int ret = 0;
+
+	/* 
+	 * TODO create directory /dev/shm/muser and create device mem files in
+	 * there
+	 */
+	ret = asprintf(&path, "/dev/shm/%s.muser", ctrlr->uuid);
+	if (ret == -1) {
+		return ret;
+	}
+	fd = open(path, O_RDWR | O_CREAT);
+	if (fd == -1) {
+		SPDK_ERRLOG("failed to open device memory at %s: %m\n", path);
+		ret = fd;
+		goto out;
+	}
+
+	ret = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
+	if (ret != 0) {
+		goto out;
+	}
+	ctrlr->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
+                                PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
+	if (ctrlr->doorbells == MAP_FAILED) {
+		ctrlr->doorbells = NULL;
+		ret = -errno;
+		goto out;
+	}
+out:
+	if (ret != 0) {
+		if (ctrlr->doorbells != NULL) {
+			munmap(ctrlr->doorbells, MUSER_DOORBELLS_SIZE);
+		}
+		if (fd != -1) {
+			close(fd);
+		}
+		unlink(path); /* FIXME check return value */
+	} else {
+		ctrlr->fd = fd;
+	}
+	free(path);
+	return ret;
+}
+
+static int
 muser_listen(struct spdk_nvmf_transport *transport,
 	     const struct spdk_nvme_transport_id *trid,
              spdk_nvmf_tgt_listen_done_fn cb_fn, void *cb_arg)
@@ -2541,6 +2597,8 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	muser_ctrlr->prop_req.muser_req.req.rsp = &muser_ctrlr->prop_req.rsp;
 	muser_ctrlr->prop_req.muser_req.req.cmd = &muser_ctrlr->prop_req.cmd;
 
+	muser_ctrlr->fd = -1;
+
 	err = sem_init(&muser_ctrlr->sem, 0, 0);
 	if (err != 0) {
 		goto out;
@@ -2557,19 +2615,16 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
-	/* XXX */
+	/* TODO this should be a command-line option or env. var. */
 	muser_ctrlr->lm_trans = LM_TRANS_SOCK;
-#if 0
-#ifndef TRAP_DOORBELLS
-	if (muser_ctrlr->lm_trans == LM_TRANS_SOCK) {
-		SPDK_ERRLOG("memory-mappable doorbells only work with kernel MUSER transport\n");
-		err = -EOPNOTSUPP;
-		goto out;
-	}
-#endif
-#endif
+
 	if (muser_ctrlr->lm_trans == LM_TRANS_KERNEL) {
 		err = mdev_create(muser_ctrlr->uuid);
+		if (err != 0) {
+			goto out;
+		}
+	} else if (muser_ctrlr->lm_trans == LM_TRANS_SOCK) {
+		err = muser_init_dev_mem(muser_ctrlr);
 		if (err != 0) {
 			goto out;
 		}
