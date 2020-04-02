@@ -41,6 +41,7 @@ C_SRCS := nvmf.c
 SPDK_LIB_LIST = $(ALL_MODULES_LIST)
 SPDK_LIB_LIST += nvmf thread util bdev conf copy rpc jsonrpc json log sock trace notify
 SPDK_LIB_LIST += event event_bdev event_copy event_vmd
+SPDK_LIB_LIST += pulsar_lib
 
 ifeq ($(CONFIG_FC),y)
 ifneq ($(strip $(CONFIG_FC_PATH)),)

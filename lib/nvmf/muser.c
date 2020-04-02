@@ -3309,8 +3309,20 @@ handle_prop_req(struct muser_ctrlr *ctrlr)
 	return 0;
 }
 
+static int
+check_qpair(struct muser_poll_group *group, struct muser_qpair *qpair)
+{
+	struct muser_ctrlr *ctrlr;
+	assert(qpair != NULL);
+
+	ctrlr = qpair->ctrlr;
+
+	return abs(sq_head(qpair) - *tdbl(ctrlr, &qpair->sq));
+}
+
+
 static void
-poll_qpair(struct muser_poll_group *group, struct muser_qpair *qpair)
+process_qpair(struct muser_poll_group *group, struct muser_qpair *qpair)
 {
 	struct muser_ctrlr *ctrlr;
 	uint32_t new_tail;
@@ -3421,11 +3433,11 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		if (muser_qpair->del) {
 			continue;
 		}
-		poll_qpair(muser_group, muser_qpair);
+		err += check_qpair(muser_group, muser_qpair);
 
 	}
 
-	return 0;
+	return err;
 }
 
 static int

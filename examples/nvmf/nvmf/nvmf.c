@@ -31,6 +31,8 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <sys/eventfd.h>
+
 #include "spdk/stdinc.h"
 #include "spdk/env.h"
 #include "spdk/event.h"
@@ -42,6 +44,8 @@
 #include "spdk/likely.h"
 
 #include "spdk_internal/event.h"
+
+#include "/root/src/libpulsar/pulsar.h"
 
 #define NVMF_DEFAULT_SUBSYSTEMS		32
 #define ACCEPT_TIMEOUT_US		10000 /* 10ms */
@@ -185,30 +189,22 @@ nvmf_reactor_run(void *arg)
 	struct nvmf_reactor *nvmf_reactor = arg;
 	struct nvmf_lw_thread *lw_thread, *tmp;
 	struct spdk_thread *thread;
+	int n = 0;
+	int ret;
 
-	/* foreach all the lightweight threads in this nvmf_reactor */
-	do {
-		pthread_mutex_lock(&nvmf_reactor->mutex);
-		TAILQ_FOREACH_SAFE(lw_thread, &nvmf_reactor->threads, link, tmp) {
-			thread = spdk_thread_get_from_ctx(lw_thread);
-
-			spdk_thread_poll(thread, 0, 0);
-		}
-		pthread_mutex_unlock(&nvmf_reactor->mutex);
-	} while (!g_reactors_exit);
-
-	/* free all the lightweight threads */
 	pthread_mutex_lock(&nvmf_reactor->mutex);
 	TAILQ_FOREACH_SAFE(lw_thread, &nvmf_reactor->threads, link, tmp) {
 		thread = spdk_thread_get_from_ctx(lw_thread);
-		TAILQ_REMOVE(&nvmf_reactor->threads, lw_thread, link);
-		spdk_set_thread(thread);
-		spdk_thread_exit(thread);
-		spdk_thread_destroy(thread);
+		ret = spdk_thread_poll(thread, 0, 0);
+		if (ret > 0) {
+			n += ret;	
+		} else if (ret < 0) {
+			fprintf(stderr, "failed to poll: %s\n", strerror(-ret));	
+		}
 	}
 	pthread_mutex_unlock(&nvmf_reactor->mutex);
 
-	return 0;
+	return n;
 }
 
 static int
@@ -259,8 +255,18 @@ nvmf_schedule_spdk_thread(struct spdk_thread *thread)
 	return 0;
 }
 
+static int poll_cb(void *pvt)
+{
+	return nvmf_reactor_run(pvt);
+}
+
+static int proc_cb(void *pvt, int nwork)
+{
+	return 0;
+}
+
 static int
-nvmf_init_threads(void)
+nvmf_init_threads(pulsar_t *pulsar, pulsar_wq_t *wqs[], int *efds)
 {
 	int rc;
 	uint32_t i;
@@ -301,16 +307,15 @@ nvmf_init_threads(void)
 
 		if (i == master_core) {
 			g_master_reactor = nvmf_reactor;
-			g_next_reactor = g_master_reactor;
-		} else {
-			rc = spdk_env_thread_launch_pinned(i,
-							   nvmf_reactor_run,
-							   nvmf_reactor);
-			if (rc) {
-				fprintf(stderr, "failed to pin reactor launch\n");
-				goto err_exit;
-			}
 		}
+
+		wqs[i] = pulsar_wq_new(poll_cb, proc_cb, NULL, 0, nvmf_reactor,
+		                       efds[i]);
+		assert(wqs[i] != NULL);
+
+		int ret = pulsar_wq_add(pulsar, wqs[i]);
+		assert(ret == 0);
+
 	}
 
 	/* Some SPDK libraries assume that there is at least some number of lightweight
@@ -834,6 +839,20 @@ int main(int argc, char **argv)
 	int rc;
 	struct spdk_env_opts opts;
 	struct nvmf_lw_thread *lw_thread;
+	pulsar_t *pulsar;
+	pulsar_wq_t **wqs;
+	int ret;
+	int *efds;
+	uint32_t i;
+
+	pulsar = pulsar_new(1);
+	assert(pulsar != NULL);
+
+	efds = calloc(spdk_env_get_core_count(), sizeof *efds);
+	assert(efds != NULL);
+
+	wqs = calloc(spdk_env_get_core_count(), sizeof *wqs);
+	assert(wqs != NULL);
 
 	spdk_env_opts_init(&opts);
 	opts.name = "nvmf-example";
@@ -849,7 +868,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Initialize the threads */
-	rc = nvmf_init_threads();
+	rc = nvmf_init_threads(pulsar, wqs, efds);
 	assert(rc == 0);
 
 	/* Send a message to the thread assigned to the master reactor
@@ -865,9 +884,19 @@ int main(int argc, char **argv)
 
 	spdk_thread_send_msg(g_init_thread, nvmf_target_app_start, NULL);
 
-	nvmf_reactor_run(g_master_reactor);
+	pause(); /* FIXME */
 
 	spdk_env_thread_wait_all();
 	nvmf_destroy_threads();
+
+	for (i = 0; i < spdk_env_get_core_count(); i++) {
+		ret = pulsar_wq_rem(wqs[i]);
+		assert(ret == 0);
+		ret = pulsar_wq_del(wqs[i]);
+		assert(ret == 0);
+	}
+	free(wqs);
+	free(efds); /* FIXME close efds */
+	pulsar_del(pulsar);
 	return rc;
 }
