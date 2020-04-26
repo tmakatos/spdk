@@ -496,29 +496,32 @@ map_one(void *prv, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 {
 	int ret;
 	lm_ctx_t *ctx = (lm_ctx_t *)prv;
+	dma_sg_t tmp_sg;
+	struct iovec tmp_iov;
 
-	if (sg == NULL) {
-		sg = alloca(sizeof(*sg));
-	}
-	if (iov == NULL) {
-		iov = alloca(sizeof(*iov));
-	}
-
-	ret = lm_addr_to_sg(ctx, addr, len, sg, 1);
+	ret = lm_addr_to_sg(ctx, addr, len, &tmp_sg, 1);
 	if (ret != 1) {
 		SPDK_ERRLOG("failed to map 0x%lx-0x%lx\n", addr, addr + len);
 		errno = ret;
 		return NULL;
 	}
 
-	ret = lm_map_sg(ctx, sg, iov, 1);
+	ret = lm_map_sg(ctx, &tmp_sg, &tmp_iov, 1);
 	if (ret != 0) {
 		SPDK_ERRLOG("failed to map segment: %d\n", ret);
 		errno = ret;
 		return NULL;
 	}
 
-	return iov->iov_base;
+	if (sg) {
+		*sg = tmp_sg;
+	}
+
+	if (iov) {
+		*iov = tmp_iov;
+	}
+
+	return tmp_iov.iov_base;
 }
 
 static uint32_t
