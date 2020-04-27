@@ -254,7 +254,6 @@ struct muser_ctrlr {
 	 * or if we're going to have a single outstanding command we should
 	 * group them into a union.
 	 */
-	bool					del_admin_qp; /* del admin qp */
 	sem_t					sem;
 	struct muser_nvmf_prop_req		prop_req; /* read/write BAR0 */
 
@@ -589,6 +588,7 @@ asq_map(struct muser_ctrlr *ctrlr)
 	if (q.addr == NULL) {
 		return -1;
 	}
+	memset(q.addr, 0, q.size * sizeof(struct spdk_nvme_cmd));
 	insert_queue(ctrlr, &q, false, 0);
 	return 0;
 }
@@ -631,7 +631,6 @@ tdbl(struct muser_ctrlr *ctrlr, struct io_q *q)
 	assert(!q->is_cq);
 	return dbl(ctrlr, q);
 }
-
 
 static uint32_t *
 hdbl(struct muser_ctrlr *ctrlr, struct io_q *q)
@@ -678,8 +677,10 @@ acq_map(struct muser_ctrlr *ctrlr)
 	if (q->addr == NULL) {
 		return -1;
 	}
+	memset(q->addr, 0, q->size * sizeof(struct spdk_nvme_cpl));
 	q->is_cq = true;
 	q->ien = true;
+	insert_queue(ctrlr, q, true, 0);
 	return 0;
 }
 
@@ -2308,7 +2309,7 @@ muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 
 static int
 handle_io_queue_connect_rsp(struct muser_req *req, void *cb_arg)
- {
+{
 	struct muser_poll_group *muser_group;
 	struct muser_qpair *qpair = cb_arg;
 
@@ -2427,7 +2428,7 @@ muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 }
 
 static int
-map_admin_queues(struct muser_ctrlr *ctrlr)
+map_admin_queue(struct muser_ctrlr *ctrlr)
 {
 	int err;
 
@@ -2444,6 +2445,14 @@ map_admin_queues(struct muser_ctrlr *ctrlr)
 		return err;
 	}
 	return 0;
+}
+
+static void
+unmap_admin_queue(struct muser_ctrlr *ctrlr)
+{
+	assert(ctrlr->qp[0] != NULL);
+
+	destroy_io_qp(ctrlr->qp[0]);
 }
 
 static int
@@ -2477,7 +2486,12 @@ handle_prop_rsp(struct muser_req *req, void *cb_arg)
 			cc = (union spdk_nvme_cc_register *)qpair->ctrlr->prop_req.buf;
 
 			if (cc->bits.en == 1 && cc->bits.shn == 0) {
-				qpair->ctrlr->prop_req.ret = map_admin_queues(qpair->ctrlr);
+				SPDK_DEBUGLOG(SPDK_LOG_MUSER, "MAP Admin queue\n");
+				qpair->ctrlr->prop_req.ret = map_admin_queue(qpair->ctrlr);
+			} else if ((cc->bits.en == 0 && cc->bits.shn == 0) ||
+				   (cc->bits.en == 1 && cc->bits.shn != 0)) {
+				SPDK_DEBUGLOG(SPDK_LOG_MUSER, "UNMAP Admin queue\n");
+				unmap_admin_queue(qpair->ctrlr);
 			}
 		}
 	}
@@ -2702,12 +2716,6 @@ muser_ctrlr_poll(struct muser_ctrlr *ctrlr)
 
 	if (ctrlr == NULL) {
 		return 0;
-	}
-
-	if (ctrlr->del_admin_qp) {
-		ctrlr->del_admin_qp = false;
-		destroy_qp(ctrlr, 0);
-		err = sem_post(&ctrlr->sem);
 	}
 
 	if (ctrlr->prop_req.dir == MUSER_NVMF_INVALID) {
