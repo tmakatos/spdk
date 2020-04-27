@@ -289,6 +289,14 @@ fail_ctrlr(struct muser_ctrlr *ctrlr)
 	ctrlr->cfs = 1U;
 }
 
+static bool
+ctrlr_interrupt_enabled(struct muser_ctrlr *ctrlr)
+{
+	lm_pci_config_space_t *pci = ctrlr->pci_config_space;
+
+	return (!pci->hdr.cmd.id || ctrlr->msixcap.mxc.mxe);
+}
+
 struct muser_transport {
 	struct spdk_nvmf_transport		transport;
 	pthread_mutex_t				lock;
@@ -671,6 +679,7 @@ acq_map(struct muser_ctrlr *ctrlr)
 		return -1;
 	}
 	q->is_cq = true;
+	q->ien = true;
 	return 0;
 }
 
@@ -887,10 +896,12 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	 * might be triggerring interrupts from MUSER thread context so
 	 * check for race conditions.
 	 */
-	err = lm_irq_trigger(ctrlr->lm_ctx, cq->iv);
-	if (err != 0) {
-		SPDK_ERRLOG("failed to trigger interrupt: %m\n");
-		return err;
+	if (ctrlr_interrupt_enabled(ctrlr) && cq->ien) {
+		err = lm_irq_trigger(ctrlr->lm_ctx, cq->iv);
+		if (err != 0) {
+			SPDK_ERRLOG("failed to trigger interrupt: %m\n");
+			return err;
+		}
 	}
 
 	return 0;
