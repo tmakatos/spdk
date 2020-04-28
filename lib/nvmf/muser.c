@@ -109,6 +109,7 @@ struct muser_req  {
 	struct spdk_nvmf_request		req;
 	struct spdk_nvme_cpl			*rsp;
 	struct spdk_nvme_cmd			*cmd;
+	uint16_t				cid;
 
 	muser_req_cb_fn				cb_fn;
 	void					*cb_arg;
@@ -173,7 +174,6 @@ struct muser_qpair {
 	struct spdk_nvmf_qpair			qpair;
 	struct spdk_nvmf_transport_poll_group	*group;
 	struct muser_ctrlr			*ctrlr;
-	struct spdk_nvme_cmd			*cmd;
 	struct muser_req			*reqs_internal;
 	union nvmf_h2c_msg			*cmds_internal;
 	union nvmf_c2h_msg			*rsps_internal;
@@ -1043,6 +1043,7 @@ init_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 		qpair->reqs_internal[i].req.qpair = &qpair->qpair;
 		qpair->reqs_internal[i].req.rsp = &qpair->rsps_internal[i];
 		qpair->reqs_internal[i].req.cmd = &qpair->cmds_internal[i];
+		qpair->reqs_internal[i].cid = i;
 		TAILQ_INSERT_TAIL(&qpair->reqs, &qpair->reqs_internal[i], link);
 	}
 	ctrlr->qp[id] = qpair;
@@ -1060,7 +1061,7 @@ out:
  */
 static int
 add_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
-       const uint16_t qsize, const uint16_t qid, struct spdk_nvme_cmd *cmd)
+       const uint16_t qsize, const uint16_t qid)
 {
 	int err;
 	struct muser_transport *muser_transport;
@@ -1071,7 +1072,6 @@ add_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 	if (err != 0) {
 		return err;
 	}
-	ctrlr->qp[qid]->cmd = cmd;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -1187,7 +1187,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
-			     cmd->cdw10_bits.create_io_q.qid, cmd);
+			     cmd->cdw10_bits.create_io_q.qid);
 		if (err != 0) {
 			sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 			goto out;
@@ -2209,8 +2209,7 @@ muser_listen_associate(struct spdk_nvmf_transport *transport,
 
 	req = &muser_req->req;
 	req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
-	req->cmd->connect_cmd.cid = nvmf_qpair_is_admin_queue(&muser_qpair->qpair) ? 0 :
-				    muser_qpair->cmd->cid;
+	req->cmd->connect_cmd.cid = 0;
 	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
 	req->cmd->connect_cmd.recfmt = 0;
 	req->cmd->connect_cmd.sqsize = muser_qpair->qsize - 1;
@@ -2374,7 +2373,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 
 	req = &muser_req->req;
 	req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
-	req->cmd->connect_cmd.cid = muser_qpair->cmd->cid;
+	req->cmd->connect_cmd.cid = muser_req->cid;
 	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
 	req->cmd->connect_cmd.recfmt = 0;
 	req->cmd->connect_cmd.sqsize = muser_qpair->qsize - 1;
