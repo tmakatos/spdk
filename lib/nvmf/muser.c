@@ -171,7 +171,7 @@ struct io_q {
 
 struct muser_qpair {
 	struct spdk_nvmf_qpair			qpair;
-	struct spdk_nvmf_muser_poll_group	*group;
+	struct spdk_nvmf_transport_poll_group	*group;
 	struct muser_ctrlr			*ctrlr;
 	struct spdk_nvme_cmd			*cmd;
 	struct muser_req			*reqs_internal;
@@ -1198,13 +1198,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	insert_queue(ctrlr, &io_q, is_cq, cmd->cdw10_bits.create_io_q.qid);
 
 out:
-	/* For CQ the completion is posted by handle_connect_rsp. */
-	if (!is_cq || sc != 0) {
-		/* TODO is sct correct here? */
-		err = post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0, sc, sct);
-	}
-
-	return err;
+	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0, sc, sct);
 }
 
 /*
@@ -2128,6 +2122,7 @@ _muser_notify_new_admin_qpair(void *ctx)
 	assert(TAILQ_EMPTY(&qpair->outstanding));
 	group = qpair->group;
 	qpair->group = NULL;
+	mctrlr->cntlid = qpair->ctrlr->cntlid;
 
 	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
 		if (tgroup->transport == qpair->transport) {
@@ -2313,6 +2308,37 @@ muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 	free(muser_group);
 }
 
+static int
+handle_io_queue_connect_rsp(struct muser_req *req, void *cb_arg)
+ {
+	struct muser_poll_group *muser_group;
+	struct muser_qpair *qpair = cb_arg;
+
+	assert(qpair != NULL);
+	assert(req != NULL);
+
+	muser_group = SPDK_CONTAINEROF(qpair->group, struct muser_poll_group, group);
+	TAILQ_INSERT_TAIL(&muser_group->qps, qpair, link);
+
+	free(req->req.data);
+	req->req.data = NULL;
+
+	return 0;
+}
+
+static int
+muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
+{
+	int ret;
+
+	assert(ctrlr != NULL);
+	assert(subnqn != NULL);
+
+	ret = snprintf(subnqn, SPDK_NVME_NQN_FIELD_SIZE,
+		       "nqn.2019-07.io.spdk.muser:%s", ctrlr->uuid);
+	return (size_t)ret >= SPDK_NVME_NQN_FIELD_SIZE ? -1 : 0;
+}
+
 /*
  * Called by spdk_nvmf_transport_poll_group_add.
  */
@@ -2322,13 +2348,65 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 {
 	struct muser_poll_group *muser_group;
 	struct muser_qpair *muser_qpair;
+	struct muser_req *muser_req;
+	struct muser_ctrlr *muser_ctrlr;
+	struct spdk_nvmf_request *req;
+	struct spdk_nvmf_fabric_connect_data *data;
+	int err;
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
+	muser_qpair->group = group;
+	muser_ctrlr = muser_qpair->ctrlr;
 
-	TAILQ_INSERT_TAIL(&muser_group->qps, muser_qpair, link);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "add QP%d=%p(%p) to poll_group=%p\n",
+		      muser_qpair->qpair.qid, muser_qpair, qpair, muser_group);
 
-	return 0;
+	if (nvmf_qpair_is_admin_queue(&muser_qpair->qpair)) {
+		TAILQ_INSERT_TAIL(&muser_group->qps, muser_qpair, link);
+		return 0;
+	}
+
+	muser_req = get_muser_req(muser_qpair);
+	if (muser_req == NULL) {
+		return -1;
+	}
+
+	req = &muser_req->req;
+	req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
+	req->cmd->connect_cmd.cid = muser_qpair->cmd->cid;
+	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
+	req->cmd->connect_cmd.recfmt = 0;
+	req->cmd->connect_cmd.sqsize = muser_qpair->qsize - 1;
+	req->cmd->connect_cmd.qid = qpair->qid;
+
+	req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
+	req->data = calloc(1, req->length);
+	if (req->data == NULL) {
+		err = -1;
+		goto out;
+	}
+
+	data = (struct spdk_nvmf_fabric_connect_data *)req->data;
+	data->cntlid = muser_ctrlr->cntlid;
+	err = muser_snprintf_subnqn(muser_ctrlr, data->subnqn);
+	if (err != 0) {
+		goto out;
+	}
+
+	muser_req->cb_fn = handle_io_queue_connect_rsp;
+	muser_req->cb_arg = muser_qpair;
+
+	SPDK_NOTICELOG("sending connect fabrics command for QID=%#x cntlid=%#x\n",
+		       qpair->qid, data->cntlid);
+
+	spdk_nvmf_request_exec_fabrics(req);
+out:
+	if (err != 0) {
+		free(req->data);
+		muser_req_free(req);
+	}
+	return err;
 }
 
 static int
