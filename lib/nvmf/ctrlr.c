@@ -801,6 +801,9 @@ nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 			ctrlr->vcprop.cc.bits.en = 0;
 			ctrlr->vcprop.csts.bits.rdy = 0;
 			ctrlr->vcprop.csts.bits.shst = SPDK_NVME_SHST_COMPLETE;
+			spdk_for_each_channel(ctrlr->subsys->tgt,
+					      nvmf_ctrlr_disconnect_io_qpairs_on_pg,
+					      ctrlr, NULL);
 		} else if (cc.bits.shn == 0) {
 			ctrlr->vcprop.cc.bits.shn = 0;
 		} else {
