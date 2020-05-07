@@ -107,8 +107,8 @@ typedef int (*muser_req_cb_fn)(struct muser_req *req, void *cb_arg);
 
 struct muser_req  {
 	struct spdk_nvmf_request		req;
-	struct spdk_nvme_cpl			*rsp;
-	struct spdk_nvme_cmd			*cmd;
+	struct spdk_nvme_cpl			rsp;
+	struct spdk_nvme_cmd			cmd;
 	uint16_t				cid;
 
 	muser_req_cb_fn				cb_fn;
@@ -131,8 +131,6 @@ struct muser_nvmf_prop_req {
 	ssize_t					ret;
 	bool					delete;
 	struct muser_req			muser_req;
-	union nvmf_h2c_msg			cmd;
-	union nvmf_c2h_msg			rsp;
 };
 
 /*
@@ -175,8 +173,6 @@ struct muser_qpair {
 	struct spdk_nvmf_transport_poll_group	*group;
 	struct muser_ctrlr			*ctrlr;
 	struct muser_req			*reqs_internal;
-	union nvmf_h2c_msg			*cmds_internal;
-	union nvmf_c2h_msg			*rsps_internal;
 	uint16_t				qsize; /* TODO aren't all queues the same size? */
 	struct io_q				cq;
 	struct io_q				sq;
@@ -962,8 +958,6 @@ static void
 tear_down_qpair(struct muser_qpair *qpair)
 {
 	free(qpair->reqs_internal);
-	free(qpair->cmds_internal);
-	free(qpair->rsps_internal);
 }
 
 /*
@@ -1003,6 +997,8 @@ init_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 {
 	int err = 0, i;
 	struct muser_qpair *qpair;
+	struct muser_req *m_req;
+	struct spdk_nvmf_request *req;
 
 	assert(ctrlr != NULL);
 	assert(transport != NULL);
@@ -1019,20 +1015,6 @@ init_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 
 	TAILQ_INIT(&qpair->reqs);
 
-	qpair->rsps_internal = calloc(qsize, sizeof(union nvmf_c2h_msg));
-	if (qpair->rsps_internal == NULL) {
-		SPDK_ERRLOG("Error allocating rsps: %m\n");
-		err = -ENOMEM;
-		goto out;
-	}
-
-	qpair->cmds_internal = calloc(qsize, sizeof(union nvmf_h2c_msg));
-	if (qpair->cmds_internal == NULL) {
-		SPDK_ERRLOG("Error allocating cmds: %m\n");
-		err = -ENOMEM;
-		goto out;
-	}
-
 	qpair->reqs_internal = calloc(qsize, sizeof(struct muser_req));
 	if (qpair->reqs_internal == NULL) {
 		SPDK_ERRLOG("Error allocating reqs: %m\n");
@@ -1041,11 +1023,15 @@ init_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 	}
 
 	for (i = 0; i < qsize; i++) {
-		qpair->reqs_internal[i].req.qpair = &qpair->qpair;
-		qpair->reqs_internal[i].req.rsp = &qpair->rsps_internal[i];
-		qpair->reqs_internal[i].req.cmd = &qpair->cmds_internal[i];
-		qpair->reqs_internal[i].cid = i;
-		TAILQ_INSERT_TAIL(&qpair->reqs, &qpair->reqs_internal[i], link);
+		m_req = &qpair->reqs_internal[i];
+		req = &m_req->req;
+
+		m_req->cid = i;
+		req->qpair = &qpair->qpair;
+		req->rsp = (union nvmf_c2h_msg *)&m_req->rsp;
+		req->cmd = (union nvmf_h2c_msg *)&m_req->cmd;
+
+		TAILQ_INSERT_TAIL(&qpair->reqs, m_req, link);
 	}
 	ctrlr->qp[id] = qpair;
 out:
@@ -2021,8 +2007,10 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	memcpy(muser_ctrlr->uuid, trid->traddr, sizeof(muser_ctrlr->uuid));
 	memcpy(&muser_ctrlr->trid, trid, sizeof(muser_ctrlr->trid));
 
-	muser_ctrlr->prop_req.muser_req.req.rsp = &muser_ctrlr->prop_req.rsp;
-	muser_ctrlr->prop_req.muser_req.req.cmd = &muser_ctrlr->prop_req.cmd;
+	muser_ctrlr->prop_req.muser_req.req.rsp = (union nvmf_c2h_msg *)
+			&muser_ctrlr->prop_req.muser_req.rsp;
+	muser_ctrlr->prop_req.muser_req.req.cmd = (union nvmf_h2c_msg *)
+			&muser_ctrlr->prop_req.muser_req.cmd;
 
 	err = sem_init(&muser_ctrlr->sem, 0, 0);
 	if (err != 0) {
@@ -2520,6 +2508,7 @@ muser_req_done(struct spdk_nvmf_request *req)
 		}
 	}
 
+	memset(&muser_req->rsp, 0, sizeof(muser_req->rsp));
 	TAILQ_INSERT_TAIL(&qpair->reqs, muser_req, link);
 }
 
