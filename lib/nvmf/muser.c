@@ -882,7 +882,7 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 
 	assert(ctrlr->qp[qid] != NULL);
 
-	cpl->sqhd = (ctrlr->qp[qid]->sq.head + 1) % ctrlr->qp[qid]->sq.size;
+	cpl->sqhd = ctrlr->qp[qid]->sq.head;
 	cpl->cid = cmd->cid;
 	cpl->status.dnr = 0x0;
 	cpl->status.m = 0x0;
