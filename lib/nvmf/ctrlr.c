@@ -780,6 +780,7 @@ nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 		if (cc.bits.en) {
 			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Property Set CC Enable!\n");
 			ctrlr->vcprop.cc.bits.en = 1;
+			ctrlr->vcprop.csts.raw = 0;
 			ctrlr->vcprop.csts.bits.rdy = 1;
 		} else {
 			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Property Set CC Disable!\n");
