@@ -129,7 +129,6 @@ struct muser_nvmf_prop_req {
 	size_t					count;
 	loff_t					pos;
 	ssize_t					ret;
-	bool					delete;
 	struct muser_req			muser_req;
 };
 
@@ -2490,13 +2489,34 @@ handle_prop_rsp(struct muser_req *req, void *cb_arg)
 	return err;
 }
 
-static void
-muser_req_done(struct spdk_nvmf_request *req)
+static int
+muser_req_free(struct spdk_nvmf_request *req)
 {
 	struct muser_qpair *qpair;
 	struct muser_req *muser_req;
 
 	assert(req != NULL);
+
+	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
+	qpair = SPDK_CONTAINEROF(muser_req->req.qpair, struct muser_qpair, qpair);
+
+	TAILQ_INSERT_TAIL(&qpair->reqs, muser_req, link);
+
+	return 0;
+}
+
+static int
+muser_req_complete(struct spdk_nvmf_request *req)
+{
+	struct muser_qpair *qpair;
+	struct muser_req *muser_req;
+
+	assert(req != NULL);
+
+	if (req->cmd->connect_cmd.opcode != SPDK_NVME_OPC_FABRIC &&
+	    req->cmd->connect_cmd.fctype != SPDK_NVMF_FABRIC_COMMAND_CONNECT) {
+		/* TODO: do cqe business */
+	}
 
 	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
 	qpair = SPDK_CONTAINEROF(muser_req->req.qpair, struct muser_qpair, qpair);
@@ -2507,31 +2527,7 @@ muser_req_done(struct spdk_nvmf_request *req)
 		}
 	}
 
-	memset(&muser_req->rsp, 0, sizeof(muser_req->rsp));
 	TAILQ_INSERT_TAIL(&qpair->reqs, muser_req, link);
-}
-
-static int
-muser_req_free(struct spdk_nvmf_request *req)
-{
-	/*
-	 * TODO why do we call muser_req_done both from muser_req_complete and
-	 * from muser_req_free? Aren't they both always called? (first complete
-	 * and then done?)
-	 */
-	muser_req_done(req);
-	return 0;
-}
-
-static int
-muser_req_complete(struct spdk_nvmf_request *req)
-{
-	if (req->cmd->connect_cmd.opcode != SPDK_NVME_OPC_FABRIC &&
-	    req->cmd->connect_cmd.fctype != SPDK_NVMF_FABRIC_COMMAND_CONNECT) {
-		/* TODO: do cqe business */
-	}
-
-	muser_req_done(req);
 
 	return 0;
 }
@@ -2571,6 +2567,8 @@ get_muser_req(struct muser_qpair *qpair)
 
 	req = TAILQ_FIRST(&qpair->reqs);
 	TAILQ_REMOVE(&qpair->reqs, req, link);
+	memset(&req->rsp, 0, sizeof(req->rsp));
+
 	return req;
 }
 
