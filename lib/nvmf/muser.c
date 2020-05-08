@@ -667,29 +667,6 @@ muser_map_prps(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 				  _map_one);
 }
 
-/*
- * Maps a DPTR (currently a single page PRP) to our virtual memory.
- */
-static int
-dptr_remap(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd, size_t size)
-{
-	struct iovec iov;
-	const struct spdk_nvmf_registers *regs = spdk_nvmf_ctrlr_get_regs(ctrlr->qp[0]->qpair.ctrlr);
-
-	assert(ctrlr != NULL);
-	assert(cmd != NULL);
-
-	if (cmd->dptr.prp.prp2 != 0) {
-		return -1;
-	}
-
-	if (muser_map_prps(ctrlr, cmd, &iov, size) != 1) {
-		return -1;
-	}
-	cmd->dptr.prp.prp1 = (uint64_t)iov.iov_base >> regs->cc.bits.mps;
-	return 0;
-}
-
 #ifdef DEBUG
 /* TODO does such a function already exist in SPDK? */
 static bool
@@ -706,52 +683,9 @@ static int
 handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	       struct spdk_nvmf_request *req);
 
-
-/*
- * TODO looks very similar to consume_io_req, maybe convert this function to
- * something like 'prepare admin req' and then call consume_io_req?
- *
- * XXX SPDK thread context
- */
-static int
-handle_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
-{
-	int err;
-
-	assert(ctrlr != NULL);
-	assert(cmd != NULL);
-
-	/*
-	 * According to the spec: SGLs shall not be used for Admin commands in
-	 * NVMe over PCIe implementations.
-	 * FIXME explicitly fail request with correct status code and status
-	 * code type.
-	 */
-	assert(is_prp(cmd));
-
-	if (cmd->opc != SPDK_NVME_OPC_ASYNC_EVENT_REQUEST) {
-		/*
-		 * TODO why do we specify size sizeof(struct spdk_nvme_cmd)?
-		 * Check the spec.
-		 */
-		err = dptr_remap(ctrlr, cmd, sizeof(struct spdk_nvme_cmd));
-		if (err != 0) {
-			SPDK_ERRLOG("failed to remap DPTR: %d\n", err);
-			return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0,
-					       SPDK_NVME_SC_INTERNAL_DEVICE_ERROR,
-					       SPDK_NVME_SCT_GENERIC);
-		}
-	}
-
-	/* TODO have handle_cmd_req to call get_nvmf_req internally */
-	return handle_cmd_req(ctrlr, cmd, get_nvmf_req(ctrlr->qp[0]));
-}
-
 static void
-handle_identify_ctrlr_rsp(struct muser_ctrlr *ctrlr,
-			  struct spdk_nvme_ctrlr_data *data)
+handle_identify_ctrlr_rsp(struct spdk_nvme_ctrlr_data *data)
 {
-	assert(ctrlr != NULL);
 	assert(data != NULL);
 
 	data->sgls.supported = SPDK_NVME_SGLS_NOT_SUPPORTED;
@@ -762,18 +696,6 @@ handle_identify_ctrlr_rsp(struct muser_ctrlr *ctrlr,
 	 * properly handle.
 	 */
 	data->oncs.dsm = 0;
-}
-
-static void
-handle_identify_rsp(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
-{
-	assert(ctrlr != NULL);
-	assert(cmd != NULL);
-
-	if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR) {
-		handle_identify_ctrlr_rsp(ctrlr,
-					  (struct spdk_nvme_ctrlr_data *)cmd->dptr.prp.prp1);
-	}
 }
 
 /*
@@ -820,18 +742,6 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "request complete SQ%d cid=%d status=%#x SQ head=%#x CQ tail=%#x\n",
 		      qid, cmd->cid, sc, ctrlr->qp[qid]->sq.head, cq->tail);
-
-	if (qid == 0) {
-		switch (cmd->opc) {
-		case SPDK_NVME_OPC_IDENTIFY:
-			handle_identify_rsp(ctrlr, cmd);
-			break;
-		case SPDK_NVME_OPC_ABORT:
-		case SPDK_NVME_OPC_SET_FEATURES:
-			cpl->cdw0 = cdw0;
-			break;
-		}
-	}
 
 	assert(ctrlr->qp[qid] != NULL);
 
@@ -1207,7 +1117,7 @@ handle_abort_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
  * XXX SPDK thread context
  */
 static int
-consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
+consume_admin_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 {
 	assert(ctrlr != NULL);
 	assert(cmd != NULL);
@@ -1227,16 +1137,15 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
 	case SPDK_NVME_OPC_IDENTIFY:
 	case SPDK_NVME_OPC_SET_FEATURES:
+	case SPDK_NVME_OPC_GET_FEATURES:
 	case SPDK_NVME_OPC_GET_LOG_PAGE:
-
 	/*
 	 * NVMf correctly fails this request with sc=0x01 (Invalid Command
 	 * Opcode) as it does not advertise support for the namespace management
 	 * capability (oacs.ns_manage is set to 0 in the identify response).
 	 */
 	case SPDK_NVME_OPC_NS_MANAGEMENT:
-
-		return handle_admin_req(ctrlr, cmd);
+		return handle_cmd_req(ctrlr, cmd, get_nvmf_req(ctrlr->qp[0]));
 	case SPDK_NVME_OPC_CREATE_IO_CQ:
 	case SPDK_NVME_OPC_CREATE_IO_SQ:
 		return handle_create_io_q(ctrlr, cmd,
@@ -1248,7 +1157,8 @@ consume_admin_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 		return handle_del_io_q(ctrlr, cmd,
 				       cmd->opc == SPDK_NVME_OPC_DELETE_IO_CQ);
 	}
-	SPDK_ERRLOG("invalid command 0x%x\n", cmd->opc);
+
+	SPDK_NOTICELOG("unsupported command 0x%x\n", cmd->opc);
 	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0,
 			       SPDK_NVME_SC_INVALID_OPCODE,
 			       SPDK_NVME_SCT_GENERIC);
@@ -1258,9 +1168,22 @@ static int
 handle_cmd_rsp(struct muser_req *req, void *cb_arg)
 {
 	struct muser_qpair *qpair = cb_arg;
+	struct spdk_nvme_cmd *cmd = &req->req.cmd->nvme_cmd;
 
 	assert(qpair != NULL);
 	assert(req != NULL);
+
+	if (nvmf_qpair_is_admin_queue(&qpair->qpair)) {
+		switch (cmd->opc) {
+		case SPDK_NVME_OPC_IDENTIFY:
+			if ((cmd->cdw10 & 0xFF) == SPDK_NVME_IDENTIFY_CTRLR) {
+				handle_identify_ctrlr_rsp(req->req.data);
+			}
+			break;
+		default:
+			break;
+		}
+	}
 
 	return post_completion(qpair->ctrlr, &req->req.cmd->nvme_cmd,
 			       &qpair->ctrlr->qp[req->req.qpair->qid]->cq,
@@ -1270,50 +1193,20 @@ handle_cmd_rsp(struct muser_req *req, void *cb_arg)
 }
 
 static int
-consume_io_req(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
-	       struct spdk_nvme_cmd *cmd)
-{
-	assert(cmd != NULL);
-	assert(qpair != NULL);
-
-	return handle_cmd_req(ctrlr, cmd, get_nvmf_req(qpair));
-}
-
-/*
- * Returns 0 on success and -errno on error.
- *
- * XXX SPDK thread context
- */
-static int
-consume_req(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
+consume_cmd(struct muser_ctrlr *ctrlr, struct muser_qpair *qpair,
 	    struct spdk_nvme_cmd *cmd)
 {
 	assert(qpair != NULL);
 	if (nvmf_qpair_is_admin_queue(&qpair->qpair)) {
-		return consume_admin_req(ctrlr, cmd);
+		return consume_admin_cmd(ctrlr, cmd);
 	}
-	return consume_io_req(ctrlr, qpair, cmd);
+
+	return handle_cmd_req(ctrlr, cmd, get_nvmf_req(qpair));
 }
 
-/*
- * XXX SPDK thread context
- *
- * TODO Lots of functions called by consume_req can post completions or fail
- * the controller. We can do better by doing it here, in one place. We need to
- * be able to differentiate between (a) fatal errors (where we must call
- * fail_ctrlr and stop precessing requests) and (b) cases where we must post a
- * completion (either because there is an error specific to that request or
- * because that request does not need forwarding to NVMf). So we need to
- * unambiguously encode the following information in the return value:
- * (1) -errno (32 bits),
- * (2) success (1 bit -- don't post a completion and continue processing
- *     requests), and
- * (3) post a completion with specified status code and status code type
- *     (8+3 bits) type and continue processing requsts.
- */
-static int
-consume_reqs(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
-	     struct muser_qpair *qpair)
+static ssize_t
+handle_sq_tdbl_write(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
+		     struct muser_qpair *qpair)
 {
 	struct spdk_nvme_cmd *queue;
 
@@ -1337,25 +1230,13 @@ consume_reqs(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
 		 */
 		sqhd_advance(ctrlr, qpair);
 
-		err = consume_req(ctrlr, qpair, cmd);
+		err = consume_cmd(ctrlr, qpair, cmd);
 		if (err != 0) {
 			return err;
 		}
 	}
-	return 0;
-}
 
-/*
- * TODO consume_reqs is redundant, move its body in handle_sq_tdbl_write
- * XXX SPDK thread context
- */
-static ssize_t
-handle_sq_tdbl_write(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
-		     struct muser_qpair *qpair)
-{
-	assert(ctrlr != NULL);
-	assert(qpair != NULL);
-	return consume_reqs(ctrlr, new_tail, qpair);
+	return 0;
 }
 
 /*
@@ -2512,6 +2393,7 @@ get_muser_req(struct muser_qpair *qpair)
 
 	req = TAILQ_FIRST(&qpair->reqs);
 	TAILQ_REMOVE(&qpair->reqs, req, link);
+	memset(&req->cmd, 0, sizeof(req->cmd));
 	memset(&req->rsp, 0, sizeof(req->rsp));
 
 	return req;
@@ -2533,6 +2415,42 @@ nlb(struct spdk_nvme_cmd *cmd)
 	return 0x0000ffff & cmd->cdw12;
 }
 
+static int
+map_admin_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
+{
+	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
+	uint32_t len = 0;
+	int iovcnt;
+
+	req->xfer = cmd->opc & 0x3;
+	req->length = 0;
+	req->data = NULL;
+
+	switch (cmd->opc) {
+	case SPDK_NVME_OPC_IDENTIFY:
+		len = 4096;
+		break;
+	case SPDK_NVME_OPC_GET_LOG_PAGE:
+		len = (cmd->cdw10_bits.get_log_page.numdl + 1) * 4;
+		break;
+	}
+
+	if (!cmd->dptr.prp.prp1 || !len) {
+		return 0;
+	}
+
+	iovcnt = muser_map_prps(ctrlr, cmd, req->iov, len);
+	if (iovcnt < 0) {
+		SPDK_ERRLOG("Map Admin Opc %x failed\n", cmd->opc);
+		return -1;
+	}
+
+	req->length = len;
+	req->data = req->iov[0].iov_base;
+
+	return 0;
+}
+
 /*
  * Handles an I/O command.
  *
@@ -2540,8 +2458,7 @@ nlb(struct spdk_nvme_cmd *cmd)
  * the request must be forwarded to NVMf.
  */
 static int
-handle_cmd_io_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req,
-		  bool *submit)
+map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 {
 	int err = 0;
 	bool remap = true;
@@ -2549,7 +2466,6 @@ handle_cmd_io_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req,
 
 	assert(ctrlr != NULL);
 	assert(req != NULL);
-	assert(submit != NULL);
 
 	switch (req->cmd->nvme_cmd.opc) {
 	case SPDK_NVME_OPC_FLUSH:
@@ -2584,14 +2500,14 @@ handle_cmd_io_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req,
 		req->iovcnt = err;
 		err = 0;
 	}
+
 out:
 	if (err != 0) {
-		*submit = false;
 		return post_completion(ctrlr, &req->cmd->nvme_cmd,
 				       &ctrlr->qp[req->qpair->qid]->cq, 0, sc,
 				       SPDK_NVME_SCT_GENERIC);
 	}
-	*submit = true;
+
 	return 0;
 }
 
@@ -2602,7 +2518,6 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 {
 	int err;
 	struct muser_req *muser_req;
-	const struct spdk_nvmf_registers *regs = spdk_nvmf_ctrlr_get_regs(ctrlr->qp[0]->qpair.ctrlr);
 
 	assert(ctrlr != NULL);
 	assert(cmd != NULL);
@@ -2619,15 +2534,14 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 
 	req->cmd->nvme_cmd = *cmd;
 	if (nvmf_qpair_is_admin_queue(req->qpair)) {
-		req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
-		req->length = 1 << 12;
-		req->data = (void *)(req->cmd->nvme_cmd.dptr.prp.prp1 << regs->cc.bits.mps);
+		err = map_admin_cmd_req(ctrlr, req);
 	} else {
-		bool submit;
-		err = handle_cmd_io_req(ctrlr, req, &submit);
-		if (err != 0 || !submit) {
-			return err;
-		}
+		err = map_io_cmd_req(ctrlr, req);
+	}
+
+	if (err < 0) {
+		SPDK_ERRLOG("Map NVMe command opc 0x%x failed\n", cmd->opc);
+		goto out;
 	}
 
 	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
@@ -2637,6 +2551,11 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	spdk_nvmf_request_exec(req);
 
 	return 0;
+
+out:
+	return post_completion(ctrlr, cmd, &ctrlr->qp[req->qpair->qid]->cq, 0,
+			       SPDK_NVME_SC_INTERNAL_DEVICE_ERROR,
+			       SPDK_NVME_SCT_GENERIC);
 }
 
 static int
