@@ -80,6 +80,8 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define MUSER_DEFAULT_NUM_SHARED_BUFFERS 512 /* internal buf size */
 #define MUSER_DEFAULT_BUFFER_CACHE_SIZE 0
 #define MUSER_DOORBELLS_SIZE PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2)
+/* TODO: Move to nvmf_internal.h, SPDK NVMf uses fixed 4KiB */
+#define NVMF_MEMORY_PAGE_SIZE 4096
 
 #define NVME_REG_CFG_SIZE       0x1000
 #define NVME_REG_BAR0_SIZE      0x4000
@@ -650,19 +652,6 @@ acq_map(struct muser_ctrlr *ctrlr)
 	return 0;
 }
 
-static ssize_t
-host_mem_page_size(uint8_t mps)
-{
-	/*
-	 * only 4 lower bits can be set
-	 * TODO this function could go into core SPDK
-	 */
-	if (0xf0 & mps) {
-		return -EINVAL;
-	}
-	return 1 << (12 + mps);
-}
-
 static void *
 _map_one(void *prv, uint64_t addr, uint64_t len)
 {
@@ -673,10 +662,8 @@ static int
 muser_map_prps(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	       struct iovec *iov, uint32_t length)
 {
-	const struct spdk_nvmf_registers *regs = spdk_nvmf_ctrlr_get_regs(ctrlr->qp[0]->qpair.ctrlr);
-
 	return spdk_nvme_map_prps(ctrlr->lm_ctx, cmd, iov, length,
-				  host_mem_page_size(regs->cc.bits.mps), /* TODO don't compute this every time, store it in ctrlr */
+				  NVMF_MEMORY_PAGE_SIZE,
 				  _map_one);
 }
 
