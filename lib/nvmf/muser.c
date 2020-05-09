@@ -453,35 +453,6 @@ do_prop_req(struct muser_ctrlr *ctrlr, char *buf, size_t count, loff_t pos,
 	return ctrlr->prop_req.ret;
 }
 
-/*
- * TODO read_bar0 and write_bar0 are very similar, merge
- */
-static ssize_t
-read_bar0(void *pvt, char *buf, size_t count, loff_t pos)
-{
-	struct muser_ctrlr *ctrlr = pvt;
-	int err;
-
-	SPDK_NOTICELOG("ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
-		       ctrlr, count, pos);
-
-	if (pos >= DOORBELLS) {
-		return handle_dbl_access(ctrlr, (uint32_t *)buf, count,
-					 pos, false);
-	}
-
-	/*
-	 * This is a PCI read from the guest so we must synchronously wait for
-	 * NVMf to respond with the data.
-	 */
-	err = do_prop_req(ctrlr, buf, count, pos, false);
-	if (err != 0) {
-		return err;
-	}
-
-	return err;
-}
-
 static uint16_t
 max_queue_size(struct muser_ctrlr const *ctrlr)
 {
@@ -1452,44 +1423,31 @@ handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
 }
 
 static ssize_t
-write_bar0(void *pvt, char *buf, size_t count, loff_t pos)
+access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
+	       bool is_write)
 {
 	struct muser_ctrlr *ctrlr = pvt;
+	int ret;
 
-	SPDK_NOTICELOG("\nctrlr: %p, count=%zu, pos=%"PRIX64"\n",
-		       ctrlr, count, pos);
-	spdk_log_dump(stdout, "muser_write", buf, count);
+	SPDK_DEBUGLOG(SPDK_LOG_NVMF_MUSER, "Bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
+		      is_write ? "Write" : "Read", ctrlr, count, pos);
+
+	if (is_write) {
+		spdk_log_dump(stdout, "muser_write", buf, count);
+	}
 
 	if (pos >= DOORBELLS) {
 		return handle_dbl_access(ctrlr, (uint32_t *)buf, count,
-					 pos, true);
+					 pos, is_write);
 	}
 
-	return do_prop_req(ctrlr, buf, count, pos, true);
-}
-
-static ssize_t
-access_bar_fn(void *pvt, char *buf, size_t count, loff_t offset,
-	      const bool is_write)
-{
-	ssize_t ret;
-
-	/*
-	 * TODO it doesn't make sense to have separate functions for the BAR0,
-	 * since a lot of the code is common, e.g. figuring out which doorbell
-	 * is accessed. Merge.
-	 */
-	if (is_write) {
-		ret = write_bar0(pvt, buf, count, offset);
-	} else {
-		ret = read_bar0(pvt, buf, count, offset);
-	}
-
+	ret = do_prop_req(ctrlr, buf, count, pos, is_write);
 	if (ret != 0) {
-		SPDK_WARNLOG("failed to %s %lx@%lx BAR0: %zu\n",
-			     is_write ? "write" : "read", offset, count, ret);
+		SPDK_WARNLOG("failed to %s %lx@%lx BAR0\n",
+			     is_write ? "write" : "read", pos, count);
 		return -1;
 	}
+
 	return count;
 }
 
@@ -1747,7 +1705,7 @@ nvme_reg_info_fill(lm_reg_info_t *reg_info)
 
 	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW | LM_REG_FLAG_MMAP;
 	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
-	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar_fn;
+	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar0_fn;
 	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
 
 	reg_info[LM_DEV_BAR4_REG_IDX].flags = LM_REG_FLAG_RW;
