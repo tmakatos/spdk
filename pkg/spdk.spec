@@ -102,7 +102,6 @@ BuildArch: noarch
 	--without-rbd \
 	--with-rdma \
 	--with-shared \
-	--with-iscsi-initiator \
 	--without-vtune
 
 make -j`nproc` all
