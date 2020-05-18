@@ -1,13 +1,15 @@
 # Build documentation package
 %bcond_with doc
 
+%global commit b55b20430118c18def733be838f57c6304585c92
+
 Name: spdk
-Version: master
+Version: %{commit}
 Release: 0%{?dist}
 Epoch: 0
 URL: http://spdk.io
 
-Source: https://github.com/spdk/spdk/archive/master.tar.gz
+Source: https://github.com/spdk/spdk/archive/%{commit}.tar.gz
 Summary: Set of libraries and utilities for high performance user-mode storage
 
 %define package_version %{epoch}:%{version}-%{release}
