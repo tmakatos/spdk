@@ -37,6 +37,7 @@ BuildRequires: libibverbs-devel, librdmacm-devel
 %if %{with doc}
 BuildRequires: doxygen mscgen graphviz
 %endif
+BuildRequires: muser
 
 # Install dependencies
 Requires: dpdk >= 17.11, numactl-libs, openssl-libs
