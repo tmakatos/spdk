@@ -1,15 +1,22 @@
 # Build documentation package
 %bcond_with doc
 
-%global commit b55b20430118c18def733be838f57c6304585c92
+# no dashes
+%global git_branch vfio_over_socket
+
+# git rev-parse --short=12 HEAD
+%global git_commit 87f8e906ec6e
 
 Name: spdk
-Version: %{commit}
+Version: %{git_branch}
 Release: 0%{?dist}
 Epoch: 0
 URL: http://spdk.io
 
-Source: https://github.com/spdk/spdk/archive/%{commit}.tar.gz
+#Source: https://github.com/spdk/spdk/archive/%{commit}.tar.gz
+# FIXME this file ends up in SOURCES, it's probably the AHV build system
+# putting it there, figure out how to use it
+Source: spdk-%{git_branch}-git%{git_commit}.tar.gz
 Summary: Set of libraries and utilities for high performance user-mode storage
 
 %define package_version %{epoch}:%{version}-%{release}
@@ -23,7 +30,7 @@ License: BSD
 # Only x86_64 is supported
 ExclusiveArch: x86_64
 
-BuildRequires: gcc gcc-c++ make
+BuildRequires: gcc gcc-c++ make python3
 BuildRequires: dpdk-devel, numactl-devel
 BuildRequires: libiscsi-devel, libaio-devel, openssl-devel, libuuid-devel
 BuildRequires: libibverbs-devel, librdmacm-devel
@@ -90,6 +97,7 @@ BuildArch: noarch
 
 %build
 ./configure --prefix=%{_usr} \
+	--without-dpdk \
 	--enable-debug \
 	--disable-tests \
 	--without-igb-uio-driver \
@@ -100,7 +108,7 @@ BuildArch: noarch
 	--without-reduce \
 	--without-vpp \
 	--without-rbd \
-	--without-rdma \
+	--with-rdma \
 	--without-fc \
 	--with-shared \
 	--without-iscsi-initiator \
@@ -148,6 +156,8 @@ mv doc/output/html/ %{install_docdir}
 %files
 %{_bindir}/spdk_*
 %{_libdir}/*.so.*
+# FIXME must depend on --with-rdma
+%{_bindir}/nvmf_tgt
 
 
 %files devel
