@@ -40,8 +40,16 @@ BuildRequires: doxygen mscgen graphviz
 BuildRequires: muser
 
 # Install dependencies
-Requires: dpdk >= 17.11, numactl-libs, openssl-libs
-Requires: libiscsi, libaio, libuuid
+
+# FIXME not required if using internal DPDK 
+Requires: dpdk >= 17.11
+
+Requires: numactl-libs, openssl-libs
+
+# FIXME not required if not built with libiscsi
+#Requires: libiscsi
+
+Requires: libaio, libuuid
 # NVMe over Fabrics
 Requires: librdmacm, librdmacm
 Requires(post): /sbin/ldconfig
@@ -93,17 +101,26 @@ BuildArch: noarch
 
 %build
 ./configure --prefix=%{_usr} \
+	--enable-debug \
 	--disable-tests \
+	--without-igb-uio-driver \
 	--without-crypto \
-	--with-dpdk=/usr/share/dpdk/x86_64-default-linuxapp-gcc \
 	--without-fio \
-	--with-vhost \
-	--without-pmdk \
+	--without-vhost \
+	--without-virtio \
+	--without-reduce \
 	--without-vpp \
 	--without-rbd \
-	--with-rdma \
+	--without-rdma \
+	--without-fc \
 	--with-shared \
-	--without-vtune
+	--without-iscsi-initiator \
+	--without-vtune \
+	--without-ocf \
+	--without-isal \
+	--without-uring \
+	--without-fuse \
+	--without-nvme-cuse
 
 make -j`nproc` all
 
