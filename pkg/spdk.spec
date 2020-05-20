@@ -35,7 +35,7 @@ BuildRequires: muser
 # Install dependencies
 
 # FIXME not required if using internal DPDK 
-Requires: dpdk >= 17.11
+#Requires: dpdk >= 17.11
 
 Requires: numactl-libs, openssl-libs
 
