@@ -249,7 +249,7 @@ struct muser_poll_group {
 
 struct muser_ctrlr {
 	struct spdk_nvme_transport_id		trid;
-	char					uuid[37]; /* TODO 37 is already defined somewhere */
+	char					uuid[SPDK_NVME_NQN_FIELD_SIZE];
 	pthread_t				lm_thr;
 	lm_ctx_t				*lm_ctx;
 	lm_pci_config_space_t			*pci_config_space;
