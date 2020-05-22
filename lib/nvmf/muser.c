@@ -2530,7 +2530,7 @@ muser_init_dev_mem(struct muser_ctrlr *ctrlr)
 	 * TODO create directory /dev/shm/muser and create device mem files in
 	 * there
 	 */
-	ret = asprintf(&path, "/dev/shm/%s.muser", ctrlr->uuid);
+	ret = asprintf(&path, "%s/bar0", ctrlr->uuid);
 	if (ret == -1) {
 		return ret;
 	}
