@@ -1,11 +1,12 @@
 # Build documentation package
 %bcond_with doc
+%bcond_with rdma
 
 # no dashes
 %global git_branch vfio_over_socket
 
 # git rev-parse --short=12 HEAD
-%global git_commit 87f8e906ec6e
+%global git_commit 5cafeb951020
 
 Name: spdk
 Version: %{git_branch}
@@ -37,6 +38,7 @@ BuildRequires: libibverbs-devel, librdmacm-devel
 %if %{with doc}
 BuildRequires: doxygen mscgen graphviz
 %endif
+
 BuildRequires: muser
 
 # Install dependencies
@@ -148,16 +150,28 @@ mkdir -p %{install_docdir}
 mv doc/output/html/ %{install_docdir}
 %endif
 
+cp -r pkg/systemd/* %{buildroot}/
 
-%post -p /sbin/ldconfig
-%postun -p /sbin/ldconfig
+
+%post
+/sbin/ldconfig
+%systemd_post nvmf_tgt.service
+
+%preun
+%systemd_preun nvmf_tgt.service
+
+%postun
+/sbin/ldconfig
+%systemd_postun_with_restart nvmf_tgt.service
 
 
 %files
 %{_bindir}/spdk_*
 %{_libdir}/*.so.*
-# FIXME must depend on --with-rdma
+
 %{_bindir}/nvmf_tgt
+/etc/systemd/system/nvmf_tgt.service
+/usr/local/bin/nvmf_tgt.sh
 
 
 %files devel

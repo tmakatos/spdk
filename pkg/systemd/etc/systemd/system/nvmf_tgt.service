@@ -1,0 +1,12 @@
+[Unit]
+Description=SPDK NVMf target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=root
+ExecStart=/usr/bin/env /usr/local/bin/nvmf_tgt.sh
+
+[Install]
+WantedBy=multi-user.target
