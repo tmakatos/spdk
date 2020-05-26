@@ -2592,15 +2592,19 @@ muser_ctrlr_poll(struct muser_ctrlr *ctrlr)
 	/* Generate a fake fabrics property set command */
 	req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
 	req->cmd->prop_set_cmd.cid = 0;
+	req->cmd->prop_set_cmd.attrib.size = (ctrlr->prop_req.count / 4) - 1;
+	req->cmd->prop_set_cmd.ofst = ctrlr->prop_req.pos;
 	if (ctrlr->prop_req.dir == MUSER_NVMF_WRITE) {
 		req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
-		req->cmd->prop_set_cmd.value.u32.high = 0;
-		req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)ctrlr->prop_req.buf;
+		if (req->cmd->prop_set_cmd.attrib.size) {
+			req->cmd->prop_set_cmd.value.u64 = *(uint64_t *)ctrlr->prop_req.buf;
+		} else {
+			req->cmd->prop_set_cmd.value.u32.high = 0;
+			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)ctrlr->prop_req.buf;
+		}
 	} else {
 		req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
 	}
-	req->cmd->prop_set_cmd.attrib.size = (ctrlr->prop_req.count / 4) - 1;
-	req->cmd->prop_set_cmd.ofst = ctrlr->prop_req.pos;
 	req->length = 0;
 	req->data = NULL;
 
