@@ -5,9 +5,6 @@
 # no dashes
 %global git_branch vfio_over_socket
 
-# git rev-parse --short=12 HEAD
-%global git_commit 5cafeb951020
-
 Name: spdk
 Version: %{git_branch}
 Release: 0%{?dist}
@@ -17,7 +14,7 @@ URL: http://spdk.io
 #Source: https://github.com/spdk/spdk/archive/%{commit}.tar.gz
 # FIXME this file ends up in SOURCES, it's probably the AHV build system
 # putting it there, figure out how to use it
-Source: spdk-%{git_branch}-git%{git_commit}.tar.gz
+Source: spdk-%{git_branch}-git%{githash}.tar.gz
 Summary: Set of libraries and utilities for high performance user-mode storage
 
 %define package_version %{epoch}:%{version}-%{release}
