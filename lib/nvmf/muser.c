@@ -1546,21 +1546,8 @@ pmcap_access(void *pvt, const uint8_t id, char *const buf, const size_t count,
 static ssize_t
 handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc *const mxc)
 {
-	uint16_t n;
-
 	assert(ctrlr != NULL);
 	assert(mxc != NULL);
-
-	/* host driver writes RO field, don't know why */
-	if (ctrlr->msixcap.mxc.ts == *(uint16_t *)mxc) {
-		goto out;
-	}
-
-	n = ~(PCI_MSIX_FLAGS_MASKALL | PCI_MSIX_FLAGS_ENABLE) & *((uint16_t *)mxc);
-	if (n != 0) {
-		SPDK_ERRLOG("bad write 0x%x to MXC\n", n);
-		return -EINVAL;
-	}
 
 	if (mxc->mxe != ctrlr->msixcap.mxc.mxe) {
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s MSI-X\n",
@@ -1578,7 +1565,7 @@ handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc *const mxc)
 		}
 		ctrlr->msixcap.mxc.fm = mxc->fm;
 	}
-out:
+
 	return sizeof(struct mxc);
 }
 
