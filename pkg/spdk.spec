@@ -46,7 +46,7 @@ BuildRequires: muser
 Requires: numactl-libs, openssl-libs
 
 # FIXME not required if not built with libiscsi
-#Requires: libiscsi
+Requires: libiscsi
 
 Requires: libaio, libuuid
 # NVMe over Fabrics
@@ -110,7 +110,7 @@ BuildArch: noarch
 	--with-rdma \
 	--without-fc \
 	--with-shared \
-	--without-iscsi-initiator \
+	--with-iscsi-initiator \
 	--without-vtune \
 	--without-ocf \
 	--without-isal \
