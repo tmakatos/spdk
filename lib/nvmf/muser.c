@@ -306,6 +306,7 @@ struct muser_ctrlr {
 
 	/* for LM_TRAS_SOCK */
 	int					fd;
+	bool					initialized;
 };
 
 static void
@@ -2400,7 +2401,6 @@ destroy_pci_dev(struct muser_ctrlr *ctrlr) {
 static int
 init_pci_dev(struct muser_ctrlr *ctrlr)
 {
-	int err = 0;
 	lm_dev_info_t dev_info = { 0 };
 
 	dev_info.trans = ctrlr->lm_trans;
@@ -2443,6 +2443,8 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 	ctrlr->pxcap.pxdcap2.ctds = 0x1;
 	/* FIXME check PXCAPS.DPT */
 
+	dev_info.flags |= LM_FLAG_ATTACH_NB;
+
 	ctrlr->lm_ctx = lm_ctx_create(&dev_info);
 	if (ctrlr->lm_ctx == NULL) {
 		/* TODO: lm_create doesn't set errno */
@@ -2452,13 +2454,6 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 
 	ctrlr->pci_config_space = lm_get_pci_config_space(ctrlr->lm_ctx);
 	init_pci_config_space(ctrlr->pci_config_space);
-
-	err = pthread_create(&ctrlr->lm_thr, NULL, drive, ctrlr->lm_ctx);
-	if (err != 0) {
-		SPDK_ERRLOG("Error creating lm_drive thread: %s\n",
-		            strerror(err));
-		return -err;
-	}
 
 	return 0;
 }
@@ -2722,7 +2717,8 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn,
 {
 	int err;
 	struct muser_transport *muser_transport;
-	struct muser_qpair *qp, *tmp;
+	struct muser_qpair *qp, *tmp_qp;
+	struct muser_ctrlr *ctrlr;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -2733,7 +2729,30 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn,
 		return;
 	}
 
-	TAILQ_FOREACH_SAFE(qp, &muser_transport->new_qps, link, tmp) {
+	/* FIXME this should be done properly using the list_done callback etc */
+	TAILQ_FOREACH(ctrlr, &muser_transport->ctrlrs, link) {
+		if (!ctrlr->initialized) {
+			err = lm_ctx_try_attach(ctrlr->lm_ctx);
+			if (err == -1) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					continue;
+				}
+				SPDK_ERRLOG("failed to attach: %m\n");
+				assert(false); /* FIXME */
+				return;
+			}
+			err = pthread_create(&ctrlr->lm_thr, NULL, drive, ctrlr->lm_ctx);
+			if (err != 0) {
+				SPDK_ERRLOG("Error creating lm_drive thread: %s\n",
+			            strerror(err));
+				assert(false); /* FIXME */
+				return;
+			}
+			ctrlr->initialized = true;
+		}
+	}
+
+	TAILQ_FOREACH_SAFE(qp, &muser_transport->new_qps, link, tmp_qp) {
 		TAILQ_REMOVE(&muser_transport->new_qps, qp, link);
 		cb_fn(&qp->qpair, NULL);
 	}
