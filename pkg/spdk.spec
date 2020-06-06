@@ -23,6 +23,9 @@ Summary: Set of libraries and utilities for high performance user-mode storage
 %define install_sbindir %{buildroot}/%{_sbindir}
 %define install_docdir %{buildroot}/%{_docdir}/%{name}
 
+%define libiscsi_tmp_inst /tmp/libiscsi-1.19.0
+%define libiscsi_inst %{buildroot}/opt/libiscsi-1.19.0/lib
+
 License: BSD
 
 # Only x86_64 is supported
@@ -30,13 +33,15 @@ ExclusiveArch: x86_64
 
 BuildRequires: gcc gcc-c++ make python3
 BuildRequires: dpdk-devel, numactl-devel
-BuildRequires: libiscsi-devel, libaio-devel, openssl-devel, libuuid-devel
+#BuildRequires: libiscsi-devel
+BuildRequires: libaio-devel, openssl-devel, libuuid-devel
 BuildRequires: libibverbs-devel, librdmacm-devel
 %if %{with doc}
 BuildRequires: doxygen mscgen graphviz
 %endif
 
 BuildRequires: muser
+BuildRequires: autoconf automake libtool
 
 # Install dependencies
 
@@ -46,7 +51,7 @@ BuildRequires: muser
 Requires: numactl-libs, openssl-libs
 
 # FIXME not required if not built with libiscsi
-Requires: libiscsi
+#Requires: libiscsi
 
 Requires: libaio, libuuid
 # NVMe over Fabrics
@@ -95,6 +100,11 @@ BuildArch: noarch
 
 
 %build
+(cd libiscsi && ./autogen.sh && ./configure --prefix=%{libiscsi_tmp_inst} && make && make install)
+export LDFLAGS="-L%{libiscsi_tmp_inst}/lib"
+export CFLAGS="-I%{libiscsi_tmp_inst}/include/"
+export CPPFLAGS="-I%{libiscsi_tmp_inst}/include/"
+export CXXFLAGS="-I%{libiscsi_tmp_inst}/include/"
 ./configure --prefix=%{_usr} \
 	--without-dpdk \
 	--enable-debug \
@@ -150,6 +160,10 @@ mv doc/output/html/ %{install_docdir}
 cp -r pkg/systemd/* %{buildroot}/
 
 
+mkdir -p %{libiscsi_inst}
+cp %{libiscsi_tmp_inst}/lib/libiscsi.so* %{libiscsi_inst}/
+
+
 %post
 /sbin/ldconfig
 %systemd_post nvmf_tgt.service
@@ -165,6 +179,7 @@ cp -r pkg/systemd/* %{buildroot}/
 %files
 %{_bindir}/spdk_*
 %{_libdir}/*.so.*
+/opt/libiscsi-1.19.0/lib/*.so*
 
 %{_bindir}/nvmf_tgt
 /etc/systemd/system/nvmf_tgt.service

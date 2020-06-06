@@ -9,7 +9,7 @@ chmod 777 /dev/shm/muser
 mkdir -p -m 777 /var/run/muser/{iommu_group,domain}
 chmod 777 /var/run/muser
 rm -f /var/tmp/spdk.sock
-nvmf_tgt -L nvme -L nvmf -L nvmf_muser &
+LD_LIBRARY_PATH=/opt/libiscsi-1.19.0/lib nvmf_tgt -L nvme -L nvmf -L nvmf_muser &
 while [ ! -S /var/tmp/spdk.sock ]; do
 	sleep 1
 done
