@@ -40,6 +40,7 @@
 
 #include "iscsi/iscsi.h"
 #include "iscsi/init_grp.h"
+#include "iscsi/spdk_iscsi.h"
 
 static struct spdk_iscsi_init_grp *
 iscsi_init_grp_create(int tag)
