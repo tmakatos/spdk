@@ -34,6 +34,7 @@
 #include "spdk/stdinc.h"
 
 #include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 
 #include "spdk_internal/event.h"
 

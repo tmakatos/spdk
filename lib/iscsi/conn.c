@@ -47,6 +47,7 @@
 
 #include "spdk_internal/log.h"
 
+#include "iscsi/spdk_iscsi.h"
 #include "iscsi/task.h"
 #include "iscsi/conn.h"
 #include "iscsi/tgt_node.h"
