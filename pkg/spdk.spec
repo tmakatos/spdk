@@ -77,7 +77,7 @@ developing applications with the Storage Performance Development Kit.
 
 %package tools
 Summary: Storage Performance Development Kit tools files
-Requires: %{name}%{?_isa} = %{package_version} python3 python3-configshell python3-pexpect
+Requires: %{name}%{?_isa} = %{package_version} python3
 BuildArch: noarch
 
 %description tools
