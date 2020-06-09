@@ -1078,6 +1078,11 @@ handle_identify_ctrlr_rsp(struct muser_ctrlr *ctrlr,
 	 * properly handle.
 	 */
 	data->oncs.dsm = 0;
+
+	/*
+	 * FIXME disable write zeroes for now.
+	 */
+	data->oncs.write_zeroes = 0;
 }
 
 static void
