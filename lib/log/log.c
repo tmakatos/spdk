@@ -31,6 +31,8 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <sys/time.h>
+
 #include "spdk/stdinc.h"
 
 #include "spdk_internal/log.h"
@@ -171,6 +173,8 @@ spdk_vlog(enum spdk_log_level level, const char *file, const int line, const cha
 	}
 
 	vsnprintf(buf, sizeof(buf), format, ap);
+
+	gettimeofday(&tv, NULL);
 
 	if (level <= g_spdk_log_print_level) {
 		get_timestamp_prefix(timestamp, sizeof(timestamp));

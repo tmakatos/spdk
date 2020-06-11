@@ -3083,6 +3083,10 @@ int spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
  */
 struct spdk_nvme_transport_poll_group;
 
+int spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
+                   uint32_t len, size_t mps,
+                   void* (*gpa_to_vva)(void* prv, uint64_t addr, uint64_t len));
+
 struct nvme_request;
 
 struct spdk_nvme_transport;

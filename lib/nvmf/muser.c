@@ -71,6 +71,13 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define PAGE_MASK (~(PAGE_SIZE-1))
 #define PAGE_ALIGN(x) ((x + PAGE_SIZE - 1) & PAGE_MASK)
 
+/*
+ * Define TRAP_DOORBELLS to disable memory mapping the doorbells and trap instead.
+ * This will incur significant performance penalty and is intended for debug
+ * purposes.
+ */
+//#define TRAP_DOORBELLS
+
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define MUSER_DEFAULT_AQ_DEPTH 32
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
@@ -239,7 +246,7 @@ struct muser_poll_group {
 struct muser_ctrlr {
 	struct spdk_nvme_transport_id		trid;
 	struct muser_transport			*transport;
-	char					uuid[37]; /* TODO 37 is already defined somewhere */
+	char					uuid[SPDK_NVME_NQN_FIELD_SIZE];
 	pthread_t				lm_thr;
 	lm_ctx_t				*lm_ctx;
 	lm_pci_config_space_t			*pci_config_space;
@@ -273,6 +280,12 @@ struct muser_ctrlr {
 
 	/* internal CSTS.CFS register for MUSER fatal errors */
 	uint32_t				cfs : 1;
+
+	lm_trans_t				lm_trans;
+
+	/* for LM_TRAS_SOCK */
+	int					fd;
+	bool					initialized;
 };
 
 static void
@@ -696,6 +709,11 @@ handle_identify_ctrlr_rsp(struct spdk_nvme_ctrlr_data *data)
 	 * properly handle.
 	 */
 	data->oncs.dsm = 0;
+
+	/*
+	 * FIXME disable write zeroes for now.
+	 */
+	data->oncs.write_zeroes = 0;
 }
 
 /*
@@ -731,6 +749,14 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	assert(cmd != NULL);
 
 	qid = io_q_id(cq);
+
+	/* FIXME */
+	if (ctrlr->qp[0]->qpair.ctrlr->vcprop.csts.bits.shst != SPDK_NVME_SHST_NORMAL) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+		              "ignore completion SQ%d cid=%d status=%#x\n",
+		              qid, cmd->cid, sc);
+		return 0;
+	}
 
 	if (cq_is_full(ctrlr, cq)) {
 		SPDK_ERRLOG("CQ%d full (tail=%d, head=%d)\n",
@@ -1346,58 +1372,114 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 }
 
 static ssize_t
-pmcap_access(void *pvt, const uint8_t id, char *const buf, const size_t count,
-	     const loff_t offset, const bool is_write)
+handle_pc_write(struct muser_ctrlr *ctrlr, const struct pc * const pc) {
+	/* FIXME IIUC these are RO fields, figure out how to handle */
+	assert(false);
+}
+
+static ssize_t
+handle_pmcs_write(struct muser_ctrlr *ctrlr, const struct pmcs * const pmcs) {
+
+	if (ctrlr->pmcap.pmcs.ps != pmcs->ps) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "power state set to %#x\n", pmcs->ps);
+	}
+	if (ctrlr->pmcap.pmcs.pmee != pmcs->pmee) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "PME enable set to %#x\n", pmcs->pmee);
+	}
+	if (ctrlr->pmcap.pmcs.dse != pmcs->dse) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "data select set to %#x\n", pmcs->dse);
+	}
+	if (ctrlr->pmcap.pmcs.pmes != pmcs->pmes) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "PME status set to %#x\n", pmcs->pmes);
+	}
+	ctrlr->pmcap.pmcs = *pmcs;
+	return 0;
+}
+
+static ssize_t
+handle_pmcap_write(struct muser_ctrlr *ctrlr, char * const buf,
+                   const size_t count, const loff_t offset)
+{
+	switch (offset) {
+		case offsetof(struct pmcap, pc):
+			if (count != sizeof(struct pc)) {
+				return -EINVAL;
+			}
+			return handle_pc_write(ctrlr, (struct pc*)buf);
+		case offsetof(struct pmcap, pmcs):
+			if (count != sizeof(struct pmcs)) {
+				return -EINVAL;
+			}
+			return handle_pmcs_write(ctrlr, (struct pmcs*)buf);
+	}
+	return -EINVAL;
+}
+
+static ssize_t
+pmcap_access(void *pvt, const uint8_t id, char * const buf, const size_t count,
+             const loff_t offset, const bool is_write)
 {
 	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
 
-	if (is_write) {
-		assert(false);        /* TODO */
-	}
+	if (is_write)
+		return handle_pmcap_write(ctrlr, buf, count, offset);
 
-	memcpy(buf, ((char *)&ctrlr->pmcap) + offset, count);
+	memcpy(buf, ((char*)&ctrlr->pmcap) + offset, count);
 
 	return count;
 }
 
 static ssize_t
-handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc *const mxc)
+handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc * const mxc)
 {
+	uint16_t n;
+
 	assert(ctrlr != NULL);
 	assert(mxc != NULL);
 
+	/* host driver writes RO field, don't know why */
+	if (ctrlr->msixcap.mxc.ts == *(uint16_t*)mxc) {
+		goto out;
+	}
+
+	n = ~(PCI_MSIX_FLAGS_MASKALL | PCI_MSIX_FLAGS_ENABLE) & *((uint16_t*)mxc);
+	if (n != 0) {
+		SPDK_ERRLOG("bad write 0x%x to MXC\n", n);
+		return -EINVAL;
+	}
+
 	if (mxc->mxe != ctrlr->msixcap.mxc.mxe) {
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s MSI-X\n",
-			      mxc->mxe ? "enable" : "disable");
+		              mxc->mxe ? "enable" : "disable");
 		ctrlr->msixcap.mxc.mxe = mxc->mxe;
 	}
 
 	if (mxc->fm != ctrlr->msixcap.mxc.fm) {
 		if (mxc->fm) {
 			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-				      "all MSI-X vectors masked\n");
+			              "all MSI-X vectors masked\n");
 		} else {
 			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-				      "vector's mask bit determines whether vector is masked");
+			              "vector's mask bit determines whether vector is masked");
 		}
 		ctrlr->msixcap.mxc.fm = mxc->fm;
 	}
-
-	return sizeof(struct mxc);
+out:
+	return sizeof (struct mxc);
 }
 
 static ssize_t
-handle_msix_write(struct muser_ctrlr *ctrlr, char *const buf, const size_t count,
-		  const loff_t offset)
+handle_msix_write(struct muser_ctrlr *ctrlr, char * const buf, const size_t count,
+                  const loff_t offset)
 {
-	if (count == sizeof(struct mxc)) {
+	if (count == sizeof (struct mxc)) {
 		switch (offset) {
-		case offsetof(struct msixcap, mxc):
-			return handle_mxc_write(ctrlr, (struct mxc *)buf);
-		default:
-			SPDK_ERRLOG("invalid MSI-X write offset %ld\n",
-				    offset);
-			return -EINVAL;
+			case offsetof(struct msixcap, mxc):
+				return handle_mxc_write(ctrlr, (struct mxc*)buf);
+			default:
+				SPDK_ERRLOG("invalid MSI-X write offset %ld\n",
+				            offset);
+				return -EINVAL;
 		}
 	}
 	SPDK_ERRLOG("invalid MSI-X write size %lu\n", count);
@@ -1537,17 +1619,20 @@ pxcap_access(void *pvt, const uint8_t id, char *const buf, size_t count,
 	return count;
 }
 
+#ifndef TRAP_DOORBELLS
 static unsigned long
 bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 {
 	struct muser_ctrlr *ctrlr;
 
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "map doorbells %#lx@%#lx\n", len, off);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "map doorbells %#lx-%#lx\n", off, off + len);
 
 	ctrlr = pvt;
 
+	assert(ctrlr != NULL);
+
 	if (off != DOORBELLS || len != MUSER_DOORBELLS_SIZE) {
-		SPDK_ERRLOG("bad map region %#lx@%#lx\n", len, off);
+		SPDK_ERRLOG("bad map region %#lx-%#lx\n", off, off + len);
 		errno = EINVAL;
 		return (unsigned long)MAP_FAILED;
 	}
@@ -1557,12 +1642,16 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 	}
 
 	ctrlr->doorbells = lm_mmap(ctrlr->lm_ctx, off, len);
-	if (ctrlr->doorbells == NULL) {
+	if (ctrlr->doorbells == MAP_FAILED) {
 		SPDK_ERRLOG("failed to allocate device memory: %m\n");
 	}
 out:
+	if (ctrlr->lm_trans == LM_TRANS_SOCK) { /* FIXME */
+		return (unsigned long)ctrlr->fd;
+	}
 	return (unsigned long)ctrlr->doorbells;
 }
+#endif
 
 static void
 nvme_reg_info_fill(lm_reg_info_t *reg_info)
@@ -1571,10 +1660,13 @@ nvme_reg_info_fill(lm_reg_info_t *reg_info)
 
 	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
 
-	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW | LM_REG_FLAG_MMAP;
+	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
+#ifndef TRAP_DOORBELLS
+	reg_info[LM_DEV_BAR0_REG_IDX].flags |= LM_REG_FLAG_MMAP;
+	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
+#endif
 	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
 	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar0_fn;
-	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
 
 	reg_info[LM_DEV_BAR4_REG_IDX].flags = LM_REG_FLAG_RW;
 	reg_info[LM_DEV_BAR4_REG_IDX].size  = PAGE_SIZE;
@@ -1701,6 +1793,18 @@ init_pci_config_space(lm_pci_config_space_t *p)
 	p->hdr.intr.ipin = 0x1;
 }
 
+muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
+{
+	int ret;
+
+	assert(ctrlr != NULL);
+	assert(subnqn != NULL);
+
+	ret = snprintf(subnqn, SPDK_NVME_NQN_FIELD_SIZE,
+	               "nqn.2019-07.io.spdk.muser:%s", ctrlr->uuid);
+	return (size_t)ret >= SPDK_NVME_NQN_FIELD_SIZE ? -1 : 0;
+}
+
 static int
 destroy_pci_dev(struct muser_ctrlr *ctrlr)
 {
@@ -1712,19 +1816,20 @@ destroy_pci_dev(struct muser_ctrlr *ctrlr)
 		return 0;
 	}
 	err = pthread_cancel(ctrlr->lm_thr);
-	if (err != 0) {
+	if (err == 0) {
+		err = pthread_join(ctrlr->lm_thr, &res);
+		if (err != 0) {
+			SPDK_ERRLOG("failed to join thread: %s\n",
+		       	            strerror(err));
+			return -err;
+		}
+		if (res != PTHREAD_CANCELED) {
+			SPDK_ERRLOG("thread exited: %s\n", strerror(-(intptr_t)res));
+			/* thread died, not much we can do here */
+		}
+	} else if (err != ESRCH) {
 		SPDK_ERRLOG("failed to cancel thread: %s\n",  strerror(err));
 		return -err;
-	}
-	err = pthread_join(ctrlr->lm_thr, &res);
-	if (err != 0) {
-		SPDK_ERRLOG("failed to join thread: %s\n",
-			    strerror(err));
-		return -err;
-	}
-	if (res != PTHREAD_CANCELED) {
-		SPDK_ERRLOG("thread exited: %s\n", strerror(-(intptr_t)res));
-		/* thread died, not much we can do here */
 	}
 	lm_ctx_destroy(ctrlr->lm_ctx);
 	ctrlr->lm_ctx = NULL;
@@ -1734,18 +1839,24 @@ destroy_pci_dev(struct muser_ctrlr *ctrlr)
 static int
 init_pci_dev(struct muser_ctrlr *ctrlr)
 {
-	int err = 0;
 	lm_dev_info_t dev_info = { 0 };
+
+	dev_info.trans = ctrlr->lm_trans;
 
 	/* LM setup */
 	nvme_dev_info_fill(&dev_info, ctrlr);
 
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(
-				struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
+#ifdef TRAP_DOORBELLS
+	ctrlr->doorbells = calloc(1, MUSER_DOORBELLS_SIZE);
+	if (ctrlr->doorbells == NULL) {
+		return -ENOMEM;
+	}
+#else
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
 	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
 	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(
-				MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
+	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
+#endif
 
 	/* PM */
 	ctrlr->pmcap.pmcs.nsfrst = 0x1;
@@ -1770,6 +1881,8 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 	ctrlr->pxcap.pxdcap2.ctds = 0x1;
 	/* FIXME check PXCAPS.DPT */
 
+	dev_info.flags |= LM_FLAG_ATTACH_NB;
+
 	ctrlr->lm_ctx = lm_ctx_create(&dev_info);
 	if (ctrlr->lm_ctx == NULL) {
 		/* TODO: lm_create doesn't set errno */
@@ -1779,13 +1892,6 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 
 	ctrlr->pci_config_space = lm_get_pci_config_space(ctrlr->lm_ctx);
 	init_pci_config_space(ctrlr->pci_config_space);
-
-	err = pthread_create(&ctrlr->lm_thr, NULL, drive, ctrlr->lm_ctx);
-	if (err != 0) {
-		SPDK_ERRLOG("Error creating lm_drive thread: %s\n",
-			    strerror(err));
-		return -err;
-	}
 
 	return 0;
 }
@@ -1802,12 +1908,72 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 	err = destroy_pci_dev(ctrlr);
 	if (err != 0) {
 		SPDK_ERRLOG("failed to tear down PCI device: %s\n",
-			    strerror(-err));
+		            strerror(-err));
 		return err;
 	}
-	mdev_remove(ctrlr->uuid);
+	if (ctrlr->doorbells != NULL) { /* TODO does it work if it's NULL? */
+#ifdef TRAP_DOORBELLS
+		free(ctrlr->doorbells);
+#else
+		if (munmap(ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
+			/* TODO shall return the error */
+			SPDK_ERRLOG("failed to unmap doorbells: %m\n");
+		}
+#endif
+	}
+	if (ctrlr->lm_trans == LM_TRANS_KERNEL) {
+		mdev_remove(ctrlr->uuid);
+	}
 	free(ctrlr);
 	return 0;
+}
+
+muser_init_dev_mem(struct muser_ctrlr *ctrlr)
+{
+	char *path = NULL;
+	int fd = -1;
+	int ret = 0;
+
+	/* 
+	 * TODO create directory /dev/shm/muser and create device mem files in
+	 * there
+	 */
+	ret = asprintf(&path, "%s/bar0", ctrlr->uuid);
+	if (ret == -1) {
+		return ret;
+	}
+	fd = open(path, O_RDWR | O_CREAT);
+	if (fd == -1) {
+		SPDK_ERRLOG("failed to open device memory at %s: %m\n", path);
+		ret = fd;
+		goto out;
+	}
+
+	ret = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
+	if (ret != 0) {
+		goto out;
+	}
+	ctrlr->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
+                                PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
+	if (ctrlr->doorbells == MAP_FAILED) {
+		ctrlr->doorbells = NULL;
+		ret = -errno;
+		goto out;
+	}
+out:
+	if (ret != 0) {
+		if (ctrlr->doorbells != NULL) {
+			munmap(ctrlr->doorbells, MUSER_DOORBELLS_SIZE);
+		}
+		if (fd != -1) {
+			close(fd);
+		}
+		unlink(path); /* FIXME check return value */
+	} else {
+		ctrlr->fd = fd;
+	}
+	free(path);
+	return ret;
 }
 
 static int
@@ -1836,15 +2002,37 @@ muser_listen(struct spdk_nvmf_transport *transport,
 			&muser_ctrlr->prop_req.muser_req.rsp;
 	muser_ctrlr->prop_req.muser_req.req.cmd = (union nvmf_h2c_msg *)
 			&muser_ctrlr->prop_req.muser_req.cmd;
+	muser_ctrlr->fd = -1;
 
 	err = sem_init(&muser_ctrlr->sem, 0, 0);
 	if (err != 0) {
 		goto out;
 	}
 
-	err = mdev_create(muser_ctrlr->uuid);
+	err = muser_snprintf_subnqn(muser_ctrlr, subnqn);
 	if (err != 0) {
 		goto out;
+	}
+	muser_ctrlr->subsys = spdk_nvmf_tgt_find_subsystem(transport->tgt,
+	                                                   subnqn);
+	if (muser_ctrlr->subsys == NULL) {
+		err = -1;
+		goto out;
+	}
+
+	/* TODO this should be a command-line option or env. var. */
+	muser_ctrlr->lm_trans = LM_TRANS_SOCK;
+
+	if (muser_ctrlr->lm_trans == LM_TRANS_KERNEL) {
+		err = mdev_create(muser_ctrlr->uuid);
+		if (err != 0) {
+			goto out;
+		}
+	} else if (muser_ctrlr->lm_trans == LM_TRANS_SOCK) {
+		err = muser_init_dev_mem(muser_ctrlr);
+		if (err != 0) {
+			goto out;
+		}
 	}
 
 	err = init_pci_dev(muser_ctrlr);
@@ -2058,7 +2246,8 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn,
 {
 	int err;
 	struct muser_transport *muser_transport;
-	struct muser_qpair *qp, *tmp;
+	struct muser_qpair *qp, *tmp_qp;
+	struct muser_ctrlr *ctrlr;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -2069,7 +2258,30 @@ muser_accept(struct spdk_nvmf_transport *transport, new_qpair_fn cb_fn,
 		return;
 	}
 
-	TAILQ_FOREACH_SAFE(qp, &muser_transport->new_qps, link, tmp) {
+	/* FIXME this should be done properly using the list_done callback etc */
+	TAILQ_FOREACH(ctrlr, &muser_transport->ctrlrs, link) {
+		if (!ctrlr->initialized) {
+			err = lm_ctx_try_attach(ctrlr->lm_ctx);
+			if (err == -1) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					continue;
+				}
+				SPDK_ERRLOG("failed to attach: %m\n");
+				assert(false); /* FIXME */
+				return;
+			}
+			err = pthread_create(&ctrlr->lm_thr, NULL, drive, ctrlr->lm_ctx);
+			if (err != 0) {
+				SPDK_ERRLOG("Error creating lm_drive thread: %s\n",
+			            strerror(err));
+				assert(false); /* FIXME */
+				return;
+			}
+			ctrlr->initialized = true;
+		}
+	}
+
+	TAILQ_FOREACH_SAFE(qp, &muser_transport->new_qps, link, tmp_qp) {
 		TAILQ_REMOVE(&muser_transport->new_qps, qp, link);
 		cb_fn(&qp->qpair, NULL);
 	}
@@ -2338,11 +2550,6 @@ muser_req_complete(struct spdk_nvmf_request *req)
 	struct muser_req *muser_req;
 
 	assert(req != NULL);
-
-	if (req->cmd->connect_cmd.opcode != SPDK_NVME_OPC_FABRIC &&
-	    req->cmd->connect_cmd.fctype != SPDK_NVMF_FABRIC_COMMAND_CONNECT) {
-		/* TODO: do cqe business */
-	}
 
 	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
 	qpair = SPDK_CONTAINEROF(muser_req->req.qpair, struct muser_qpair, qpair);
