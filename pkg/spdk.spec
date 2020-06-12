@@ -36,6 +36,7 @@ BuildRequires: dpdk-devel, numactl-devel
 #BuildRequires: libiscsi-devel
 BuildRequires: libaio-devel, openssl-devel, libuuid-devel
 BuildRequires: libibverbs-devel, librdmacm-devel
+BuildRequires: ncurses-devel
 %if %{with doc}
 BuildRequires: doxygen mscgen graphviz
 %endif
