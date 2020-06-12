@@ -1432,21 +1432,8 @@ pmcap_access(void *pvt, const uint8_t id, char * const buf, const size_t count,
 static ssize_t
 handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc * const mxc)
 {
-	uint16_t n;
-
 	assert(ctrlr != NULL);
 	assert(mxc != NULL);
-
-	/* host driver writes RO field, don't know why */
-	if (ctrlr->msixcap.mxc.ts == *(uint16_t*)mxc) {
-		goto out;
-	}
-
-	n = ~(PCI_MSIX_FLAGS_MASKALL | PCI_MSIX_FLAGS_ENABLE) & *((uint16_t*)mxc);
-	if (n != 0) {
-		SPDK_ERRLOG("bad write 0x%x to MXC\n", n);
-		return -EINVAL;
-	}
 
 	if (mxc->mxe != ctrlr->msixcap.mxc.mxe) {
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s MSI-X\n",
@@ -1793,6 +1780,7 @@ init_pci_config_space(lm_pci_config_space_t *p)
 	p->hdr.intr.ipin = 0x1;
 }
 
+static int
 muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
 {
 	int ret;
@@ -1801,7 +1789,7 @@ muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
 	assert(subnqn != NULL);
 
 	ret = snprintf(subnqn, SPDK_NVME_NQN_FIELD_SIZE,
-	               "nqn.2019-07.io.spdk.muser:%s", ctrlr->uuid);
+		       "nqn.2019-07.io.spdk.muser:%s", ctrlr->uuid);
 	return (size_t)ret >= SPDK_NVME_NQN_FIELD_SIZE ? -1 : 0;
 }
 
@@ -1928,6 +1916,7 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 	return 0;
 }
 
+static int
 muser_init_dev_mem(struct muser_ctrlr *ctrlr)
 {
 	char *path = NULL;
@@ -2006,17 +1995,6 @@ muser_listen(struct spdk_nvmf_transport *transport,
 
 	err = sem_init(&muser_ctrlr->sem, 0, 0);
 	if (err != 0) {
-		goto out;
-	}
-
-	err = muser_snprintf_subnqn(muser_ctrlr, subnqn);
-	if (err != 0) {
-		goto out;
-	}
-	muser_ctrlr->subsys = spdk_nvmf_tgt_find_subsystem(transport->tgt,
-	                                                   subnqn);
-	if (muser_ctrlr->subsys == NULL) {
-		err = -1;
 		goto out;
 	}
 
@@ -2348,19 +2326,6 @@ handle_io_queue_connect_rsp(struct muser_req *req, void *cb_arg)
 	req->req.data = NULL;
 
 	return 0;
-}
-
-static int
-muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
-{
-	int ret;
-
-	assert(ctrlr != NULL);
-	assert(subnqn != NULL);
-
-	ret = snprintf(subnqn, SPDK_NVME_NQN_FIELD_SIZE,
-		       "nqn.2019-07.io.spdk.muser:%s", ctrlr->uuid);
-	return (size_t)ret >= SPDK_NVME_NQN_FIELD_SIZE ? -1 : 0;
 }
 
 /*
