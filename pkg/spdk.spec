@@ -103,7 +103,7 @@ BuildArch: noarch
 %build
 (cd libiscsi && ./autogen.sh && ./configure --prefix=%{libiscsi_tmp_inst} && make && make install)
 export LDFLAGS="-L%{libiscsi_tmp_inst}/lib"
-export CFLAGS="-I%{libiscsi_tmp_inst}/include/"
+export CFLAGS="-I%{libiscsi_tmp_inst}/include/ -mno-bmi2"
 export CPPFLAGS="-I%{libiscsi_tmp_inst}/include/"
 export CXXFLAGS="-I%{libiscsi_tmp_inst}/include/"
 ./configure --prefix=%{_usr} \
