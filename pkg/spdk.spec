@@ -143,6 +143,7 @@ make -C doc
 mkdir -p %{install_datadir}
 find scripts -type f -regextype egrep -regex '.*(spdkcli|rpc).*[.]py' \
 	-exec cp --parents -t %{install_datadir} {} ";"
+install -m 755 scripts/vNVMe.py %{install_datadir}/scripts
 
 # env is banned - replace '/usr/bin/env anything' with '/usr/bin/anything'
 find %{install_datadir}/scripts -type f -regextype egrep -regex '.*([.]py|[.]sh)' \
