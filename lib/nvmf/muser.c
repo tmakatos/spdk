@@ -1722,7 +1722,7 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 	nvme_reg_info_fill(dev_info->pci_info.reg_info);
 
 	dev_info->log = nvme_log;
-	dev_info->log_lvl = LM_DBG;
+	dev_info->log_lvl = LM_ERR;
 }
 
 /*
