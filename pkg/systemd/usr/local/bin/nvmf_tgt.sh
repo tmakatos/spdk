@@ -20,7 +20,7 @@ chmod 777 ${muser_shm_dir}
 chmod 777 ${muser_dir}
 
 rm -f ${spdk_sock}
-LD_LIBRARY_PATH=/opt/libiscsi-1.19.0/lib nvmf_tgt -L nvme -L nvmf -L nvmf_muser &
+LD_LIBRARY_PATH=/opt/libiscsi-1.19.0/lib nvmf_tgt &
 while [ ! -S ${spdk_sock} ]; do
 	sleep 1
 done
