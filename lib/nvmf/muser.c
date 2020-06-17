@@ -1327,9 +1327,11 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF_MUSER, "Bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
 		      is_write ? "Write" : "Read", ctrlr, count, pos);
 
-	if (is_write) {
+#if 0
+	if (is_write && SPDK_LOG_MUSER.enabled) {
 		spdk_log_dump(stdout, "muser_write", buf, count);
 	}
+#endif
 
 	if (pos >= DOORBELLS) {
 		return handle_dbl_access(ctrlr, (uint32_t *)buf, count,
