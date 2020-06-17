@@ -992,7 +992,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	assert(ctrlr != NULL);
 	assert(cmd != NULL);
 
-	SPDK_NOTICELOG("create I/O %cQ: QID=0x%x, QSIZE=0x%x\n",
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "create I/O %cQ: QID=0x%x, QSIZE=0x%x\n",
 		       is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid,
 		       cmd->cdw10_bits.create_io_q.qsize);
 
@@ -1148,7 +1148,8 @@ consume_admin_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	assert(ctrlr != NULL);
 	assert(cmd != NULL);
 
-	SPDK_NOTICELOG("handle admin req opc=%#x cid=%d\n", cmd->opc, cmd->cid);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "handle admin req opc=%#x cid=%d\n",
+	              cmd->opc, cmd->cid);
 
 	switch (cmd->opc) {
 	/* TODO put all cases in order */
@@ -2394,8 +2395,9 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	muser_req->cb_fn = handle_io_queue_connect_rsp;
 	muser_req->cb_arg = muser_qpair;
 
-	SPDK_NOTICELOG("sending connect fabrics command for QID=%#x cntlid=%#x\n",
-		       qpair->qid, data->cntlid);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+	              "sending connect fabrics command for QID=%#x cntlid=%#x\n",
+		      qpair->qid, data->cntlid);
 
 	spdk_nvmf_request_exec_fabrics(req);
 out:
