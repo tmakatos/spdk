@@ -10,3 +10,6 @@
 [submodule "ocf"]
 	path = ocf
 	url = https://github.com/Open-CAS/ocf.git
+[submodule "libiscsi"]
+	path = libiscsi
+	url = git@github.com:sahlberg/libiscsi.git

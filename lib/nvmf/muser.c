@@ -1326,9 +1326,11 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF_MUSER, "Bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
 		      is_write ? "Write" : "Read", ctrlr, count, pos);
 
-	if (is_write) {
+#if 0
+	if (is_write && SPDK_LOG_MUSER.enabled) {
 		spdk_log_dump(stdout, "muser_write", buf, count);
 	}
+#endif
 
 	if (pos >= DOORBELLS) {
 		return handle_dbl_access(ctrlr, (uint32_t *)buf, count,
@@ -1724,7 +1726,7 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 	nvme_reg_info_fill(dev_info->pci_info.reg_info);
 
 	dev_info->log = nvme_log;
-	dev_info->log_lvl = LM_DBG;
+	dev_info->log_lvl = LM_ERR;
 }
 
 /*

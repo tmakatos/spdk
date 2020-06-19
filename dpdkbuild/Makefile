@@ -152,8 +152,15 @@ all: $(SPDK_ROOT_DIR)/dpdk/build
 clean:
 	$(Q)rm -rf $(SPDK_ROOT_DIR)/dpdk/build
 
-install:
-	@:
+DPDK_LIB_NAMES := eal mempool ring mbuf mempool_ring pci bus_pci kvargs
+DPDK_SHARED_LIBS := $(patsubst %, $(SPDK_ROOT_DIR)/dpdk/build/lib/librte_%.so.*, $(DPDK_LIB_NAMES))
+
+DESTDIR?=
+libdir?=$(CONFIG_PREFIX)/lib
+
+install: all
+	mkdir -p "$(DESTDIR)$(libdir)"
+	install -D -m 755 $(DPDK_SHARED_LIBS) "$(DESTDIR)$(libdir)"
 
 uninstall:
 	@:
