@@ -2587,10 +2587,24 @@ get_nvmf_req(struct muser_qpair *qpair)
 	return &req->req;
 }
 
-static uint16_t
-nlb(struct spdk_nvme_cmd *cmd)
+static int
+get_nvmf_io_req_length(struct spdk_nvmf_request *req)
 {
-	return 0x0000ffff & cmd->cdw12;
+	uint16_t nlb;
+	uint32_t nsid;
+	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
+	struct spdk_nvmf_ctrlr *ctrlr = req->qpair->ctrlr;
+	struct spdk_nvmf_ns *ns;
+
+	nsid = cmd->nsid;
+	nlb = (cmd->cdw12 & 0x0000ffffu) + 1;
+	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, nsid);
+	if (ns == NULL || ns->bdev == NULL) {
+		SPDK_ERRLOG("Unsuccessful query for nsid %u\n", cmd->nsid);
+		return -EINVAL;
+	}
+
+	return nlb * spdk_bdev_get_block_size(ns->bdev);
 }
 
 static int
@@ -2667,7 +2681,13 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 	req->data = NULL;
 	if (remap) {
 		assert(is_prp(&req->cmd->nvme_cmd));
-		req->length = (nlb(&req->cmd->nvme_cmd) + 1) << 9;
+		err = get_nvmf_io_req_length(req);
+		if (err < 0) {
+			sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
+			goto out;
+		}
+
+		req->length = err;
 		err = muser_map_prps(ctrlr, &req->cmd->nvme_cmd, req->iov,
 				     req->length);
 		if (err < 0) {
@@ -2676,7 +2696,7 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 			goto out;
 		}
 		req->iovcnt = err;
-		err = 0;
+		return 0;
 	}
 
 out:
