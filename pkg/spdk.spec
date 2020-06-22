@@ -102,10 +102,13 @@ BuildArch: noarch
 
 %build
 (cd libiscsi && ./autogen.sh && ./configure --prefix=%{libiscsi_tmp_inst} && make && make install)
+
+# flags for DPDK
 export LDFLAGS="-L%{libiscsi_tmp_inst}/lib"
-export CFLAGS="-I%{libiscsi_tmp_inst}/include/ -mno-bmi2"
+export CFLAGS="-I%{libiscsi_tmp_inst}/include/ -mno-bmi2" # FIXME should be ivybridge/core2
 export CPPFLAGS="-I%{libiscsi_tmp_inst}/include/"
 export CXXFLAGS="-I%{libiscsi_tmp_inst}/include/"
+
 ./configure --prefix=%{_usr} \
 	--without-dpdk \
 	--enable-debug \
@@ -130,7 +133,7 @@ export CXXFLAGS="-I%{libiscsi_tmp_inst}/include/"
 	--without-fuse \
 	--without-nvme-cuse
 
-make -j`nproc` all
+make V=1 -j`nproc` all
 
 %if %{with doc}
 make -C doc
