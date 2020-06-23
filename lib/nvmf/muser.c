@@ -1958,6 +1958,9 @@ muser_init_dev_mem(struct muser_ctrlr *ctrlr)
 		ret = -errno;
 		goto out;
 	}
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n",
+	              ctrlr->uuid, ctrlr->doorbells);
+
 out:
 	if (ret != 0) {
 		if (fd != -1) {
