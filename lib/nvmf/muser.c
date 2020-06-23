@@ -1673,7 +1673,7 @@ nvme_reg_info_fill(lm_reg_info_t *reg_info)
 static void
 nvme_log(void *pvt, char const *msg)
 {
-	struct muser_ctrlr ctrlr = *pvt;
+	struct muser_ctrlr *ctrlr = (struct muser_ctrlr*)pvt;
 	assert(ctrlr != NULL);
 	fprintf(stderr, "%s: %s", ctrlr->uuid, msg);
 }
