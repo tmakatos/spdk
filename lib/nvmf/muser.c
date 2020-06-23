@@ -1962,9 +1962,6 @@ muser_init_dev_mem(struct muser_ctrlr *ctrlr)
 	}
 out:
 	if (ret != 0) {
-		if (ctrlr->doorbells != NULL) {
-			munmap(ctrlr->doorbells, MUSER_DOORBELLS_SIZE);
-		}
 		if (fd != -1) {
 			close(fd);
 		}
