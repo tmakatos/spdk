@@ -1725,7 +1725,14 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 	nvme_reg_info_fill(dev_info->pci_info.reg_info);
 
 	dev_info->log = nvme_log;
-	dev_info->log_lvl = LM_DBG;
+
+	if (spdk_log_get_print_level() >= SPDK_LOG_DEBUG) {
+		dev_info->log_lvl = LM_DBG;
+	} else if (spdk_log_get_print_level() >= SPDK_LOG_INFO) {
+		dev_info->log_lvl = LM_INF;
+	} else {
+		dev_info->log_lvl = LM_ERR;
+	}
 }
 
 /*
