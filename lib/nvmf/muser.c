@@ -1911,6 +1911,9 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 #ifdef TRAP_DOORBELLS
 		free(ctrlr->doorbells);
 #else
+
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: unmap doorbells %p\n",
+		              ctrlr->uuid, ctrlr->doorbells);
 		if (munmap(ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
 			/* TODO shall return the error */
 			SPDK_ERRLOG("failed to unmap doorbells: %m\n");
