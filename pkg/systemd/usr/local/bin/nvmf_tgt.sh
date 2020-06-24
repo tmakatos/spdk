@@ -15,9 +15,11 @@ chmod 777 ${muser_dir}
 
 rm -f ${spdk_sock}
 if ${debug}; then
-	debug_args="-L nvme -L nvmf -L nvmf_muser"
+	log_args="-L nvme -L nvmf -L nvmf_muser"
+else
+	log_args="--silence-noticelog"
 fi
-LD_LIBRARY_PATH=${libiscsi} nvmf_tgt ${debug_args} &
+LD_LIBRARY_PATH=${libiscsi} nvmf_tgt ${log_args} &
 while [ ! -S ${spdk_sock} ]; do
 	sleep 1
 done
