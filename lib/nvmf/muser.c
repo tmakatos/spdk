@@ -1091,8 +1091,8 @@ handle_del_io_q(struct muser_ctrlr *ctrlr,
 	uint16_t sct = SPDK_NVME_SCT_GENERIC;
 	uint16_t sc = SPDK_NVME_SC_SUCCESS;
 
-	SPDK_NOTICELOG("delete I/O %cQ: QID=%d\n",
-		       is_cq ? 'C' : 'S', cmd->cdw10_bits.delete_io_q.qid);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "delete I/O %cQ: QID=%d\n",
+	              is_cq ? 'C' : 'S', cmd->cdw10_bits.delete_io_q.qid);
 
 	if (lookup_io_q(ctrlr, cmd->cdw10_bits.delete_io_q.qid, is_cq) == NULL) {
 		SPDK_ERRLOG("%cQ%d does not exist\n", is_cq ? 'C' : 'S',
