@@ -1816,21 +1816,25 @@ destroy_pci_dev(struct muser_ctrlr *ctrlr)
 	if (ctrlr == NULL || ctrlr->lm_ctx == NULL) {
 		return 0;
 	}
-	err = pthread_cancel(ctrlr->lm_thr);
-	if (err == 0) {
-		err = pthread_join(ctrlr->lm_thr, &res);
-		if (err != 0) {
-			SPDK_ERRLOG("failed to join thread: %s\n",
-				    strerror(err));
+	if (ctrlr->lm_thr != 0) {
+		err = pthread_cancel(ctrlr->lm_thr);
+		if (err == 0) {
+			err = pthread_join(ctrlr->lm_thr, &res);
+			if (err != 0) {
+				SPDK_ERRLOG("failed to join thread: %s\n",
+				            strerror(err));
+				return -err;
+			}
+			if (res != PTHREAD_CANCELED) {
+				SPDK_ERRLOG("thread exited: %s\n",
+				            strerror(-(intptr_t)res));
+				/* thread died, not much we can do here */
+			}
+		} else if (err != ESRCH) {
+			SPDK_ERRLOG("failed to cancel thread: %s\n",
+			            strerror(err));
 			return -err;
 		}
-		if (res != PTHREAD_CANCELED) {
-			SPDK_ERRLOG("thread exited: %s\n", strerror(-(intptr_t)res));
-			/* thread died, not much we can do here */
-		}
-	} else if (err != ESRCH) {
-		SPDK_ERRLOG("failed to cancel thread: %s\n",  strerror(err));
-		return -err;
 	}
 	lm_ctx_destroy(ctrlr->lm_ctx);
 	ctrlr->lm_ctx = NULL;
