@@ -769,6 +769,17 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "request complete SQ%d cid=%d status=%#x SQ head=%#x CQ tail=%#x\n",
 		      qid, cmd->cid, sc, ctrlr->qp[qid]->sq.head, cq->tail);
 
+	if (qid == 0) {
+		switch (cmd->opc) {
+			case SPDK_NVME_OPC_ABORT:
+			case SPDK_NVME_OPC_SET_FEATURES:
+			case SPDK_NVME_OPC_GET_FEATURES:
+				cpl->cdw0 = cdw0;
+				break;
+		}
+	}
+
+
 	assert(ctrlr->qp[qid] != NULL);
 
 	cpl->sqhd = ctrlr->qp[qid]->sq.head;
