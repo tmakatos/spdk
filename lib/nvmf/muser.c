@@ -1888,7 +1888,7 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 	 * it's just easier, otherwise in order to put it in BAR0 we'd
 	 * have to figure out where exactly doorbells end.
 	 */
-	ctrlr->msixcap.mxc.ts = 0x3;
+	ctrlr->msixcap.mxc.ts = NVME_IRQ_MSIX_NUM - 1;
 	ctrlr->msixcap.mtab.tbir = 0x4;
 	ctrlr->msixcap.mtab.to = 0x0;
 	ctrlr->msixcap.mpba.pbir = 0x5;
