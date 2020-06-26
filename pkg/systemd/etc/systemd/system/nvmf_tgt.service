@@ -8,6 +8,8 @@ RestartSec=1
 User=root
 EnvironmentFile=/etc/systemd/nvmf_tgt.conf
 ExecStart=/usr/bin/env /usr/local/bin/nvmf_tgt.sh $muser_dir $spdk_sock $muser_shm_dir $libiscsi $debug
+# start after pressured because nvmf_tgt needs huge pages
+After=pressured.service
 
 [Install]
 WantedBy=multi-user.target
