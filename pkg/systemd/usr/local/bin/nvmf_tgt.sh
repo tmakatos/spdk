@@ -3,6 +3,9 @@
 set -e
 set -x
 
+echo "waiting for hugepages to initialize"
+while (( ! ($(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) > 0))); do sleep 1; done
+
 rm -rf ${muser_dir} ${muser_shm_dir}
 mkdir -p ${muser_shm_dir}
 
