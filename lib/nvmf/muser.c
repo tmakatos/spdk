@@ -190,54 +190,6 @@ struct muser_qpair {
 	TAILQ_ENTRY(muser_qpair)		link;
 };
 
-/*
- * function prototypes
- */
-static volatile uint32_t *
-hdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
-
-static volatile uint32_t *
-tdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
-
-static int
-muser_req_free(struct spdk_nvmf_request *req);
-
-static struct muser_req *
-get_muser_req(struct muser_qpair *qpair);
-
-static int
-post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
-		struct io_q *cq, uint32_t cdw0, uint16_t sc,
-		uint16_t sct);
-
-/*
- * XXX We need a way to extract the queue ID from an io_q, which is already
- * available in muser_qpair->qpair.qid. Currently we store the type of the
- * queue within the queue, so retrieving the QID requires a comparison. Rather
- * than duplicating this information in struct io_q, we could store a pointer
- * to parent struct muser_qpair, however we would be using 8 bytes instead of
- * just 2 (uint16_t vs. pointer). This is only per-queue so it's not that bad.
- * Another approach is to define two types: struct io_cq { struct io_q q }; and
- * struct io_sq { struct io_q q; };. The downside would be that we would need
- * two almost identical functions to extract the QID.
- */
-static uint16_t
-io_q_id(struct io_q *q)
-{
-
-	struct muser_qpair *muser_qpair;
-
-	assert(q);
-
-	if (q->is_cq) {
-		muser_qpair = SPDK_CONTAINEROF(q, struct muser_qpair, cq);
-	} else {
-		muser_qpair = SPDK_CONTAINEROF(q, struct muser_qpair, sq);
-	}
-	assert(muser_qpair);
-	return muser_qpair->qpair.qid;
-}
-
 struct muser_poll_group {
 	struct spdk_nvmf_transport_poll_group	group;
 	TAILQ_HEAD(, muser_qpair)		qps;
@@ -289,6 +241,61 @@ struct muser_ctrlr {
 	bool					initialized;
 };
 
+struct muser_transport {
+	struct spdk_nvmf_transport		transport;
+	pthread_mutex_t				lock;
+	TAILQ_HEAD(, muser_ctrlr)		ctrlrs;
+
+	TAILQ_HEAD(, muser_qpair)		new_qps;
+};
+
+/*
+ * function prototypes
+ */
+static volatile uint32_t *
+hdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
+
+static volatile uint32_t *
+tdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
+
+static int
+muser_req_free(struct spdk_nvmf_request *req);
+
+static struct muser_req *
+get_muser_req(struct muser_qpair *qpair);
+
+static int
+post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
+		struct io_q *cq, uint32_t cdw0, uint16_t sc,
+		uint16_t sct);
+
+/*
+ * XXX We need a way to extract the queue ID from an io_q, which is already
+ * available in muser_qpair->qpair.qid. Currently we store the type of the
+ * queue within the queue, so retrieving the QID requires a comparison. Rather
+ * than duplicating this information in struct io_q, we could store a pointer
+ * to parent struct muser_qpair, however we would be using 8 bytes instead of
+ * just 2 (uint16_t vs. pointer). This is only per-queue so it's not that bad.
+ * Another approach is to define two types: struct io_cq { struct io_q q }; and
+ * struct io_sq { struct io_q q; };. The downside would be that we would need
+ * two almost identical functions to extract the QID.
+ */
+static uint16_t
+io_q_id(struct io_q *q)
+{
+
+	struct muser_qpair *muser_qpair;
+
+	assert(q);
+
+	if (q->is_cq) {
+		muser_qpair = SPDK_CONTAINEROF(q, struct muser_qpair, cq);
+	} else {
+		muser_qpair = SPDK_CONTAINEROF(q, struct muser_qpair, sq);
+	}
+	assert(muser_qpair);
+	return muser_qpair->qpair.qid;
+}
 
 static void
 fail_ctrlr(struct muser_ctrlr *ctrlr)
@@ -307,14 +314,6 @@ ctrlr_interrupt_enabled(struct muser_ctrlr *ctrlr)
 
 	return (!pci->hdr.cmd.id || ctrlr->msixcap.mxc.mxe);
 }
-
-struct muser_transport {
-	struct spdk_nvmf_transport		transport;
-	pthread_mutex_t				lock;
-	TAILQ_HEAD(, muser_ctrlr)		ctrlrs;
-
-	TAILQ_HEAD(, muser_qpair)		new_qps;
-};
 
 /* called when process exits */
 static int
