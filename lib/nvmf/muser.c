@@ -2058,16 +2058,11 @@ muser_ctrlr_id(const char *s)
 }
 
 static int
-muser_listen(struct spdk_nvmf_transport *transport,
-	     const struct spdk_nvme_transport_id *trid)
+muser_create_ctrlr(struct muser_transport *muser_transport, const struct spdk_nvme_transport_id *trid)
 {
-	struct muser_transport *muser_transport = NULL;
-	struct muser_ctrlr *muser_ctrlr = NULL;
+	struct muser_ctrlr *muser_ctrlr;
 	struct spdk_nvmf_poll_group *pg;
 	int err;
-
-	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
-					   transport);
 
 	/* First, construct a muser controller */
 	muser_ctrlr = calloc(1, sizeof(*muser_ctrlr));
@@ -2114,7 +2109,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	}
 
 	/* Then, construct an admin queue pair */
-	err = init_qp(muser_ctrlr, transport, MUSER_DEFAULT_AQ_DEPTH, 0);
+	err = init_qp(muser_ctrlr, &muser_transport->transport, MUSER_DEFAULT_AQ_DEPTH, 0);
 	if (err != 0) {
 		goto out;
 	}
@@ -2142,6 +2137,19 @@ out:
 	}
 
 	return err;
+}
+
+static int
+muser_listen(struct spdk_nvmf_transport *transport,
+	     const struct spdk_nvme_transport_id *trid)
+{
+	struct muser_transport *muser_transport = NULL;
+
+	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
+					   transport);
+
+
+	return muser_create_ctrlr(muser_transport, trid);
 }
 
 static void
