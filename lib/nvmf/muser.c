@@ -1577,7 +1577,7 @@ handle_pxcap_pxdc_write(struct muser_ctrlr *const c, const union pxdc *const p)
 
 	if (p->ete != c->pxcap.pxdc.ete) {
 		c->pxcap.pxdc.ete = p->ete;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "ETE %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: ETE %s\n", c->id,
 			      p->ete ? "enable" : "disable");
 	}
 
