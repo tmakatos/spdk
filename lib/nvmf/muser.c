@@ -2659,8 +2659,6 @@ muser_close_qpair(struct spdk_nvmf_qpair *qpair)
 	assert(qpair != NULL);
 
 	/* TODO when is this called? */
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: close QP%d\n", muser_qpair->ctrlr->id,
-	              qpair->qid);
 
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	destroy_qp(muser_qpair->ctrlr, qpair->qid);
