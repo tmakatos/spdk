@@ -1087,6 +1087,9 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		SPDK_ERRLOG("%s: failed to map I/O queue: %m\n", ctrlr->id);
 		goto out;
 	}
+	SPDK_NOTICELOG("%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n", ctrlr->id,
+	               is_cq ? 'C' : 'S', io_q.cqid, cmd->dptr.prp.prp1,
+	               (unsigned long long)io_q.addr);
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
