@@ -1362,8 +1362,13 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 	}
 
 	if (pos >= DOORBELLS) {
-		return handle_dbl_access(ctrlr, (uint32_t *)buf, count,
-					 pos, is_write);
+		ret = handle_dbl_access(ctrlr, (uint32_t *)buf, count,
+		                        pos, is_write);
+		if (ret == 0) {
+			return count;
+		}
+		assert(ret < 0);
+		return ret;
 	}
 
 	ret = do_prop_req(ctrlr, buf, count, pos, is_write);
