@@ -1668,7 +1668,7 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 	              ctrlr->id, off, off + len);
 
 	if (off != DOORBELLS || len != MUSER_DOORBELLS_SIZE) {
-		SPDK_ERRLOG("%s: bad map region %#lx-%#lx\n", ctrlr->id, off,
+		SPDK_ERRLOG("%s: bad mam region %#lx-%#lx\n", ctrlr->id, off,
 		            off + len);
 		errno = EINVAL;
 		return (unsigned long)MAP_FAILED;
