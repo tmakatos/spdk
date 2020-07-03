@@ -193,10 +193,10 @@ struct muser_qpair {
 /*
  * function prototypes
  */
-static uint32_t *
+static volatile uint32_t *
 hdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
 
-static uint32_t *
+static volatile uint32_t *
 tdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
 
 static int
@@ -277,7 +277,7 @@ struct muser_ctrlr {
 	TAILQ_ENTRY(muser_ctrlr)		link;
 
 	/* even indices are SQ, odd indices are CQ */
-	uint32_t				*doorbells;
+	volatile uint32_t			*doorbells;
 
 	/* internal CSTS.CFS register for MUSER fatal errors */
 	uint32_t				cfs : 1;
@@ -595,38 +595,24 @@ queue_index(uint16_t qid, int is_cq)
 	return (qid * 2) + is_cq;
 }
 
-static uint32_t *
-_dbl(struct muser_ctrlr *ctrlr, uint16_t qid, bool is_cq)
-{
-	assert(ctrlr != NULL);
-	return &ctrlr->doorbells[queue_index(qid, is_cq)];
-}
-
-/*
- * Don't use directly, use tdbl and hdbl instead which check that queue type. */
-static uint32_t *
-dbl(struct muser_ctrlr *ctrlr, struct io_q *q)
-{
-	assert(q != NULL);
-	return _dbl(ctrlr, io_q_id(q), q->is_cq);
-}
-
-static uint32_t *
+static volatile uint32_t *
 tdbl(struct muser_ctrlr *ctrlr, struct io_q *q)
 {
 	assert(ctrlr != NULL);
 	assert(q != NULL);
 	assert(!q->is_cq);
-	return dbl(ctrlr, q);
+
+	return &ctrlr->doorbells[queue_index(io_q_id(q), false)];
 }
 
-static uint32_t *
+static volatile uint32_t *
 hdbl(struct muser_ctrlr *ctrlr, struct io_q *q)
 {
 	assert(ctrlr != NULL);
 	assert(q != NULL);
 	assert(q->is_cq);
-	return dbl(ctrlr, q);
+
+	return &ctrlr->doorbells[queue_index(io_q_id(q), true)];
 }
 
 static bool
@@ -1087,6 +1073,11 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		SPDK_ERRLOG("%s: failed to map I/O queue: %m\n", ctrlr->id);
 		goto out;
 	}
+	memset(io_q.addr, 0, io_q.size * entry_size);
+
+	SPDK_NOTICELOG("%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n", ctrlr->id,
+	               is_cq ? 'C' : 'S', io_q.cqid, cmd->dptr.prp.prp1,
+	               (unsigned long long)io_q.addr);
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
@@ -1361,8 +1352,13 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 #endif
 
 	if (pos >= DOORBELLS) {
-		return handle_dbl_access(ctrlr, (uint32_t *)buf, count,
+		ret = handle_dbl_access(ctrlr, (uint32_t *)buf, count,
 					 pos, is_write);
+		if (ret == 0) {
+			return count;
+		}
+		assert(ret < 0);
+		return ret;
 	}
 
 	ret = do_prop_req(ctrlr, buf, count, pos, is_write);
@@ -1571,7 +1567,7 @@ handle_pxcap_pxdc_write(struct muser_ctrlr *const c, const union pxdc *const p)
 
 	if (p->ete != c->pxcap.pxdc.ete) {
 		c->pxcap.pxdc.ete = p->ete;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "ETE %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: ETE %s\n", c->id,
 			      p->ete ? "enable" : "disable");
 	}
 
@@ -1972,7 +1968,7 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: unmap doorbells %p\n",
 		              ctrlr->id, ctrlr->doorbells);
-		if (munmap(ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
+		if (munmap((void *)ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
 			/* TODO shall return the error */
 			SPDK_ERRLOG("%s: failed to unmap doorbells: %m\n",
 			            ctrlr->id);
@@ -2044,7 +2040,8 @@ out:
  * reasonable length ID.
  */
 static const char*
-muser_ctrlr_id(const char *s) {
+muser_ctrlr_id(const char *s)
+{
 	const char *p = strrchr(s, '/');
 	if (p != NULL) {
 		while (p > s && *(p - 1) != '/') {
@@ -2077,7 +2074,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	muser_ctrlr->cntlid = 0xffff;
 	muser_ctrlr->transport = muser_transport;
 	memcpy(muser_ctrlr->uuid, trid->traddr, sizeof(muser_ctrlr->uuid));
-	muser_ctrlr->id = muser_ctrlr_id(muser_ctrlr->uuid);
+	muser_ctrlr->id = (char *)muser_ctrlr_id(muser_ctrlr->uuid);
 	
 	memcpy(&muser_ctrlr->trid, trid, sizeof(muser_ctrlr->trid));
 
@@ -2118,11 +2115,9 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
-	if (muser_transport->pg == NULL) {
+	assert(muser_transport->pg == NULL);
 		muser_transport->pg = spdk_nvmf_poll_group_create(muser_transport->transport.tgt);
 		assert(muser_transport->pg != NULL);
-	}
-
 	/* Add this qpair to our internal poll group, just so that it has one assigned. */
 	spdk_nvmf_poll_group_add(muser_transport->pg, &muser_ctrlr->qp[0]->qpair);
 
@@ -2157,7 +2152,7 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 	assert(trid != NULL);
 	assert(trid->traddr != NULL);
 
-	id = muser_ctrlr_id(trid->traddr);
+	id = (char *)muser_ctrlr_id(trid->traddr);
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: stop listen\n", id);
 
@@ -2189,36 +2184,23 @@ _muser_notify_new_admin_qpair(void *ctx)
 	struct muser_qpair *mqpair;
 	struct spdk_nvmf_qpair *qpair;
 	struct muser_ctrlr *mctrlr;
-	struct spdk_nvmf_poll_group *group;
-	struct spdk_nvmf_transport_poll_group *tgroup;
-	int rc;
 
 	mctrlr = ctx;
 	assert(mctrlr != NULL);
 
 	mqpair = mctrlr->qp[0];
-	qpair = &mqpair->qpair;
 	assert(mqpair != NULL);
+	qpair = &mqpair->qpair;
 
 	/* We're ready to show this new qpair to the upper layer. Remove it from
 	 * our internal poll group. Currently there's no API to do that.
 	 * TODO: Add an API. */
 	assert(TAILQ_EMPTY(&qpair->outstanding));
-	group = qpair->group;
-	qpair->group = NULL;
 	mctrlr->cntlid = qpair->ctrlr->cntlid;
 
-	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
-		if (tgroup->transport == qpair->transport) {
-			rc = nvmf_transport_poll_group_remove(tgroup, qpair);
-			assert(rc == 0);
-			break;
-		}
-	}
-
-	TAILQ_REMOVE(&group->qpairs, qpair, link);
-	qpair->state = SPDK_NVMF_QPAIR_UNINITIALIZED;
-
+	/* destroy the internal poll group created in muser_listen */
+	spdk_nvmf_poll_group_remove(qpair);
+	spdk_nvmf_poll_group_destroy(qpair->group, NULL, NULL);
 	/* Queue the admin queue up so that it gets discovered and assigned to
 	 * a poll group.
 	 */
@@ -2649,12 +2631,11 @@ static void
 muser_close_qpair(struct spdk_nvmf_qpair *qpair)
 {
 	struct muser_qpair *muser_qpair;
+	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 
 	assert(qpair != NULL);
 
 	/* TODO when is this called? */
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: close QP%d\n", muser_qpair->ctrlr->id,
-	              qpair->qid);
 
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	destroy_qp(muser_qpair->ctrlr, qpair->qid);
@@ -2766,7 +2747,6 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 {
 	int err = 0;
 	bool remap = true;
-	uint16_t sc;
 
 	assert(ctrlr != NULL);
 	assert(req != NULL);
@@ -2785,9 +2765,7 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 	default:
 		SPDK_ERRLOG("%s: SQ%d invalid I/O request type 0x%x\n",
 			    ctrlr->id, req->qpair->qid, req->cmd->nvme_cmd.opc);
-		err = -EINVAL;
-		sc = SPDK_NVME_SC_INVALID_OPCODE;
-		goto out;
+		return -EINVAL;
 	}
 
 	req->data = NULL;
@@ -2795,8 +2773,7 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 		assert(is_prp(&req->cmd->nvme_cmd));
 		err = get_nvmf_io_req_length(req);
 		if (err < 0) {
-			sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
-			goto out;
+			return -EINVAL;
 		}
 
 		req->length = err;
@@ -2805,18 +2782,10 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 		if (err < 0) {
 			SPDK_ERRLOG("%s: failed to map PRP: %d\n", ctrlr->id,
 			            err);
-			sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-			goto out;
+			return -EFAULT;
 		}
 		req->iovcnt = err;
 		return 0;
-	}
-
-out:
-	if (err != 0) {
-		return post_completion(ctrlr, &req->cmd->nvme_cmd,
-				       &ctrlr->qp[req->qpair->qid]->cq, 0, sc,
-				       SPDK_NVME_SCT_GENERIC);
 	}
 
 	return 0;
