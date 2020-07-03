@@ -2125,11 +2125,9 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
-	if (muser_transport->pg == NULL) {
-		muser_transport->pg = spdk_nvmf_poll_group_create(muser_transport->transport.tgt);
-		assert(muser_transport->pg != NULL);
-	}
-
+	assert(muser_transport->pg == NULL);
+	muser_transport->pg = spdk_nvmf_poll_group_create(muser_transport->transport.tgt);
+	assert(muser_transport->pg != NULL);
 	/* Add this qpair to our internal poll group, just so that it has one assigned. */
 	spdk_nvmf_poll_group_add(muser_transport->pg, &muser_ctrlr->qp[0]->qpair);
 
@@ -2196,36 +2194,23 @@ _muser_notify_new_admin_qpair(void *ctx)
 	struct muser_qpair *mqpair;
 	struct spdk_nvmf_qpair *qpair;
 	struct muser_ctrlr *mctrlr;
-	struct spdk_nvmf_poll_group *group;
-	struct spdk_nvmf_transport_poll_group *tgroup;
-	int rc;
 
 	mctrlr = ctx;
 	assert(mctrlr != NULL);
 
 	mqpair = mctrlr->qp[0];
-	qpair = &mqpair->qpair;
 	assert(mqpair != NULL);
+	qpair = &mqpair->qpair;
 
 	/* We're ready to show this new qpair to the upper layer. Remove it from
 	 * our internal poll group. Currently there's no API to do that.
 	 * TODO: Add an API. */
 	assert(TAILQ_EMPTY(&qpair->outstanding));
-	group = qpair->group;
-	qpair->group = NULL;
 	mctrlr->cntlid = qpair->ctrlr->cntlid;
 
-	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
-		if (tgroup->transport == qpair->transport) {
-			rc = nvmf_transport_poll_group_remove(tgroup, qpair);
-			assert(rc == 0);
-			break;
-		}
-	}
-
-	TAILQ_REMOVE(&group->qpairs, qpair, link);
-	qpair->state = SPDK_NVMF_QPAIR_UNINITIALIZED;
-
+	/* destroy the internal poll group created in muser_listen */
+	spdk_nvmf_poll_group_remove(qpair);
+	spdk_nvmf_poll_group_destroy(qpair->group, NULL, NULL);
 	/* Queue the admin queue up so that it gets discovered and assigned to
 	 * a poll group.
 	 */
