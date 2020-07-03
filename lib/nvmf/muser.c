@@ -2757,7 +2757,6 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 {
 	int err = 0;
 	bool remap = true;
-	uint16_t sc;
 
 	assert(ctrlr != NULL);
 	assert(req != NULL);
@@ -2776,9 +2775,7 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 	default:
 		SPDK_ERRLOG("%s: SQ%d invalid I/O request type 0x%x\n",
 			    ctrlr->id, req->qpair->qid, req->cmd->nvme_cmd.opc);
-		err = -EINVAL;
-		sc = SPDK_NVME_SC_INVALID_OPCODE;
-		goto out;
+		return -EINVAL;
 	}
 
 	req->data = NULL;
@@ -2786,8 +2783,7 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 		assert(is_prp(&req->cmd->nvme_cmd));
 		err = get_nvmf_io_req_length(req);
 		if (err < 0) {
-			sc = SPDK_NVME_SC_INVALID_NAMESPACE_OR_FORMAT;
-			goto out;
+			return -EINVAL;
 		}
 
 		req->length = err;
@@ -2796,18 +2792,10 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 		if (err < 0) {
 			SPDK_ERRLOG("%s: failed to map PRP: %d\n", ctrlr->id,
 				    err);
-			sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-			goto out;
+			return -EFAULT;
 		}
 		req->iovcnt = err;
 		return 0;
-	}
-
-out:
-	if (err != 0) {
-		return post_completion(ctrlr, &req->cmd->nvme_cmd,
-				       &ctrlr->qp[req->qpair->qid]->cq, 0, sc,
-				       SPDK_NVME_SCT_GENERIC);
 	}
 
 	return 0;
