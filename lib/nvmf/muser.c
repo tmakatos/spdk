@@ -193,10 +193,10 @@ struct muser_qpair {
 /*
  * function prototypes
  */
-static uint32_t *
+static volatile uint32_t *
 hdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
 
-static uint32_t *
+static volatile uint32_t *
 tdbl(struct muser_ctrlr *ctrlr, struct io_q *q);
 
 static int
@@ -277,7 +277,7 @@ struct muser_ctrlr {
 	TAILQ_ENTRY(muser_ctrlr)		link;
 
 	/* even indices are SQ, odd indices are CQ */
-	uint32_t				*doorbells;
+	volatile uint32_t			*doorbells;
 
 	/* internal CSTS.CFS register for MUSER fatal errors */
 	uint32_t				cfs : 1;
@@ -595,38 +595,24 @@ queue_index(uint16_t qid, int is_cq)
 	return (qid * 2) + is_cq;
 }
 
-static uint32_t *
-_dbl(struct muser_ctrlr *ctrlr, uint16_t qid, bool is_cq)
-{
-	assert(ctrlr != NULL);
-	return &ctrlr->doorbells[queue_index(qid, is_cq)];
-}
-
-/*
- * Don't use directly, use tdbl and hdbl instead which check that queue type. */
-static uint32_t *
-dbl(struct muser_ctrlr *ctrlr, struct io_q *q)
-{
-	assert(q != NULL);
-	return _dbl(ctrlr, io_q_id(q), q->is_cq);
-}
-
-static uint32_t *
+static volatile uint32_t *
 tdbl(struct muser_ctrlr *ctrlr, struct io_q *q)
 {
 	assert(ctrlr != NULL);
 	assert(q != NULL);
 	assert(!q->is_cq);
-	return dbl(ctrlr, q);
+
+	return &ctrlr->doorbells[queue_index(io_q_id(q), false)];
 }
 
-static uint32_t *
+static volatile uint32_t *
 hdbl(struct muser_ctrlr *ctrlr, struct io_q *q)
 {
 	assert(ctrlr != NULL);
 	assert(q != NULL);
 	assert(q->is_cq);
-	return dbl(ctrlr, q);
+
+	return &ctrlr->doorbells[queue_index(io_q_id(q), true)];
 }
 
 static bool
@@ -1087,6 +1073,8 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		SPDK_ERRLOG("%s: failed to map I/O queue: %m\n", ctrlr->id);
 		goto out;
 	}
+	memset(io_q.addr, 0, io_q.size * entry_size);
+
 	SPDK_NOTICELOG("%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n", ctrlr->id,
 	               is_cq ? 'C' : 'S', io_q.cqid, cmd->dptr.prp.prp1,
 	               (unsigned long long)io_q.addr);
@@ -1978,7 +1966,7 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: unmap doorbells %p\n",
 			      ctrlr->id, ctrlr->doorbells);
-		if (munmap(ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
+		if (munmap((void *)ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
 			/* TODO shall return the error */
 			SPDK_ERRLOG("%s: failed to unmap doorbells: %m\n",
 				    ctrlr->id);
