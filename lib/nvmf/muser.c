@@ -1704,11 +1704,18 @@ nvme_reg_info_fill(lm_reg_info_t *reg_info)
 }
 
 static void
-nvme_log(void *pvt, char const *msg)
+muser_log(void *pvt, lm_log_lvl_t lvl, char const *msg)
 {
 	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
 	assert(ctrlr != NULL);
-	fprintf(stderr, "%s: %s", ctrlr->id, msg);
+
+	if (lvl >= LM_DBG) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: %s", ctrlr->id, msg);
+	} else if (lvl >= LM_INF) {
+		SPDK_NOTICELOG("%s: %s", ctrlr->id, msg);
+	} else {
+		SPDK_ERRLOG("%s: %s", ctrlr->id, msg);
+	}
 }
 
 static void
@@ -1759,7 +1766,7 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 
 	nvme_reg_info_fill(dev_info->pci_info.reg_info);
 
-	dev_info->log = nvme_log;
+	dev_info->log = muser_log;
 
 	if (spdk_log_get_print_level() >= SPDK_LOG_DEBUG) {
 		dev_info->log_lvl = LM_DBG;
