@@ -224,9 +224,6 @@ struct muser_ctrlr {
 
 	/* internal CSTS.CFS register for MUSER fatal errors */
 	uint32_t				cfs : 1;
-
-	/* for LM_TRAS_SOCK */
-	bool					initialized;
 };
 
 struct muser_endpoint {
@@ -241,13 +238,14 @@ struct muser_endpoint {
 	 * currently attached. */
 	struct muser_ctrlr			*ctrlr;
 
+	bool					initialized;
+
 	TAILQ_ENTRY(muser_endpoint)		link;
 };
 
 struct muser_transport {
 	struct spdk_nvmf_transport		transport;
 	pthread_mutex_t				lock;
-	TAILQ_HEAD(, muser_ctrlr)		ctrlrs;
 	TAILQ_HEAD(, muser_endpoint)		endpoints;
 
 	TAILQ_HEAD(, muser_qpair)		new_qps;
@@ -388,7 +386,6 @@ muser_create(struct spdk_nvmf_transport_opts *opts)
 	}
 
 	TAILQ_INIT(&muser_transport->endpoints);
-	TAILQ_INIT(&muser_transport->ctrlrs);
 	TAILQ_INIT(&muser_transport->new_qps);
 
 	return &muser_transport->transport;
@@ -1868,6 +1865,7 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 
 	if (ctrlr->endpoint) {
 		ctrlr->endpoint->ctrlr = NULL;
+		ctrlr->endpoint->initialized = false;
 	}
 
 	free(ctrlr);
@@ -1943,10 +1941,6 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 	assert(pg != NULL);
 	/* Add this qpair to our internal poll group, just so that it has one assigned. */
 	spdk_nvmf_poll_group_add(pg, &muser_ctrlr->qp[0]->qpair);
-
-	/* Add this controller to the list. The rest of the work will be done
-	 * when this is assigned to a subsystem. */
-	TAILQ_INSERT_TAIL(&muser_transport->ctrlrs, muser_ctrlr, link);
 
 out:
 	if (err != 0) {
@@ -2072,13 +2066,11 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 		if (strcmp(trid->traddr, muser_ep->trid.traddr) == 0) {
 			TAILQ_REMOVE(&muser_transport->endpoints, muser_ep, link);
 			if (muser_ep->ctrlr) {
-				TAILQ_REMOVE(&muser_transport->ctrlrs, muser_ep->ctrlr, link);
 				err = destroy_ctrlr(muser_ep->ctrlr);
 				if (err != 0) {
 					SPDK_ERRLOG("%s: failed destroy controller: %s\n",
 						    muser_ep->ctrlr->endpoint->trid.traddr, strerror(-err));
 				}
-				muser_ep->ctrlr = NULL;
 			}
 			muser_destroy_endpoint(muser_ep);
 		}
@@ -2224,6 +2216,7 @@ muser_accept(struct spdk_nvmf_transport *transport)
 	int err;
 	struct muser_transport *muser_transport;
 	struct muser_qpair *qp, *tmp_qp;
+	struct muser_endpoint *muser_ep;
 	struct muser_ctrlr *ctrlr;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
@@ -2235,28 +2228,29 @@ muser_accept(struct spdk_nvmf_transport *transport)
 		return -EFAULT;
 	}
 
-	/* FIXME this should be done properly using the list_done callback etc */
-	TAILQ_FOREACH(ctrlr, &muser_transport->ctrlrs, link) {
-		if (!ctrlr->initialized) {
-			err = lm_ctx_try_attach(ctrlr->lm_ctx);
-			if (err == -1) {
-				if (errno == EAGAIN || errno == EWOULDBLOCK) {
-					continue;
-				}
-				SPDK_ERRLOG("%s: failed to attach: %m\n",
-					    ctrlr->endpoint->trid.traddr);
-				assert(false); /* FIXME */
-				return -EFAULT;
-			}
-			err = pthread_create(&ctrlr->lm_thr, NULL, drive, ctrlr->lm_ctx);
-			if (err != 0) {
-				SPDK_ERRLOG("%s: failed to create lm_drive thread: %s\n",
-					    ctrlr->endpoint->trid.traddr, strerror(err));
-				assert(false); /* FIXME */
-				return -EFAULT;
-			}
-			ctrlr->initialized = true;
+	TAILQ_FOREACH(muser_ep, &muser_transport->endpoints, link) {
+		if (muser_ep->initialized) {
+			continue;
 		}
+
+		err = lm_ctx_try_attach(muser_ep->lm_ctx);
+		if (err == -1) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				continue;
+			}
+			SPDK_ERRLOG("%s: failed to attach: %m\n", muser_ep->trid.traddr);
+			return -EFAULT;
+		}
+
+		ctrlr = muser_ep->ctrlr;
+
+		err = pthread_create(&ctrlr->lm_thr, NULL, drive, muser_ep->lm_ctx);
+		if (err != 0) {
+			SPDK_ERRLOG("%s: failed to create lm_drive thread: %s\n",
+				    muser_ep->trid.traddr, strerror(err));
+			return -EFAULT;
+		}
+		muser_ep->initialized = true;
 	}
 
 	TAILQ_FOREACH_SAFE(qp, &muser_transport->new_qps, link, tmp_qp) {
