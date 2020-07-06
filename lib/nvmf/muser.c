@@ -1872,7 +1872,7 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 	return 0;
 }
 
-static int
+static struct muser_ctrlr *
 muser_create_ctrlr(struct muser_transport *muser_transport,
 		   struct muser_endpoint *muser_ep)
 {
@@ -1953,9 +1953,11 @@ out:
 		if (destroy_ctrlr(muser_ctrlr) != 0) {
 			SPDK_ERRLOG("%s: failed to clean up\n", muser_ep->trid.traddr);
 		}
+
+		muser_ctrlr = NULL;
 	}
 
-	return err;
+	return muser_ctrlr;
 }
 
 static int
@@ -2041,7 +2043,7 @@ out:
 		muser_destroy_endpoint(muser_ep);
 	}
 
-	return muser_create_ctrlr(muser_transport, muser_ep);
+	return err;
 }
 
 static void
@@ -2166,7 +2168,9 @@ muser_listen_associate(struct spdk_nvmf_transport *transport,
 
 	muser_ep->subsystem = subsystem;
 
-	muser_ctrlr = muser_ep->ctrlr;
+	/* Construct a controller */
+	muser_ctrlr = muser_create_ctrlr(mtransport, muser_ep);
+
 	muser_ctrlr->cb_fn = cb_fn;
 	muser_ctrlr->cb_arg = cb_arg;
 
