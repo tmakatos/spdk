@@ -1908,56 +1908,6 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 	return 0;
 }
 
-static int
-muser_init_dev_mem(struct muser_ctrlr *ctrlr)
-{
-	char *path = NULL;
-	int fd = -1;
-	int ret = 0;
-
-	/*
-	 * TODO create directory /dev/shm/muser and create device mem files in
-	 * there
-	 */
-	ret = asprintf(&path, "%s/bar0", ctrlr->uuid);
-	if (ret == -1) {
-		return ret;
-	}
-	fd = open(path, O_RDWR | O_CREAT);
-	if (fd == -1) {
-		SPDK_ERRLOG("%s: failed to open device memory at %s: %m\n",
-			    ctrlr->id, path);
-		ret = fd;
-		goto out;
-	}
-
-	ret = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
-	if (ret != 0) {
-		goto out;
-	}
-	ctrlr->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
-				PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
-	if (ctrlr->doorbells == MAP_FAILED) {
-		ctrlr->doorbells = NULL;
-		ret = -errno;
-		goto out;
-	}
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n", ctrlr->id,
-		      ctrlr->doorbells);
-
-out:
-	if (ret != 0) {
-		if (fd != -1) {
-			close(fd);
-		}
-		unlink(path); /* FIXME check return value */
-	} else {
-		ctrlr->fd = fd;
-	}
-	free(path);
-	return ret;
-}
-
 /*
  * TODO this assumes that the last two components are <domain UUID>/<IOMMU group>, e.g.
  * /var/run/muser/domain/49abd9e2-efa1-488f-8d4f-5a5f8e592fe9/2
@@ -1986,6 +1936,8 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 {
 	struct muser_ctrlr *muser_ctrlr;
 	struct spdk_nvmf_poll_group *pg;
+	char *path;
+	int fd;
 	int err;
 
 	/* First, construct a muser controller */
@@ -2012,10 +1964,38 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 		goto out;
 	}
 
-	err = muser_init_dev_mem(muser_ctrlr);
+	/*
+	 * TODO create directory /dev/shm/muser and create device mem files in
+	 * there
+	 */
+	err = asprintf(&path, "%s/bar0", muser_ctrlr->uuid);
+	if (err == -1) {
+		goto out;
+	}
+
+	fd = open(path, O_RDWR | O_CREAT);
+	if (fd == -1) {
+		SPDK_ERRLOG("%s: failed to open device memory at %s: %m\n",
+			    muser_ctrlr->id, path);
+		err = fd;
+		goto out;
+	}
+
+	err = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
 	if (err != 0) {
 		goto out;
 	}
+	muser_ctrlr->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
+				      PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
+	if (muser_ctrlr->doorbells == MAP_FAILED) {
+		muser_ctrlr->doorbells = NULL;
+		err = -errno;
+		goto out;
+	}
+
+	muser_ctrlr->fd = fd;
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n", muser_ctrlr->id,
+		      muser_ctrlr->doorbells);
 
 	err = init_pci_dev(muser_ctrlr);
 	if (err != 0) {
@@ -2039,6 +2019,11 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 
 out:
 	if (err != 0) {
+		if (fd != -1) {
+			close(fd);
+		}
+		unlink(path); /* FIXME check return value */
+
 		/*
 		 * TODO this prints the whole path instead of
 		 * <domain UUID>/<IOMMU group>, fix.
@@ -2050,6 +2035,7 @@ out:
 		}
 	}
 
+	free(path);
 	return err;
 }
 
