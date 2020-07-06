@@ -205,9 +205,6 @@ struct muser_ctrlr {
 	sem_t					sem;
 	struct muser_nvmf_prop_req		prop_req; /* read/write BAR0 */
 
-	spdk_nvmf_tgt_subsystem_listen_done_fn	cb_fn;
-	void					*cb_arg;
-
 	/* PCI capabilities */
 	struct pmcap				pmcap;
 	struct msixcap				msixcap;
@@ -237,8 +234,6 @@ struct muser_endpoint {
 	/* The current controller. NULL if nothing is
 	 * currently attached. */
 	struct muser_ctrlr			*ctrlr;
-
-	bool					initialized;
 
 	TAILQ_ENTRY(muser_endpoint)		link;
 };
@@ -1865,7 +1860,6 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 
 	if (ctrlr->endpoint) {
 		ctrlr->endpoint->ctrlr = NULL;
-		ctrlr->endpoint->initialized = false;
 	}
 
 	free(ctrlr);
@@ -1878,6 +1872,7 @@ _muser_notify_new_admin_qpair(void *ctx)
 	struct muser_qpair *mqpair;
 	struct spdk_nvmf_qpair *qpair;
 	struct muser_ctrlr *mctrlr;
+	int err;
 
 	mctrlr = ctx;
 	assert(mctrlr != NULL);
@@ -1895,6 +1890,16 @@ _muser_notify_new_admin_qpair(void *ctx)
 	/* destroy the internal poll group created in muser_listen */
 	spdk_nvmf_poll_group_remove(qpair);
 	spdk_nvmf_poll_group_destroy(qpair->group, NULL, NULL);
+
+	/* Start the thread that receives on this socket */
+	err = pthread_create(&mctrlr->lm_thr, NULL, drive, mctrlr->endpoint->lm_ctx);
+	if (err != 0) {
+		SPDK_ERRLOG("%s: failed to create lm_drive thread: %s\n",
+			    mctrlr->endpoint->trid.traddr, strerror(err));
+		destroy_ctrlr(mctrlr);
+		return;
+	}
+
 	/* Queue the admin queue up so that it gets discovered and assigned to
 	 * a poll group.
 	 */
@@ -1914,11 +1919,9 @@ _muser_handle_admin_connect_rsp(struct muser_req *req, void *cb_arg)
 	free(req->req.data);
 
 	if (spdk_nvme_cpl_is_error(&req->req.rsp->nvme_cpl)) {
-		mctrlr->cb_fn(mctrlr->cb_arg, -1);
+		destroy_ctrlr(mctrlr);
 		return -1;
 	}
-
-	mctrlr->cb_fn(mctrlr->cb_arg, 0);
 
 	/* Send a message to ourself to allow the request handling stack
 	 * to unwind before continuing. */
@@ -1929,9 +1932,7 @@ _muser_handle_admin_connect_rsp(struct muser_req *req, void *cb_arg)
 
 static void
 muser_create_ctrlr(struct muser_transport *muser_transport,
-		   struct muser_endpoint *muser_ep,
-		   spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn,
-		   void *cb_arg)
+		   struct muser_endpoint *muser_ep)
 {
 	struct muser_ctrlr *muser_ctrlr;
 	struct spdk_nvmf_poll_group *pg;
@@ -2003,9 +2004,6 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 	/* Add this qpair to our internal poll group, just so that it has one assigned. */
 	spdk_nvmf_poll_group_add(pg, &muser_ctrlr->qp[0]->qpair);
 
-	muser_ctrlr->cb_fn = cb_fn;
-	muser_ctrlr->cb_arg = cb_arg;
-
 	/* Send a fabric connect */
 	muser_qpair = muser_ctrlr->qp[0];
 
@@ -2051,8 +2049,6 @@ out:
 		if (destroy_ctrlr(muser_ctrlr) != 0) {
 			SPDK_ERRLOG("%s: failed to clean up\n", muser_ep->trid.traddr);
 		}
-
-		cb_fn(cb_arg, err);
 	}
 }
 
@@ -2204,8 +2200,7 @@ muser_listen_associate(struct spdk_nvmf_transport *transport,
 
 	muser_ep->subsystem = subsystem;
 
-	/* Construct a controller */
-	muser_create_ctrlr(mtransport, muser_ep, cb_fn, cb_arg);
+	cb_fn(cb_arg, 0);
 }
 
 /*
@@ -2220,7 +2215,6 @@ muser_accept(struct spdk_nvmf_transport *transport)
 	struct muser_transport *muser_transport;
 	struct muser_qpair *qp, *tmp_qp;
 	struct muser_endpoint *muser_ep;
-	struct muser_ctrlr *ctrlr;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -2232,7 +2226,7 @@ muser_accept(struct spdk_nvmf_transport *transport)
 	}
 
 	TAILQ_FOREACH(muser_ep, &muser_transport->endpoints, link) {
-		if (muser_ep->initialized) {
+		if (muser_ep->ctrlr != NULL) {
 			continue;
 		}
 
@@ -2245,15 +2239,8 @@ muser_accept(struct spdk_nvmf_transport *transport)
 			return -EFAULT;
 		}
 
-		ctrlr = muser_ep->ctrlr;
-
-		err = pthread_create(&ctrlr->lm_thr, NULL, drive, muser_ep->lm_ctx);
-		if (err != 0) {
-			SPDK_ERRLOG("%s: failed to create lm_drive thread: %s\n",
-				    muser_ep->trid.traddr, strerror(err));
-			return -EFAULT;
-		}
-		muser_ep->initialized = true;
+		/* Construct a controller */
+		muser_create_ctrlr(muser_transport, muser_ep);
 	}
 
 	TAILQ_FOREACH_SAFE(qp, &muser_transport->new_qps, link, tmp_qp) {
