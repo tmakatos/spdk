@@ -71,13 +71,6 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define PAGE_MASK (~(PAGE_SIZE-1))
 #define PAGE_ALIGN(x) ((x + PAGE_SIZE - 1) & PAGE_MASK)
 
-/*
- * Define TRAP_DOORBELLS to disable memory mapping the doorbells and trap instead.
- * This will incur significant performance penalty and is intended for debug
- * purposes.
- */
-//#define TRAP_DOORBELLS
-
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define MUSER_DEFAULT_AQ_DEPTH 32
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
@@ -333,11 +326,7 @@ muser_destroy_endpoint(struct muser_endpoint *muser_ep)
 	assert(muser_ep->ctrlr == NULL);
 
 	if (muser_ep->doorbells) {
-#ifdef TRAP_DOORBELLS
-		free(muser_ep->doorbells);
-#else
 		munmap((void *)muser_ep->doorbells, MUSER_DOORBELLS_SIZE);
-#endif
 	}
 
 	if (muser_ep->fd > 0) {
@@ -1633,7 +1622,6 @@ pxcap_access(void *pvt, const uint8_t id, char *const buf, size_t count,
 	return count;
 }
 
-#ifndef TRAP_DOORBELLS
 static unsigned long
 bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 {
@@ -1667,7 +1655,6 @@ out:
 
 	return (unsigned long)ctrlr->endpoint->fd;
 }
-#endif
 
 static void
 muser_log(void *pvt, lm_log_lvl_t lvl, char const *msg)
@@ -1747,7 +1734,6 @@ muser_dev_info_fill(lm_dev_info_t *dev_info)
 	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
 
 	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
-#ifndef TRAP_DOORBELLS
 	reg_info[LM_DEV_BAR0_REG_IDX].flags |= LM_REG_FLAG_MMAP;
 	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
 	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(
@@ -1756,7 +1742,6 @@ muser_dev_info_fill(lm_dev_info_t *dev_info)
 	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
 	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(
 				MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
-#endif
 	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
 	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar0_fn;
 
@@ -2068,13 +2053,6 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
-#ifdef TRAP_DOORBELLS
-	muser_ep->doorbells = calloc(1, MUSER_DOORBELLS_SIZE);
-	if (muser_ep->doorbells == NULL) {
-		err = -ENOMEM;
-		goto out;
-	}
-#else
 	muser_ep->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
 				   PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
 	if (muser_ep->doorbells == MAP_FAILED) {
@@ -2082,7 +2060,6 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		err = -errno;
 		goto out;
 	}
-#endif
 
 	muser_ep->fd = fd;
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n", muser_ep->trid.traddr,
