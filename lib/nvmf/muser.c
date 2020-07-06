@@ -1000,9 +1000,9 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	memset(io_q.addr, 0, io_q.size * entry_size);
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n",
-		       ctrlr->id, is_cq ? 'C' : 'S',
-		       cmd->cdw10_bits.create_io_q.qid, cmd->dptr.prp.prp1,
-		       (unsigned long long)io_q.addr);
+		      ctrlr->id, is_cq ? 'C' : 'S',
+		      cmd->cdw10_bits.create_io_q.qid, cmd->dptr.prp.prp1,
+		      (unsigned long long)io_q.addr);
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
@@ -1603,32 +1603,6 @@ out:
 #endif
 
 static void
-nvme_reg_info_fill(lm_reg_info_t *reg_info)
-{
-	assert(reg_info != NULL);
-
-	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
-
-	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
-#ifndef TRAP_DOORBELLS
-	reg_info[LM_DEV_BAR0_REG_IDX].flags |= LM_REG_FLAG_MMAP;
-	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
-#endif
-	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
-	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar0_fn;
-
-	reg_info[LM_DEV_BAR4_REG_IDX].flags = LM_REG_FLAG_RW;
-	reg_info[LM_DEV_BAR4_REG_IDX].size  = PAGE_SIZE;
-
-	reg_info[LM_DEV_BAR5_REG_IDX].flags = LM_REG_FLAG_RW;
-	reg_info[LM_DEV_BAR5_REG_IDX].size  = PAGE_SIZE;
-
-	reg_info[LM_DEV_CFG_REG_IDX].flags = LM_REG_FLAG_RW;
-	reg_info[LM_DEV_CFG_REG_IDX].size  = NVME_REG_CFG_SIZE;
-	reg_info[LM_DEV_CFG_REG_IDX].fn  = access_pci_config;
-}
-
-static void
 muser_log(void *pvt, lm_log_lvl_t lvl, char const *msg)
 {
 	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
@@ -1644,7 +1618,7 @@ muser_log(void *pvt, lm_log_lvl_t lvl, char const *msg)
 }
 
 static void
-nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
+muser_dev_info_fill(lm_dev_info_t *dev_info)
 {
 	static const lm_cap_t pm = {.id = PCI_CAP_ID_PM,
 				    .size = sizeof(struct pmcap),
@@ -1659,12 +1633,12 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 				      .fn = msixcap_access
 				     };
 
+	lm_reg_info_t *reg_info;
+
 	assert(dev_info != NULL);
-	assert(muser_ctrlr != NULL);
 
-	dev_info->pvt = muser_ctrlr;
-
-	dev_info->uuid = muser_ctrlr->uuid;
+	dev_info->trans = LM_TRANS_SOCK;
+	dev_info->flags |= LM_FLAG_ATTACH_NB;
 
 	dev_info->pci_info.id.vid = 0x4e58;     /* TODO: LE ? */
 	dev_info->pci_info.id.did = 0x0001;
@@ -1689,8 +1663,6 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 
 	dev_info->extended = true;
 
-	nvme_reg_info_fill(dev_info->pci_info.reg_info);
-
 	dev_info->log = muser_log;
 
 	if (spdk_log_get_print_level() >= SPDK_LOG_DEBUG) {
@@ -1700,6 +1672,33 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 	} else {
 		dev_info->log_lvl = LM_ERR;
 	}
+
+	reg_info = dev_info->pci_info.reg_info;
+	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
+
+	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
+#ifndef TRAP_DOORBELLS
+	reg_info[LM_DEV_BAR0_REG_IDX].flags |= LM_REG_FLAG_MMAP;
+	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
+	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(
+				struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
+	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
+	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
+	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(
+				MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
+#endif
+	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
+	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar0_fn;
+
+	reg_info[LM_DEV_BAR4_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_BAR4_REG_IDX].size  = PAGE_SIZE;
+
+	reg_info[LM_DEV_BAR5_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_BAR5_REG_IDX].size  = PAGE_SIZE;
+
+	reg_info[LM_DEV_CFG_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_CFG_REG_IDX].size  = NVME_REG_CFG_SIZE;
+	reg_info[LM_DEV_CFG_REG_IDX].fn  = access_pci_config;
 }
 
 /*
@@ -1816,24 +1815,9 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 {
 	lm_dev_info_t dev_info = { 0 };
 
-	dev_info.trans = LM_TRANS_SOCK;
-
-	/* LM setup */
-	nvme_dev_info_fill(&dev_info, ctrlr);
-
-#ifdef TRAP_DOORBELLS
-	ctrlr->doorbells = calloc(1, MUSER_DOORBELLS_SIZE);
-	if (ctrlr->doorbells == NULL) {
-		return -ENOMEM;
-	}
-#else
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(
-				struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(
-				MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
-#endif
+	dev_info.pvt = ctrlr;
+	dev_info.uuid = ctrlr->uuid;
+	muser_dev_info_fill(&dev_info);
 
 	/* PM */
 	ctrlr->pmcap.pmcs.nsfrst = 0x1;
@@ -1857,8 +1841,6 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 	ctrlr->pxcap.pxdcap.flrc = 0x1;
 	ctrlr->pxcap.pxdcap2.ctds = 0x1;
 	/* FIXME check PXCAPS.DPT */
-
-	dev_info.flags |= LM_FLAG_ATTACH_NB;
 
 	ctrlr->lm_ctx = lm_ctx_create(&dev_info);
 	if (ctrlr->lm_ctx == NULL) {
@@ -1985,6 +1967,14 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 	if (err != 0) {
 		goto out;
 	}
+
+#ifdef TRAP_DOORBELLS
+	muser_ctrlr->doorbells = calloc(1, MUSER_DOORBELLS_SIZE);
+	if (ctrlr->doorbells == NULL) {
+		err = -ENOMEM;
+		goto out;
+	}
+#else
 	muser_ctrlr->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
 				      PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
 	if (muser_ctrlr->doorbells == MAP_FAILED) {
@@ -1992,6 +1982,7 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 		err = -errno;
 		goto out;
 	}
+#endif
 
 	muser_ctrlr->fd = fd;
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n", muser_ctrlr->id,
