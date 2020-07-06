@@ -1872,12 +1872,73 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 	return 0;
 }
 
-static struct muser_ctrlr *
+static void
+_muser_notify_new_admin_qpair(void *ctx)
+{
+	struct muser_qpair *mqpair;
+	struct spdk_nvmf_qpair *qpair;
+	struct muser_ctrlr *mctrlr;
+
+	mctrlr = ctx;
+	assert(mctrlr != NULL);
+
+	mqpair = mctrlr->qp[0];
+	assert(mqpair != NULL);
+	qpair = &mqpair->qpair;
+
+	/* We're ready to show this new qpair to the upper layer. Remove it from
+	 * our internal poll group. Currently there's no API to do that.
+	 * TODO: Add an API. */
+	assert(TAILQ_EMPTY(&qpair->outstanding));
+	mctrlr->cntlid = qpair->ctrlr->cntlid;
+
+	/* destroy the internal poll group created in muser_listen */
+	spdk_nvmf_poll_group_remove(qpair);
+	spdk_nvmf_poll_group_destroy(qpair->group, NULL, NULL);
+	/* Queue the admin queue up so that it gets discovered and assigned to
+	 * a poll group.
+	 */
+	pthread_mutex_lock(&mctrlr->transport->lock);
+	TAILQ_INSERT_TAIL(&mctrlr->transport->new_qps, mqpair, link);
+	pthread_mutex_unlock(&mctrlr->transport->lock);
+}
+
+static int
+_muser_handle_admin_connect_rsp(struct muser_req *req, void *cb_arg)
+{
+	struct muser_ctrlr *mctrlr;
+
+	mctrlr = cb_arg;
+	assert(mctrlr != NULL);
+
+	free(req->req.data);
+
+	if (spdk_nvme_cpl_is_error(&req->req.rsp->nvme_cpl)) {
+		mctrlr->cb_fn(mctrlr->cb_arg, -1);
+		return -1;
+	}
+
+	mctrlr->cb_fn(mctrlr->cb_arg, 0);
+
+	/* Send a message to ourself to allow the request handling stack
+	 * to unwind before continuing. */
+	spdk_thread_send_msg(spdk_get_thread(), _muser_notify_new_admin_qpair, mctrlr);
+
+	return 0;
+}
+
+static void
 muser_create_ctrlr(struct muser_transport *muser_transport,
-		   struct muser_endpoint *muser_ep)
+		   struct muser_endpoint *muser_ep,
+		   spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn,
+		   void *cb_arg)
 {
 	struct muser_ctrlr *muser_ctrlr;
 	struct spdk_nvmf_poll_group *pg;
+	struct muser_qpair *muser_qpair;
+	struct muser_req *muser_req;
+	struct spdk_nvmf_request *req;
+	struct spdk_nvmf_fabric_connect_data *data;
 	int err;
 
 	/* First, construct a muser controller */
@@ -1942,6 +2003,43 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 	/* Add this qpair to our internal poll group, just so that it has one assigned. */
 	spdk_nvmf_poll_group_add(pg, &muser_ctrlr->qp[0]->qpair);
 
+	muser_ctrlr->cb_fn = cb_fn;
+	muser_ctrlr->cb_arg = cb_arg;
+
+	/* Send a fabric connect */
+	muser_qpair = muser_ctrlr->qp[0];
+
+	muser_req = get_muser_req(muser_qpair);
+	if (muser_req == NULL) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	req = &muser_req->req;
+	req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
+	req->cmd->connect_cmd.cid = 0;
+	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
+	req->cmd->connect_cmd.recfmt = 0;
+	req->cmd->connect_cmd.sqsize = muser_qpair->qsize - 1;
+	req->cmd->connect_cmd.qid = 0;
+
+	req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
+	req->data = calloc(1, req->length);
+	if (req->data == NULL) {
+		muser_req_free(req);
+		err = -ENOMEM;
+		goto out;
+	}
+
+	data = (struct spdk_nvmf_fabric_connect_data *)req->data;
+	data->cntlid = 0xFFFF;
+	snprintf(data->subnqn, sizeof(data->subnqn), "%s", muser_ep->trid.subnqn);
+
+	muser_req->cb_fn = _muser_handle_admin_connect_rsp;
+	muser_req->cb_arg = muser_ctrlr;
+
+	err = spdk_nvmf_ctrlr_connect(req);
+
 out:
 	if (err != 0) {
 		/*
@@ -1954,10 +2052,8 @@ out:
 			SPDK_ERRLOG("%s: failed to clean up\n", muser_ep->trid.traddr);
 		}
 
-		muser_ctrlr = NULL;
+		cb_fn(cb_arg, err);
 	}
-
-	return muser_ctrlr;
 }
 
 static int
@@ -2084,61 +2180,6 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 }
 
 static void
-_muser_notify_new_admin_qpair(void *ctx)
-{
-	struct muser_qpair *mqpair;
-	struct spdk_nvmf_qpair *qpair;
-	struct muser_ctrlr *mctrlr;
-
-	mctrlr = ctx;
-	assert(mctrlr != NULL);
-
-	mqpair = mctrlr->qp[0];
-	assert(mqpair != NULL);
-	qpair = &mqpair->qpair;
-
-	/* We're ready to show this new qpair to the upper layer. Remove it from
-	 * our internal poll group. Currently there's no API to do that.
-	 * TODO: Add an API. */
-	assert(TAILQ_EMPTY(&qpair->outstanding));
-	mctrlr->cntlid = qpair->ctrlr->cntlid;
-
-	/* destroy the internal poll group created in muser_listen */
-	spdk_nvmf_poll_group_remove(qpair);
-	spdk_nvmf_poll_group_destroy(qpair->group, NULL, NULL);
-	/* Queue the admin queue up so that it gets discovered and assigned to
-	 * a poll group.
-	 */
-	pthread_mutex_lock(&mctrlr->transport->lock);
-	TAILQ_INSERT_TAIL(&mctrlr->transport->new_qps, mqpair, link);
-	pthread_mutex_unlock(&mctrlr->transport->lock);
-}
-
-static int
-_muser_handle_admin_connect_rsp(struct muser_req *req, void *cb_arg)
-{
-	struct muser_ctrlr *mctrlr;
-
-	mctrlr = cb_arg;
-	assert(mctrlr != NULL);
-
-	free(req->req.data);
-
-	if (spdk_nvme_cpl_is_error(&req->req.rsp->nvme_cpl)) {
-		mctrlr->cb_fn(mctrlr->cb_arg, -1);
-		return -1;
-	}
-
-	mctrlr->cb_fn(mctrlr->cb_arg, 0);
-
-	/* Send a message to ourself to allow the request handling stack
-	 * to unwind before continuing. */
-	spdk_thread_send_msg(spdk_get_thread(), _muser_notify_new_admin_qpair, mctrlr);
-
-	return 0;
-}
-
-static void
 muser_listen_associate(struct spdk_nvmf_transport *transport,
 		       const struct spdk_nvmf_subsystem *subsystem,
 		       const struct spdk_nvme_transport_id *trid,
@@ -2146,12 +2187,7 @@ muser_listen_associate(struct spdk_nvmf_transport *transport,
 		       void *cb_arg)
 {
 	struct muser_transport *mtransport;
-	struct muser_qpair *muser_qpair;
-	struct muser_req *muser_req;
 	struct muser_endpoint *muser_ep;
-	struct muser_ctrlr *muser_ctrlr;
-	struct spdk_nvmf_request *req;
-	struct spdk_nvmf_fabric_connect_data *data;
 
 	mtransport = SPDK_CONTAINEROF(transport, struct muser_transport, transport);
 
@@ -2169,44 +2205,7 @@ muser_listen_associate(struct spdk_nvmf_transport *transport,
 	muser_ep->subsystem = subsystem;
 
 	/* Construct a controller */
-	muser_ctrlr = muser_create_ctrlr(mtransport, muser_ep);
-
-	muser_ctrlr->cb_fn = cb_fn;
-	muser_ctrlr->cb_arg = cb_arg;
-
-	/* Send a fabric connect */
-	muser_qpair = muser_ctrlr->qp[0];
-
-	muser_req = get_muser_req(muser_qpair);
-	if (muser_req == NULL) {
-		cb_fn(cb_arg, -ENOMEM);
-		return;
-	}
-
-	req = &muser_req->req;
-	req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
-	req->cmd->connect_cmd.cid = 0;
-	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
-	req->cmd->connect_cmd.recfmt = 0;
-	req->cmd->connect_cmd.sqsize = muser_qpair->qsize - 1;
-	req->cmd->connect_cmd.qid = 0;
-
-	req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
-	req->data = calloc(1, req->length);
-	if (req->data == NULL) {
-		muser_req_free(req);
-		cb_fn(cb_arg, -ENOMEM);
-		return;
-	}
-
-	data = (struct spdk_nvmf_fabric_connect_data *)req->data;
-	data->cntlid = 0xFFFF;
-	snprintf(data->subnqn, sizeof(data->subnqn), "%s", spdk_nvmf_subsystem_get_nqn(subsystem));
-
-	muser_req->cb_fn = _muser_handle_admin_connect_rsp;
-	muser_req->cb_arg = muser_ctrlr;
-
-	spdk_nvmf_ctrlr_connect(req);
+	muser_create_ctrlr(mtransport, muser_ep, cb_fn, cb_arg);
 }
 
 /*
