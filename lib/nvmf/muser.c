@@ -196,7 +196,7 @@ struct muser_poll_group {
 };
 
 struct muser_ctrlr {
-	struct spdk_nvme_transport_id		trid;
+	struct muser_endpoint			*endpoint;
 	struct muser_transport			*transport;
 	char					uuid[SPDK_NVME_NQN_FIELD_SIZE];
 	char					*id;
@@ -235,14 +235,28 @@ struct muser_ctrlr {
 	uint32_t				cfs : 1;
 
 	/* for LM_TRAS_SOCK */
-	int					fd;
 	bool					initialized;
+};
+
+struct muser_endpoint {
+	lm_ctx_t				*lm_ctx;
+	int					fd;
+	volatile uint32_t			*doorbells;
+
+	struct spdk_nvme_transport_id		trid;
+
+	/* The current controller. NULL if nothing is
+	 * currently attached. */
+	struct muser_ctrlr			*ctrlr;
+
+	TAILQ_ENTRY(muser_endpoint)		link;
 };
 
 struct muser_transport {
 	struct spdk_nvmf_transport		transport;
 	pthread_mutex_t				lock;
 	TAILQ_HEAD(, muser_ctrlr)		ctrlrs;
+	TAILQ_HEAD(, muser_endpoint)		endpoints;
 
 	TAILQ_HEAD(, muser_qpair)		new_qps;
 };
@@ -313,11 +327,34 @@ ctrlr_interrupt_enabled(struct muser_ctrlr *ctrlr)
 	return (!pci->hdr.cmd.id || ctrlr->msixcap.mxc.mxe);
 }
 
+static void
+muser_destroy_endpoint(struct muser_endpoint *muser_ep)
+{
+	assert(muser_ep->ctrlr == NULL);
+
+	if (muser_ep->doorbells) {
+#ifdef TRAP_DOORBELLS
+		free(muser_ep->doorbells);
+#else
+		munmap((void *)muser_ep->doorbells, MUSER_DOORBELLS_SIZE);
+#endif
+	}
+
+	if (muser_ep->fd > 0) {
+		close(muser_ep->fd);
+	}
+
+	lm_ctx_destroy(muser_ep->lm_ctx);
+
+	free(muser_ep);
+}
+
 /* called when process exits */
 static int
 muser_destroy(struct spdk_nvmf_transport *transport)
 {
 	struct muser_transport *muser_transport;
+	struct muser_endpoint *muser_ep, *tmp;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "destroy transport\n");
 
@@ -325,6 +362,19 @@ muser_destroy(struct spdk_nvmf_transport *transport)
 					   transport);
 
 	(void)pthread_mutex_destroy(&muser_transport->lock);
+
+	TAILQ_FOREACH_SAFE(muser_ep, &muser_transport->endpoints, link, tmp) {
+		TAILQ_REMOVE(&muser_transport->endpoints, muser_ep, link);
+		if (muser_ep->doorbells) {
+			munmap((void *)muser_ep->doorbells, MUSER_DOORBELLS_SIZE);
+		}
+
+		if (muser_ep->fd != -1) {
+			close(muser_ep->fd);
+		}
+
+		free(muser_ep);
+	}
 
 	free(muser_transport);
 
@@ -349,6 +399,7 @@ muser_create(struct spdk_nvmf_transport_opts *opts)
 		goto err;
 	}
 
+	TAILQ_INIT(&muser_transport->endpoints);
 	TAILQ_INIT(&muser_transport->ctrlrs);
 	TAILQ_INIT(&muser_transport->new_qps);
 
@@ -412,7 +463,7 @@ map_one(void *prv, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 	struct iovec tmp_iov;
 
 	/*
-	 * TODO struct muser_ctrlr* == ctx->pvt, but lm_ctx_t is opaque, need
+	 * TODO struct muser_ep* == ctx->pvt, but lm_ctx_t is opaque, need
 	 * a function to return pvt from lm_ctx_t.
 	 */
 
@@ -1262,8 +1313,11 @@ static ssize_t
 access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 	       bool is_write)
 {
-	struct muser_ctrlr *ctrlr = pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
 	int ret;
+
+	ctrlr = muser_ep->ctrlr;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
 		      "%s: bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
@@ -1302,7 +1356,10 @@ static ssize_t
 access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 		  const bool is_write)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+
+	ctrlr = muser_ep->ctrlr;
 
 	if (is_write) {
 		fprintf(stderr, "writes not supported\n");
@@ -1374,7 +1431,10 @@ static ssize_t
 pmcap_access(void *pvt, const uint8_t id, char *const buf, const size_t count,
 	     const loff_t offset, const bool is_write)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+
+	ctrlr = muser_ep->ctrlr;
 
 	if (is_write) {
 		return handle_pmcap_write(ctrlr, buf, count, offset);
@@ -1435,7 +1495,10 @@ static ssize_t
 msixcap_access(void *pvt, const uint8_t id, char *const buf, size_t count,
 	       loff_t offset, const bool is_write)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+
+	ctrlr = muser_ep->ctrlr;
 
 	if (is_write) {
 		return handle_msix_write(ctrlr, buf, count, offset);
@@ -1556,7 +1619,10 @@ static ssize_t
 pxcap_access(void *pvt, const uint8_t id, char *const buf, size_t count,
 	     loff_t offset, const bool is_write)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+
+	ctrlr = muser_ep->ctrlr;
 
 	if (is_write) {
 		return handle_pxcap_write(ctrlr, buf, count, offset);
@@ -1571,9 +1637,10 @@ pxcap_access(void *pvt, const uint8_t id, char *const buf, size_t count,
 static unsigned long
 bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 {
+	struct muser_endpoint *muser_ep = pvt;
 	struct muser_ctrlr *ctrlr;
 
-	ctrlr = pvt;
+	ctrlr = muser_ep->ctrlr;
 
 	assert(ctrlr != NULL);
 
@@ -1598,14 +1665,17 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 	}
 out:
 
-	return (unsigned long)ctrlr->fd;
+	return (unsigned long)ctrlr->endpoint->fd;
 }
 #endif
 
 static void
 muser_log(void *pvt, lm_log_lvl_t lvl, char const *msg)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+
+	ctrlr = muser_ep->ctrlr;
 	assert(ctrlr != NULL);
 
 	if (lvl >= LM_DBG) {
@@ -1713,7 +1783,7 @@ drive(void *arg)
 	assert(arg != NULL);
 
 	/*
-	 * TODO need accesor for lm_ctx_t.pvt == struct muser_ctrlr*
+	 * TODO need accesor for lm_ctx_t.pvt == struct muser_endpoint*
 	 * so that we can include the ID when printing
 	 */
 
@@ -1805,8 +1875,7 @@ destroy_pci_dev(struct muser_ctrlr *ctrlr)
 			return -err;
 		}
 	}
-	lm_ctx_destroy(ctrlr->lm_ctx);
-	ctrlr->lm_ctx = NULL;
+
 	return 0;
 }
 
@@ -1825,19 +1894,9 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 			    ctrlr->id, strerror(-err));
 		return err;
 	}
-	if (ctrlr->doorbells != NULL) { /* TODO does it work if it's NULL? */
-#ifdef TRAP_DOORBELLS
-		free(ctrlr->doorbells);
-#else
 
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: unmap doorbells %p\n",
-			      ctrlr->id, ctrlr->doorbells);
-		if (munmap((void *)ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
-			/* TODO shall return the error */
-			SPDK_ERRLOG("%s: failed to unmap doorbells: %m\n",
-				    ctrlr->id);
-		}
-#endif
+	if (ctrlr->endpoint) {
+		ctrlr->endpoint->ctrlr = NULL;
 	}
 
 	free(ctrlr);
@@ -1868,13 +1927,10 @@ muser_ctrlr_id(const char *s)
 
 static int
 muser_create_ctrlr(struct muser_transport *muser_transport,
-		   const struct spdk_nvme_transport_id *trid)
+		   struct muser_endpoint *muser_ep)
 {
 	struct muser_ctrlr *muser_ctrlr;
 	struct spdk_nvmf_poll_group *pg;
-	lm_dev_info_t dev_info = { 0 };
-	char *path;
-	int fd;
 	int err;
 
 	/* First, construct a muser controller */
@@ -1885,67 +1941,24 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 	}
 	muser_ctrlr->cntlid = 0xffff;
 	muser_ctrlr->transport = muser_transport;
-	memcpy(muser_ctrlr->uuid, trid->traddr, sizeof(muser_ctrlr->uuid));
+	memcpy(muser_ctrlr->uuid, muser_ep->trid.traddr, sizeof(muser_ctrlr->uuid));
 	muser_ctrlr->id = (char *)muser_ctrlr_id(muser_ctrlr->uuid);
-
-	memcpy(&muser_ctrlr->trid, trid, sizeof(muser_ctrlr->trid));
 
 	muser_ctrlr->prop_req.muser_req.req.rsp = (union nvmf_c2h_msg *)
 			&muser_ctrlr->prop_req.muser_req.rsp;
 	muser_ctrlr->prop_req.muser_req.req.cmd = (union nvmf_h2c_msg *)
 			&muser_ctrlr->prop_req.muser_req.cmd;
-	muser_ctrlr->fd = -1;
 
 	err = sem_init(&muser_ctrlr->sem, 0, 0);
 	if (err != 0) {
 		goto out;
 	}
 
-	/*
-	 * TODO create directory /dev/shm/muser and create device mem files in
-	 * there
-	 */
-	err = asprintf(&path, "%s/bar0", muser_ctrlr->uuid);
-	if (err == -1) {
-		goto out;
-	}
+	muser_ctrlr->endpoint = muser_ep;
+	muser_ctrlr->lm_ctx = muser_ep->lm_ctx;
+	muser_ctrlr->doorbells = muser_ep->doorbells;
 
-	fd = open(path, O_RDWR | O_CREAT);
-	if (fd == -1) {
-		SPDK_ERRLOG("%s: failed to open device memory at %s: %m\n",
-			    muser_ctrlr->id, path);
-		err = fd;
-		goto out;
-	}
-
-	err = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
-	if (err != 0) {
-		goto out;
-	}
-
-#ifdef TRAP_DOORBELLS
-	muser_ctrlr->doorbells = calloc(1, MUSER_DOORBELLS_SIZE);
-	if (ctrlr->doorbells == NULL) {
-		err = -ENOMEM;
-		goto out;
-	}
-#else
-	muser_ctrlr->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
-				      PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
-	if (muser_ctrlr->doorbells == MAP_FAILED) {
-		muser_ctrlr->doorbells = NULL;
-		err = -errno;
-		goto out;
-	}
-#endif
-
-	muser_ctrlr->fd = fd;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n", muser_ctrlr->id,
-		      muser_ctrlr->doorbells);
-
-	dev_info.pvt = muser_ctrlr;
-	dev_info.uuid = muser_ctrlr->uuid;
-	muser_dev_info_fill(&dev_info);
+	muser_ep->ctrlr = muser_ctrlr;
 
 	/* PM */
 	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
@@ -1970,15 +1983,6 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 	muser_ctrlr->pxcap.pxdcap2.ctds = 0x1;
 	/* FIXME check PXCAPS.DPT */
 
-	muser_ctrlr->lm_ctx = lm_ctx_create(&dev_info);
-	if (muser_ctrlr->lm_ctx == NULL) {
-		/* TODO: lm_create doesn't set errno */
-		SPDK_ERRLOG("%s: error creating libmuser context: %m\n",
-			    muser_ctrlr->id);
-		err = -1;
-		goto out;
-	}
-
 	muser_ctrlr->pci_config_space = lm_get_pci_config_space(muser_ctrlr->lm_ctx);
 	init_pci_config_space(muser_ctrlr->pci_config_space);
 
@@ -1999,23 +2003,17 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 
 out:
 	if (err != 0) {
-		if (fd != -1) {
-			close(fd);
-		}
-		unlink(path); /* FIXME check return value */
-
 		/*
 		 * TODO this prints the whole path instead of
 		 * <domain UUID>/<IOMMU group>, fix.
 		 */
 		SPDK_ERRLOG("%s: failed to create MUSER controller: %s\n",
-			    trid->traddr, strerror(-err));
+			    muser_ep->trid.traddr, strerror(-err));
 		if (destroy_ctrlr(muser_ctrlr) != 0) {
-			SPDK_ERRLOG("%s: failed to clean up\n", trid->traddr);
+			SPDK_ERRLOG("%s: failed to clean up\n", muser_ep->trid.traddr);
 		}
 	}
 
-	free(path);
 	return err;
 }
 
@@ -2023,13 +2021,92 @@ static int
 muser_listen(struct spdk_nvmf_transport *transport,
 	     const struct spdk_nvme_transport_id *trid)
 {
-	struct muser_transport *muser_transport = NULL;
+	struct muser_transport *muser_transport;
+	struct muser_endpoint *muser_ep, *tmp;
+	char *path = NULL;
+	int fd;
+	int err;
+	lm_dev_info_t dev_info = { 0 };
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
 
+	TAILQ_FOREACH_SAFE(muser_ep, &muser_transport->endpoints, link, tmp) {
+		/* Only compare traddr */
+		if (strncmp(muser_ep->trid.traddr, trid->traddr, sizeof(muser_ep->trid.traddr)) == 0) {
+			return -EEXIST;
+		}
+	}
 
-	return muser_create_ctrlr(muser_transport, trid);
+	muser_ep = calloc(1, sizeof(*muser_ep));
+	if (!muser_ep) {
+		return -ENOMEM;
+	}
+
+	muser_ep->fd = -1;
+	memcpy(&muser_ep->trid, trid, sizeof(muser_ep->trid));
+
+	err = asprintf(&path, "%s/bar0", muser_ep->trid.traddr);
+	if (err == -1) {
+		goto out;
+	}
+
+	fd = open(path, O_RDWR | O_CREAT);
+	if (fd == -1) {
+		SPDK_ERRLOG("%s: failed to open device memory at %s: %m\n",
+			    muser_ep->trid.traddr, path);
+		err = fd;
+		goto out;
+	}
+
+	err = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
+	if (err != 0) {
+		goto out;
+	}
+
+#ifdef TRAP_DOORBELLS
+	muser_ep->doorbells = calloc(1, MUSER_DOORBELLS_SIZE);
+	if (muser_ep->doorbells == NULL) {
+		err = -ENOMEM;
+		goto out;
+	}
+#else
+	muser_ep->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
+				   PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
+	if (muser_ep->doorbells == MAP_FAILED) {
+		muser_ep->doorbells = NULL;
+		err = -errno;
+		goto out;
+	}
+#endif
+
+	muser_ep->fd = fd;
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n", muser_ep->trid.traddr,
+		      muser_ep->doorbells);
+
+	dev_info.pvt = muser_ep;
+	dev_info.uuid = muser_ep->trid.traddr;
+	muser_dev_info_fill(&dev_info);
+
+	muser_ep->lm_ctx = lm_ctx_create(&dev_info);
+	if (muser_ep->lm_ctx == NULL) {
+		/* TODO: lm_create doesn't set errno */
+		SPDK_ERRLOG("%s: error creating libmuser context: %m\n",
+			    muser_ep->trid.traddr);
+		err = -1;
+		goto out;
+	}
+
+	TAILQ_INSERT_TAIL(&muser_transport->endpoints, muser_ep, link);
+
+out:
+	if (err != 0) {
+		muser_destroy_endpoint(muser_ep);
+	}
+
+	free(path);
+
+	return muser_create_ctrlr(muser_transport, muser_ep);
 }
 
 static void
@@ -2037,8 +2114,9 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 		  const struct spdk_nvme_transport_id *trid)
 {
 	struct muser_transport *muser_transport;
-	struct muser_ctrlr *ctrlr, *tmp;
+	struct muser_endpoint *muser_ep, *mtmp;
 	char *id;
+	int err;
 
 	assert(trid != NULL);
 	assert(trid->traddr != NULL);
@@ -2052,21 +2130,25 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 
 	/* FIXME should acquire lock */
 
-	TAILQ_FOREACH_SAFE(ctrlr, &muser_transport->ctrlrs, link, tmp) {
-		if (strcmp(trid->traddr, ctrlr->trid.traddr) == 0) {
-			int err;
-			TAILQ_REMOVE(&muser_transport->ctrlrs, ctrlr, link);
-			err = destroy_ctrlr(ctrlr);
-			if (err != 0) {
-				SPDK_ERRLOG("%s: failed destroy controller: %s\n",
-					    ctrlr->id, strerror(-err));
+	TAILQ_FOREACH_SAFE(muser_ep, &muser_transport->endpoints, link, mtmp) {
+		if (strcmp(trid->traddr, muser_ep->trid.traddr) == 0) {
+			TAILQ_REMOVE(&muser_transport->endpoints, muser_ep, link);
+			if (muser_ep->ctrlr) {
+				TAILQ_REMOVE(&muser_transport->ctrlrs, muser_ep->ctrlr, link);
+				err = destroy_ctrlr(muser_ep->ctrlr);
+				if (err != 0) {
+					SPDK_ERRLOG("%s: failed destroy controller: %s\n",
+						    muser_ep->ctrlr->id, strerror(-err));
+				}
+				muser_ep->ctrlr = NULL;
 			}
-			return;
+			muser_destroy_endpoint(muser_ep);
 		}
 	}
 
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: not found\n", id);
-	return;
+	if (muser_ep == NULL) {
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: not found\n", id);
+	}
 }
 
 static void
@@ -2873,7 +2955,7 @@ muser_qpair_get_local_trid(struct spdk_nvmf_qpair *qpair,
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	muser_ctrlr = muser_qpair->ctrlr;
 
-	memcpy(trid, &muser_ctrlr->trid, sizeof(*trid));
+	memcpy(trid, &muser_ctrlr->endpoint->trid, sizeof(*trid));
 	return 0;
 }
 
@@ -2894,7 +2976,7 @@ muser_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	muser_ctrlr = muser_qpair->ctrlr;
 
-	memcpy(trid, &muser_ctrlr->trid, sizeof(*trid));
+	memcpy(trid, &muser_ctrlr->endpoint->trid, sizeof(*trid));
 	return 0;
 }
 
