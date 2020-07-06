@@ -161,7 +161,6 @@ struct io_q {
 	 * there.
 	 */
 	uint32_t size;
-	uint64_t prp1;
 
 	union {
 		struct {
@@ -801,6 +800,34 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	return 0;
 }
 
+static struct io_q *
+lookup_io_q(struct muser_ctrlr *ctrlr, const uint16_t qid, const bool is_cq)
+{
+	struct io_q *q;
+
+	assert(ctrlr != NULL);
+
+	if (qid > MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
+		return NULL;
+	}
+
+	if (ctrlr->qp[qid] == NULL) {
+		return NULL;
+	}
+
+	if (is_cq) {
+		q = &ctrlr->qp[qid]->cq;
+	} else {
+		q = &ctrlr->qp[qid]->sq;
+	}
+
+	if (q->addr == NULL) {
+		return NULL;
+	}
+
+	return q;
+}
+
 static void
 destroy_io_q(lm_ctx_t *lm_ctx, struct io_q *q)
 {
@@ -958,7 +985,6 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	uint16_t sc = SPDK_NVME_SC_SUCCESS;
 	uint16_t sct = SPDK_NVME_SCT_GENERIC;
 	int err = 0;
-	void *q_addr;
 
 	/*
 	 * XXX don't call io_q_id on this. Maybe operate directly on the
@@ -983,6 +1009,15 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		goto out;
 	}
 
+	if (lookup_io_q(ctrlr, cmd->cdw10_bits.create_io_q.qid, is_cq)) {
+		SPDK_ERRLOG("%s: %cQ%d already exists\n", ctrlr->id,
+			    is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid);
+		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
+		goto out;
+	}
+
+	/* TODO break rest of this function into smaller functions */
 	if (is_cq) {
 		entry_size = sizeof(struct spdk_nvme_cpl);
 		if (cmd->cdw11_bits.create_io_cq.pc != 0x1) {
@@ -999,7 +1034,15 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		io_q.ien = cmd->cdw11_bits.create_io_cq.ien;
 		io_q.iv = cmd->cdw11_bits.create_io_cq.iv;
 	} else {
-		/* TODO: CQ must be created before SQ */
+		/* CQ must be created before SQ */
+		if (!lookup_io_q(ctrlr, cmd->cdw11_bits.create_io_sq.cqid, true)) {
+			SPDK_ERRLOG("%s: CQ%d does not exist\n", ctrlr->id,
+				    cmd->cdw11_bits.create_io_sq.cqid);
+			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			sc = SPDK_NVME_SC_COMPLETION_QUEUE_INVALID;
+			goto out;
+		}
+
 		entry_size = sizeof(struct spdk_nvme_cmd);
 		if (cmd->cdw11_bits.create_io_sq.pc != 0x1) {
 			SPDK_ERRLOG("%s: non-PC SQ not supported\n", ctrlr->id);
@@ -1021,22 +1064,18 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		goto out;
 	}
 
-	/* Do the memory length check for now, we will get the virtual
-	 * address of Submission/Completion queue in the polling thread.
-	 */
-	q_addr = map_one(ctrlr->lm_ctx, cmd->dptr.prp.prp1,
-			 io_q.size * entry_size, &io_q.sg, &io_q.iov);
-	if (q_addr == NULL) {
+	io_q.addr = map_one(ctrlr->lm_ctx, cmd->dptr.prp.prp1,
+			    io_q.size * entry_size, &io_q.sg, &io_q.iov);
+	if (io_q.addr == NULL) {
 		sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		SPDK_ERRLOG("%s: failed to map I/O queue: %m\n", ctrlr->id);
 		goto out;
 	}
-	io_q.prp1 = cmd->dptr.prp.prp1;
-	memset(q_addr, 0, io_q.size * entry_size);
+	memset(io_q.addr, 0, io_q.size * entry_size);
 
 	SPDK_NOTICELOG("%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n", ctrlr->id,
-	               is_cq ? 'C' : 'S', io_q.cqid, cmd->dptr.prp.prp1,
-	               (unsigned long long)io_q.addr);
+		       is_cq ? 'C' : 'S', io_q.cqid, cmd->dptr.prp.prp1,
+		       (unsigned long long)io_q.addr);
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
@@ -1067,6 +1106,14 @@ handle_del_io_q(struct muser_ctrlr *ctrlr,
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: delete I/O %cQ: QID=%d\n",
 		      ctrlr->id, is_cq ? 'C' : 'S',
 		      cmd->cdw10_bits.delete_io_q.qid);
+
+	if (lookup_io_q(ctrlr, cmd->cdw10_bits.delete_io_q.qid, is_cq) == NULL) {
+		SPDK_ERRLOG("%s: %cQ%d does not exist\n", ctrlr->id,
+			    is_cq ? 'C' : 'S', cmd->cdw10_bits.delete_io_q.qid);
+		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
+		goto out;
+	}
 
 	if (is_cq) {
 		/* SQ must have been deleted first */
@@ -1302,7 +1349,7 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 
 	if (pos >= DOORBELLS) {
 		ret = handle_dbl_access(ctrlr, (uint32_t *)buf, count,
-		                        pos, is_write);
+					pos, is_write);
 		if (ret == 0) {
 			return count;
 		}
@@ -1608,7 +1655,7 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 
 	if (off != DOORBELLS || len != MUSER_DOORBELLS_SIZE) {
 		SPDK_ERRLOG("%s: bad map region %#lx-%#lx\n", ctrlr->id, off,
-		            off + len);
+			    off + len);
 		errno = EINVAL;
 		return (unsigned long)MAP_FAILED;
 	}
@@ -2847,8 +2894,6 @@ muser_qpair_poll(struct muser_qpair *qpair)
 {
 	struct muser_ctrlr *ctrlr;
 	uint32_t new_tail;
-	struct io_q *sq = &qpair->sq;
-	struct io_q *cq = &qpair->cq;
 
 	assert(qpair != NULL);
 
@@ -2856,17 +2901,6 @@ muser_qpair_poll(struct muser_qpair *qpair)
 
 	new_tail = *tdbl(ctrlr, &qpair->sq);
 	if (sq_head(qpair) != new_tail) {
-
-		if (sq->addr == NULL) {
-			sq->addr = map_one(ctrlr->lm_ctx, sq->prp1, sq->size * 64, &sq->sg, &sq->iov);
-			assert(sq->addr);
-		}
-
-		if (cq->addr == NULL) {
-			cq->addr = map_one(ctrlr->lm_ctx, cq->prp1, cq->size * 16, &cq->sg, &cq->iov);
-			assert(cq->addr);
-		}
-
 		int err = handle_sq_tdbl_write(ctrlr, new_tail, qpair);
 		if (err != 0) {
 			fail_ctrlr(ctrlr);
