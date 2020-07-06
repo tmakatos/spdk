@@ -313,10 +313,6 @@ struct muser_transport {
 	pthread_mutex_t				lock;
 	TAILQ_HEAD(, muser_ctrlr)		ctrlrs;
 
-	/* A poll group where new qpairs exist prior to being
-	 * assigned to a "real" poll group. */
-	struct spdk_nvmf_poll_group		*pg;
-
 	TAILQ_HEAD(, muser_qpair)		new_qps;
 };
 
@@ -1046,6 +1042,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 			sc = SPDK_NVME_SC_COMPLETION_QUEUE_INVALID;
 			goto out;
 		}
+
 		entry_size = sizeof(struct spdk_nvme_cmd);
 		if (cmd->cdw11_bits.create_io_sq.pc != 0x1) {
 			SPDK_ERRLOG("%s: non-PC SQ not supported\n", ctrlr->id);
@@ -1066,6 +1063,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		sc = SPDK_NVME_SC_INVALID_QUEUE_SIZE;
 		goto out;
 	}
+
 	io_q.addr = map_one(ctrlr->lm_ctx, cmd->dptr.prp.prp1,
 			    io_q.size * entry_size, &io_q.sg, &io_q.iov);
 	if (io_q.addr == NULL) {
@@ -1076,7 +1074,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	memset(io_q.addr, 0, io_q.size * entry_size);
 
 	SPDK_NOTICELOG("%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n", ctrlr->id,
-	               is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid,
+		       is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid,
 		       cmd->dptr.prp.prp1, (unsigned long long)io_q.addr);
 
 	if (is_cq) {
@@ -1353,7 +1351,7 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 
 	if (pos >= DOORBELLS) {
 		ret = handle_dbl_access(ctrlr, (uint32_t *)buf, count,
-					 pos, is_write);
+					pos, is_write);
 		if (ret == 0) {
 			return count;
 		}
@@ -1659,7 +1657,7 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 
 	if (off != DOORBELLS || len != MUSER_DOORBELLS_SIZE) {
 		SPDK_ERRLOG("%s: bad map region %#lx-%#lx\n", ctrlr->id, off,
-		            off + len);
+			    off + len);
 		errno = EINVAL;
 		return (unsigned long)MAP_FAILED;
 	}
@@ -2060,6 +2058,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 {
 	struct muser_transport *muser_transport = NULL;
 	struct muser_ctrlr *muser_ctrlr = NULL;
+	struct spdk_nvmf_poll_group *pg;
 	int err;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
@@ -2115,11 +2114,10 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
-	assert(muser_transport->pg == NULL);
-		muser_transport->pg = spdk_nvmf_poll_group_create(muser_transport->transport.tgt);
-		assert(muser_transport->pg != NULL);
+	pg = spdk_nvmf_poll_group_create(muser_transport->transport.tgt);
+	assert(pg != NULL);
 	/* Add this qpair to our internal poll group, just so that it has one assigned. */
-	spdk_nvmf_poll_group_add(muser_transport->pg, &muser_ctrlr->qp[0]->qpair);
+	spdk_nvmf_poll_group_add(pg, &muser_ctrlr->qp[0]->qpair);
 
 	/* Add this controller to the list. The rest of the work will be done
 	 * when this is assigned to a subsystem. */
