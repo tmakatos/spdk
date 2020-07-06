@@ -1073,9 +1073,10 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	}
 	memset(io_q.addr, 0, io_q.size * entry_size);
 
-	SPDK_NOTICELOG("%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n", ctrlr->id,
-		       is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid,
-		       cmd->dptr.prp.prp1, (unsigned long long)io_q.addr);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n",
+		       ctrlr->id, is_cq ? 'C' : 'S',
+		       cmd->cdw10_bits.create_io_q.qid, cmd->dptr.prp.prp1,
+		       (unsigned long long)io_q.addr);
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
