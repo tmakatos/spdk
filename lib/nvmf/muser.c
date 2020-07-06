@@ -314,10 +314,6 @@ struct muser_transport {
 	pthread_mutex_t				lock;
 	TAILQ_HEAD(, muser_ctrlr)		ctrlrs;
 
-	/* A poll group where new qpairs exist prior to being
-	 * assigned to a "real" poll group. */
-	struct spdk_nvmf_poll_group		*pg;
-
 	TAILQ_HEAD(, muser_qpair)		new_qps;
 };
 
@@ -2013,6 +2009,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 {
 	struct muser_transport *muser_transport = NULL;
 	struct muser_ctrlr *muser_ctrlr = NULL;
+	struct spdk_nvmf_poll_group *pg;
 	int err;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
@@ -2068,11 +2065,10 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
-	assert(muser_transport->pg == NULL);
-	muser_transport->pg = spdk_nvmf_poll_group_create(muser_transport->transport.tgt);
-	assert(muser_transport->pg != NULL);
+	pg = spdk_nvmf_poll_group_create(muser_transport->transport.tgt);
+	assert(pg != NULL);
 	/* Add this qpair to our internal poll group, just so that it has one assigned. */
-	spdk_nvmf_poll_group_add(muser_transport->pg, &muser_ctrlr->qp[0]->qpair);
+	spdk_nvmf_poll_group_add(pg, &muser_ctrlr->qp[0]->qpair);
 
 	/* Add this controller to the list. The rest of the work will be done
 	 * when this is assigned to a subsystem. */
