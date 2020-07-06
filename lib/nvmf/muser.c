@@ -1811,52 +1811,6 @@ destroy_pci_dev(struct muser_ctrlr *ctrlr)
 }
 
 static int
-init_pci_dev(struct muser_ctrlr *ctrlr)
-{
-	lm_dev_info_t dev_info = { 0 };
-
-	dev_info.pvt = ctrlr;
-	dev_info.uuid = ctrlr->uuid;
-	muser_dev_info_fill(&dev_info);
-
-	/* PM */
-	ctrlr->pmcap.pmcs.nsfrst = 0x1;
-
-	/*
-	 * MSI-X
-	 *
-	 * TODO for now we put table BIR and PBA BIR in BAR4 because
-	 * it's just easier, otherwise in order to put it in BAR0 we'd
-	 * have to figure out where exactly doorbells end.
-	 */
-	ctrlr->msixcap.mxc.ts = NVME_IRQ_MSIX_NUM - 1;
-	ctrlr->msixcap.mtab.tbir = 0x4;
-	ctrlr->msixcap.mtab.to = 0x0;
-	ctrlr->msixcap.mpba.pbir = 0x5;
-	ctrlr->msixcap.mpba.pbao = 0x0;
-
-	/* EXP */
-	ctrlr->pxcap.pxcaps.ver = 0x2;
-	ctrlr->pxcap.pxdcap.per = 0x1;
-	ctrlr->pxcap.pxdcap.flrc = 0x1;
-	ctrlr->pxcap.pxdcap2.ctds = 0x1;
-	/* FIXME check PXCAPS.DPT */
-
-	ctrlr->lm_ctx = lm_ctx_create(&dev_info);
-	if (ctrlr->lm_ctx == NULL) {
-		/* TODO: lm_create doesn't set errno */
-		SPDK_ERRLOG("%s: error creating libmuser context: %m\n",
-			    ctrlr->id);
-		return -1;
-	}
-
-	ctrlr->pci_config_space = lm_get_pci_config_space(ctrlr->lm_ctx);
-	init_pci_config_space(ctrlr->pci_config_space);
-
-	return 0;
-}
-
-static int
 destroy_ctrlr(struct muser_ctrlr *ctrlr)
 {
 	int err;
@@ -1918,6 +1872,7 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 {
 	struct muser_ctrlr *muser_ctrlr;
 	struct spdk_nvmf_poll_group *pg;
+	lm_dev_info_t dev_info = { 0 };
 	char *path;
 	int fd;
 	int err;
@@ -1988,10 +1943,44 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n", muser_ctrlr->id,
 		      muser_ctrlr->doorbells);
 
-	err = init_pci_dev(muser_ctrlr);
-	if (err != 0) {
+	dev_info.pvt = muser_ctrlr;
+	dev_info.uuid = muser_ctrlr->uuid;
+	muser_dev_info_fill(&dev_info);
+
+	/* PM */
+	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
+
+	/*
+	 * MSI-X
+	 *
+	 * TODO for now we put table BIR and PBA BIR in BAR4 because
+	 * it's just easier, otherwise in order to put it in BAR0 we'd
+	 * have to figure out where exactly doorbells end.
+	 */
+	muser_ctrlr->msixcap.mxc.ts = NVME_IRQ_MSIX_NUM - 1;
+	muser_ctrlr->msixcap.mtab.tbir = 0x4;
+	muser_ctrlr->msixcap.mtab.to = 0x0;
+	muser_ctrlr->msixcap.mpba.pbir = 0x5;
+	muser_ctrlr->msixcap.mpba.pbao = 0x0;
+
+	/* EXP */
+	muser_ctrlr->pxcap.pxcaps.ver = 0x2;
+	muser_ctrlr->pxcap.pxdcap.per = 0x1;
+	muser_ctrlr->pxcap.pxdcap.flrc = 0x1;
+	muser_ctrlr->pxcap.pxdcap2.ctds = 0x1;
+	/* FIXME check PXCAPS.DPT */
+
+	muser_ctrlr->lm_ctx = lm_ctx_create(&dev_info);
+	if (muser_ctrlr->lm_ctx == NULL) {
+		/* TODO: lm_create doesn't set errno */
+		SPDK_ERRLOG("%s: error creating libmuser context: %m\n",
+			    muser_ctrlr->id);
+		err = -1;
 		goto out;
 	}
+
+	muser_ctrlr->pci_config_space = lm_get_pci_config_space(muser_ctrlr->lm_ctx);
+	init_pci_config_space(muser_ctrlr->pci_config_space);
 
 	/* Then, construct an admin queue pair */
 	err = init_qp(muser_ctrlr, &muser_transport->transport, MUSER_DEFAULT_AQ_DEPTH, 0);
