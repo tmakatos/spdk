@@ -234,8 +234,6 @@ struct muser_ctrlr {
 	/* internal CSTS.CFS register for MUSER fatal errors */
 	uint32_t				cfs : 1;
 
-	lm_trans_t				lm_trans;
-
 	/* for LM_TRAS_SOCK */
 	int					fd;
 	bool					initialized;
@@ -360,77 +358,6 @@ err:
 	free(muser_transport);
 
 	return NULL;
-}
-
-#define MDEV_CREATE_PATH "/sys/class/muser/muser/mdev_supported_types/muser-1/create"
-
-static void
-mdev_remove(const char *uuid)
-{
-	char *s;
-	FILE *fp;
-
-	if (asprintf(&s, "/sys/class/muser/muser/%s/remove", uuid) == -1) {
-		return;
-	}
-
-	fp = fopen(s, "a");
-	if (fp == NULL) {
-		SPDK_ERRLOG("%s: failed to open %s: %m\n", uuid, s);
-		return;
-	}
-	if (fprintf(fp, "1\n") < 0) {
-		SPDK_ERRLOG("%s: failed to remove: %m\n", uuid);
-	}
-	fclose(fp);
-}
-
-static int
-mdev_wait(const char *uuid)
-{
-	char *s;
-	int err;
-
-	if (asprintf(&s, "/dev/muser/%s", uuid) == -1) {
-		return -errno;
-	}
-
-	while ((err = access(s, F_OK)) == -1) {
-		if (errno != ENOENT) {
-			break;
-		}
-		/* FIXME don't sleep, use a more intelligent way, e.g. inotify */
-		sleep(1);
-	}
-	free(s);
-	return err;
-}
-
-static int
-mdev_create(const char *uuid)
-{
-	int fd;
-	int err;
-
-	fd = open(MDEV_CREATE_PATH, O_WRONLY);
-	if (fd == -1) {
-		SPDK_ERRLOG("%s: error opening '%s': %m\n", uuid, MDEV_CREATE_PATH);
-		return -1;
-	}
-
-	err = write(fd, uuid, strlen(uuid));
-	if (err != (int)strlen(uuid)) {
-		SPDK_ERRLOG("%s: error creating device: %m\n", uuid);
-		err = -1;
-	} else {
-		err = 0;
-	}
-	(void)close(fd);
-	if (err != 0) {
-		return err;
-	}
-
-	return mdev_wait(uuid);
 }
 
 static int
@@ -1670,10 +1597,8 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 			    ctrlr->id);
 	}
 out:
-	if (ctrlr->lm_trans == LM_TRANS_SOCK) { /* FIXME */
-		return (unsigned long)ctrlr->fd;
-	}
-	return (unsigned long)ctrlr->doorbells;
+
+	return (unsigned long)ctrlr->fd;
 }
 #endif
 
@@ -1891,7 +1816,7 @@ init_pci_dev(struct muser_ctrlr *ctrlr)
 {
 	lm_dev_info_t dev_info = { 0 };
 
-	dev_info.trans = ctrlr->lm_trans;
+	dev_info.trans = LM_TRANS_SOCK;
 
 	/* LM setup */
 	nvme_dev_info_fill(&dev_info, ctrlr);
@@ -1978,9 +1903,7 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 		}
 #endif
 	}
-	if (ctrlr->lm_trans == LM_TRANS_KERNEL) {
-		mdev_remove(ctrlr->uuid);
-	}
+
 	free(ctrlr);
 	return 0;
 }
@@ -2058,7 +1981,8 @@ muser_ctrlr_id(const char *s)
 }
 
 static int
-muser_create_ctrlr(struct muser_transport *muser_transport, const struct spdk_nvme_transport_id *trid)
+muser_create_ctrlr(struct muser_transport *muser_transport,
+		   const struct spdk_nvme_transport_id *trid)
 {
 	struct muser_ctrlr *muser_ctrlr;
 	struct spdk_nvmf_poll_group *pg;
@@ -2088,19 +2012,9 @@ muser_create_ctrlr(struct muser_transport *muser_transport, const struct spdk_nv
 		goto out;
 	}
 
-	/* TODO this should be a command-line option or env. var. */
-	muser_ctrlr->lm_trans = LM_TRANS_SOCK;
-
-	if (muser_ctrlr->lm_trans == LM_TRANS_KERNEL) {
-		err = mdev_create(muser_ctrlr->uuid);
-		if (err != 0) {
-			goto out;
-		}
-	} else if (muser_ctrlr->lm_trans == LM_TRANS_SOCK) {
-		err = muser_init_dev_mem(muser_ctrlr);
-		if (err != 0) {
-			goto out;
-		}
+	err = muser_init_dev_mem(muser_ctrlr);
+	if (err != 0) {
+		goto out;
 	}
 
 	err = init_pci_dev(muser_ctrlr);
