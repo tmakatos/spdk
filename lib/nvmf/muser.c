@@ -2056,8 +2056,12 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		SPDK_ERRLOG("%s: failed to open device memory at %s: %m\n",
 			    muser_ep->trid.traddr, path);
 		err = fd;
+		free(path);
 		goto out;
 	}
+
+	unlink(path);
+	free(path);
 
 	err = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
 	if (err != 0) {
@@ -2103,8 +2107,6 @@ out:
 	if (err != 0) {
 		muser_destroy_endpoint(muser_ep);
 	}
-
-	free(path);
 
 	return muser_create_ctrlr(muser_transport, muser_ep);
 }
