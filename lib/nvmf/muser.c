@@ -1000,7 +1000,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	assert(cmd != NULL);
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-	              "%s: create I/O %cQ: QID=0x%x, QSIZE=0x%x\n", ctrlr->id,
+	              "%s: create I/O %cQ%d: QSIZE=%#x\n", ctrlr->id,
 		      is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid,
 		      cmd->cdw10_bits.create_io_q.qsize);
 
@@ -1054,8 +1054,8 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		}
 
 		io_q.cqid = cmd->cdw11_bits.create_io_sq.cqid;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: CQID=%d\n", ctrlr->id,
-		              io_q.cqid);
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: SQ%d CQID=%d\n", ctrlr->id,
+		              cmd->cdw10_bits.create_io_q.qid, io_q.cqid);
 	}
 
 	io_q.size = cmd->cdw10_bits.create_io_q.qsize + 1;
@@ -1076,8 +1076,8 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	memset(io_q.addr, 0, io_q.size * entry_size);
 
 	SPDK_NOTICELOG("%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n", ctrlr->id,
-	               is_cq ? 'C' : 'S', io_q.cqid, cmd->dptr.prp.prp1,
-	               (unsigned long long)io_q.addr);
+	               is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid,
+		       cmd->dptr.prp.prp1, (unsigned long long)io_q.addr);
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
