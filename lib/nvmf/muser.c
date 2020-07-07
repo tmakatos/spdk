@@ -96,12 +96,6 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 SPDK_STATIC_ASSERT(DOORBELLS == offsetof(struct spdk_nvme_registers, doorbell[0].sq_tdbl),
 		   "Incorrect register offset");
 
-enum muser_nvmf_dir {
-	MUSER_NVMF_INVALID,
-	MUSER_NVMF_READ,
-	MUSER_NVMF_WRITE
-};
-
 struct muser_req;
 struct muser_qpair;
 
@@ -117,21 +111,6 @@ struct muser_req  {
 	void					*cb_arg;
 
 	TAILQ_ENTRY(muser_req)			link;
-};
-
-struct muser_nvmf_prop_req {
-	enum muser_nvmf_dir			dir;
-	sem_t					wait;
-	/*
-	 * TODO either this will be a register access or an internal command
-	 * (for now it's only about starting the NVMf subsystem. Convert into a
-	 * union.
-	 */
-	char					*buf;
-	size_t					count;
-	loff_t					pos;
-	ssize_t					ret;
-	struct muser_req			muser_req;
 };
 
 /*
@@ -191,19 +170,11 @@ struct muser_poll_group {
 struct muser_ctrlr {
 	struct muser_endpoint			*endpoint;
 	struct muser_transport			*transport;
-	pthread_t				lm_thr;
 	lm_ctx_t				*lm_ctx;
 	lm_pci_config_space_t			*pci_config_space;
 
-	/*
-	 * TODO variables that are checked by poll_group_poll to see whether
-	 * commands need to be executed, in addition to checking the doorbells.
-	 * We now have 2 such different commands so we should introduce a queue,
-	 * or if we're going to have a single outstanding command we should
-	 * group them into a union.
-	 */
-	sem_t					sem;
-	struct muser_nvmf_prop_req		prop_req; /* read/write BAR0 */
+	/* True when the admin queue is connected */
+	bool					ready;
 
 	/* PCI capabilities */
 	struct pmcap				pmcap;
@@ -391,37 +362,8 @@ err:
 	return NULL;
 }
 
-static int
-handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
-		  const size_t count, loff_t pos, const bool is_write);
-
 static void
 destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid);
-
-static int
-do_prop_req(struct muser_ctrlr *ctrlr, char *buf, size_t count, loff_t pos,
-	    bool is_write)
-{
-	int err;
-
-	assert(ctrlr != NULL);
-
-	err = sem_init(&ctrlr->prop_req.wait, 0, 0);
-	if (err != 0) {
-		return err;
-	}
-	ctrlr->prop_req.ret = 0;
-	ctrlr->prop_req.buf = buf;
-	ctrlr->prop_req.count = count;
-	ctrlr->prop_req.pos = pos;
-	spdk_wmb();
-	ctrlr->prop_req.dir = is_write ? MUSER_NVMF_WRITE : MUSER_NVMF_READ;
-	err = sem_wait(&ctrlr->prop_req.wait);
-	if (err != 0) {
-		return err;
-	}
-	return ctrlr->prop_req.ret;
-}
 
 static uint16_t
 max_queue_size(struct muser_ctrlr const *ctrlr)
@@ -1237,55 +1179,74 @@ handle_sq_tdbl_write(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
 	return 0;
 }
 
-/*
- * Handles a write at offset 0x1000 or more.
- *
- * DSTRD is set to fixed value 0 for NVMf.
- *
- * TODO this function won't be called when sparse mapping is used, however it
- * might be used when we dynamically switch off polling, so I'll leave it here
- * for now.
- */
 static int
-handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
-		  const size_t count, loff_t pos, const bool is_write)
+map_admin_queue(struct muser_ctrlr *ctrlr)
 {
+	int err;
+
 	assert(ctrlr != NULL);
-	assert(buf != NULL);
 
-	if (count != sizeof(uint32_t)) {
-		SPDK_ERRLOG("%s: bad doorbell buffer size %ld\n",
-			    ctrlr->endpoint->trid.traddr, count);
-		return -EINVAL;
+	err = acq_map(ctrlr);
+	if (err != 0) {
+		SPDK_ERRLOG("%s: failed to map CQ0: %d\n", ctrlr->endpoint->trid.traddr, err);
+		return err;
 	}
-
-	pos -= DOORBELLS;
-
-	/* pos must be dword aligned */
-	if ((pos & 0x3) != 0) {
-		SPDK_ERRLOG("%s: bad doorbell offset %#lx\n", ctrlr->endpoint->trid.traddr, pos);
-		return -EINVAL;
+	err = asq_map(ctrlr);
+	if (err != 0) {
+		SPDK_ERRLOG("%s: failed to map SQ0: %d\n", ctrlr->endpoint->trid.traddr, err);
+		return err;
 	}
+	return 0;
+}
 
-	/* convert byte offset to array index */
-	pos >>= 2;
+static void
+unmap_admin_queue(struct muser_ctrlr *ctrlr)
+{
+	assert(ctrlr->qp[0] != NULL);
 
-	if (pos > MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * 2) {
-		/*
-		 * FIXME need to emit a "Write to Invalid Doorbell Register"
-		 * asynchronous event
-		 */
-		SPDK_ERRLOG("%s: bad doorbell index %#lx\n", ctrlr->endpoint->trid.traddr, pos);
-		return -EINVAL;
-	}
+	destroy_io_qp(ctrlr->qp[0]);
+}
 
-	if (is_write) {
-		ctrlr->doorbells[pos] = *buf;
-		spdk_wmb();
+static int
+muser_prop_req_rsp(struct muser_req *req, void *cb_arg)
+{
+	struct muser_qpair *qpair = cb_arg;
+
+	assert(qpair != NULL);
+	assert(req != NULL);
+
+	if (req->req.cmd->prop_get_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET) {
+		assert(qpair->ctrlr != NULL);
+		assert(req != NULL);
+
+		memcpy(req->req.data,
+		       &req->req.rsp->prop_get_rsp.value.u64,
+		       req->req.length);
 	} else {
-		spdk_rmb();
-		*buf = ctrlr->doorbells[pos];
+		assert(req->req.cmd->prop_set_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET);
+		assert(qpair->ctrlr != NULL);
+
+		if (req->req.cmd->prop_set_cmd.ofst == CC) {
+			union spdk_nvme_cc_register *cc;
+
+			cc = (union spdk_nvme_cc_register *)&req->req.cmd->prop_set_cmd.value.u64;
+
+			if (cc->bits.en == 1 && cc->bits.shn == 0) {
+				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+					      "%s: MAP Admin queue\n",
+					      qpair->ctrlr->endpoint->trid.traddr);
+				map_admin_queue(qpair->ctrlr);
+			} else if ((cc->bits.en == 0 && cc->bits.shn == 0) ||
+				   (cc->bits.en == 1 && cc->bits.shn != 0)) {
+				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+					      "%s: UNMAP Admin queue\n",
+					      qpair->ctrlr->endpoint->trid.traddr);
+				unmap_admin_queue(qpair->ctrlr);
+			}
+		}
 	}
+
+	qpair->ctrlr->ready = true;
 	return 0;
 }
 
@@ -1295,35 +1256,48 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 {
 	struct muser_endpoint *muser_ep = pvt;
 	struct muser_ctrlr *ctrlr;
-	int ret;
+	struct muser_req *req;
 
 	ctrlr = muser_ep->ctrlr;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
 		      "%s: bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
-		      ctrlr->endpoint->trid.traddr, is_write ? "write" : "read", ctrlr, count,
+		      muser_ep->trid.traddr, is_write ? "write" : "read", ctrlr, count,
 		      pos);
 
-	if (is_write) {
-		spdk_log_dump(stdout, "muser_write", buf, count);
-	}
+	assert(pos < DOORBELLS);
 
-	if (pos >= DOORBELLS) {
-		ret = handle_dbl_access(ctrlr, (uint32_t *)buf, count,
-					pos, is_write);
-		if (ret == 0) {
-			return count;
-		}
-		assert(ret < 0);
-		return ret;
-	}
+	/* Construct a Fabric Property Get/Set command and send it */
 
-	ret = do_prop_req(ctrlr, buf, count, pos, is_write);
-	if (ret != 0) {
-		SPDK_WARNLOG("%s: failed to %s %lx@%lx BAR0\n", ctrlr->endpoint->trid.traddr,
-			     is_write ? "write" : "read", pos, count);
+	req = get_muser_req(ctrlr->qp[0]);
+	if (req == NULL) {
 		return -1;
 	}
+
+	req->cb_fn = muser_prop_req_rsp;
+	req->cb_arg = ctrlr->qp[0];
+	req->req.cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
+	req->req.cmd->prop_set_cmd.cid = 0;
+	req->req.cmd->prop_set_cmd.attrib.size = (count / 4) - 1;
+	req->req.cmd->prop_set_cmd.ofst = pos;
+	if (is_write) {
+		req->req.cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
+		if (req->req.cmd->prop_set_cmd.attrib.size) {
+			req->req.cmd->prop_set_cmd.value.u64 = *(uint64_t *)buf;
+		} else {
+			req->req.cmd->prop_set_cmd.value.u32.high = 0;
+			req->req.cmd->prop_set_cmd.value.u32.low = *(uint32_t *)buf;
+		}
+	} else {
+		req->req.cmd->prop_get_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
+	}
+	req->req.length = count;
+	req->req.data = buf;
+
+	/* Mark the controller as busy to limit the queue depth for fabric get/set to 1 */
+	ctrlr->ready = false;
+
+	spdk_nvmf_request_exec_fabrics(&req->req);
 
 	return count;
 }
@@ -1747,38 +1721,6 @@ muser_dev_info_fill(lm_dev_info_t *dev_info)
 	reg_info[LM_DEV_CFG_REG_IDX].fn  = access_pci_config;
 }
 
-/*
- * Returns (void*)0 on success, (void*)-errno on error.
- */
-static void *
-drive(void *arg)
-{
-	int err;
-	lm_ctx_t *lm_ctx = arg;
-
-	assert(arg != NULL);
-
-	/*
-	 * TODO need accesor for lm_ctx_t.pvt == struct muser_endpoint*
-	 * so that we can include the ID when printing
-	 */
-
-	err = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-	if (err != 0)  {
-		SPDK_ERRLOG("failed to set pthread cancel state: %s\n",
-			    strerror(err));
-		return (void *)((long) - err);
-	}
-	err = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-	if (err != 0)  {
-		SPDK_ERRLOG("failed to set pthread cancel type: %s\n",
-			    strerror(err));
-		return (void *)((long) - err);
-	}
-
-	return (void *)((long)lm_ctx_drive(lm_ctx));
-}
-
 static void
 init_pci_config_space(lm_pci_config_space_t *p)
 {
@@ -1809,54 +1751,13 @@ init_pci_config_space(lm_pci_config_space_t *p)
 }
 
 static int
-destroy_pci_dev(struct muser_ctrlr *ctrlr)
-{
-
-	int err;
-	void *res;
-
-	if (ctrlr == NULL || ctrlr->lm_ctx == NULL) {
-		return 0;
-	}
-	if (ctrlr->lm_thr != 0) {
-		err = pthread_cancel(ctrlr->lm_thr);
-		if (err == 0) {
-			err = pthread_join(ctrlr->lm_thr, &res);
-			if (err != 0) {
-				SPDK_ERRLOG("%s: failed to join thread: %s\n",
-					    ctrlr->endpoint->trid.traddr, strerror(err));
-				return -err;
-			}
-			if (res != PTHREAD_CANCELED) {
-				SPDK_ERRLOG("%s: thread exited: %s\n",
-					    ctrlr->endpoint->trid.traddr, strerror(-(intptr_t)res));
-				/* thread died, not much we can do here */
-			}
-		} else if (err != ESRCH) {
-			SPDK_ERRLOG("%s: failed to cancel thread: %s\n",
-				    ctrlr->endpoint->trid.traddr, strerror(err));
-			return -err;
-		}
-	}
-
-	return 0;
-}
-
-static int
 destroy_ctrlr(struct muser_ctrlr *ctrlr)
 {
-	int err;
-
 	if (ctrlr == NULL) {
 		return 0;
 	}
+
 	destroy_qp(ctrlr, 0);
-	err = destroy_pci_dev(ctrlr);
-	if (err != 0) {
-		SPDK_ERRLOG("%s: failed to tear down PCI device: %s\n",
-			    ctrlr->endpoint->trid.traddr, strerror(-err));
-		return err;
-	}
 
 	if (ctrlr->endpoint) {
 		ctrlr->endpoint->ctrlr = NULL;
@@ -1881,17 +1782,6 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 	}
 	muser_ctrlr->cntlid = 0xffff;
 	muser_ctrlr->transport = muser_transport;
-
-	muser_ctrlr->prop_req.muser_req.req.rsp = (union nvmf_c2h_msg *)
-			&muser_ctrlr->prop_req.muser_req.rsp;
-	muser_ctrlr->prop_req.muser_req.req.cmd = (union nvmf_h2c_msg *)
-			&muser_ctrlr->prop_req.muser_req.cmd;
-
-	err = sem_init(&muser_ctrlr->sem, 0, 0);
-	if (err != 0) {
-		goto out;
-	}
-
 	muser_ctrlr->endpoint = muser_ep;
 	muser_ctrlr->lm_ctx = muser_ep->lm_ctx;
 	muser_ctrlr->doorbells = muser_ep->doorbells;
@@ -2197,7 +2087,6 @@ handle_queue_connect_rsp(struct muser_req *req, void *cb_arg)
 	struct muser_poll_group *muser_group;
 	struct muser_qpair *qpair = cb_arg;
 	struct muser_ctrlr *ctrlr;
-	int err;
 
 	assert(qpair != NULL);
 	assert(req != NULL);
@@ -2216,15 +2105,7 @@ handle_queue_connect_rsp(struct muser_req *req, void *cb_arg)
 
 	if (nvmf_qpair_is_admin_queue(&qpair->qpair)) {
 		ctrlr->cntlid = qpair->qpair.ctrlr->cntlid;
-
-		/* Start the thread that receives on this domain socket */
-		err = pthread_create(&ctrlr->lm_thr, NULL, drive, ctrlr->endpoint->lm_ctx);
-		if (err != 0) {
-			SPDK_ERRLOG("%s: failed to create lm_drive thread: %s\n",
-				    ctrlr->endpoint->trid.traddr, strerror(err));
-			destroy_ctrlr(ctrlr);
-			return err;
-		}
+		ctrlr->ready = true;
 	}
 
 	free(req->req.data);
@@ -2315,85 +2196,6 @@ muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
 
 	return 0;
-}
-
-static int
-map_admin_queue(struct muser_ctrlr *ctrlr)
-{
-	int err;
-
-	assert(ctrlr != NULL);
-
-	err = acq_map(ctrlr);
-	if (err != 0) {
-		SPDK_ERRLOG("%s: failed to map CQ0: %d\n", ctrlr->endpoint->trid.traddr, err);
-		return err;
-	}
-	err = asq_map(ctrlr);
-	if (err != 0) {
-		SPDK_ERRLOG("%s: failed to map SQ0: %d\n", ctrlr->endpoint->trid.traddr, err);
-		return err;
-	}
-	return 0;
-}
-
-static void
-unmap_admin_queue(struct muser_ctrlr *ctrlr)
-{
-	assert(ctrlr->qp[0] != NULL);
-
-	destroy_io_qp(ctrlr->qp[0]);
-}
-
-static int
-handle_prop_rsp(struct muser_req *req, void *cb_arg)
-{
-	struct muser_qpair *qpair = cb_arg;
-	int err = 0;
-
-	assert(qpair != NULL);
-	assert(req != NULL);
-
-	if (qpair->ctrlr->prop_req.dir == MUSER_NVMF_READ) {
-		assert(qpair->ctrlr != NULL);
-		assert(req != NULL);
-
-		memcpy(qpair->ctrlr->prop_req.buf,
-		       &req->req.rsp->prop_get_rsp.value.u64,
-		       qpair->ctrlr->prop_req.count);
-	} else {
-		assert(qpair->ctrlr->prop_req.dir == MUSER_NVMF_WRITE);
-
-		assert(qpair->ctrlr != NULL);
-
-		if (qpair->ctrlr->prop_req.pos == CC) {
-			union spdk_nvme_cc_register *cc;
-
-			assert(qpair->ctrlr != NULL);
-
-			spdk_rmb();
-
-			cc = (union spdk_nvme_cc_register *)qpair->ctrlr->prop_req.buf;
-
-			if (cc->bits.en == 1 && cc->bits.shn == 0) {
-				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-					      "%s: MAP Admin queue\n",
-					      qpair->ctrlr->endpoint->trid.traddr);
-				qpair->ctrlr->prop_req.ret = map_admin_queue(qpair->ctrlr);
-			} else if ((cc->bits.en == 0 && cc->bits.shn == 0) ||
-				   (cc->bits.en == 1 && cc->bits.shn != 0)) {
-				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-					      "%s: UNMAP Admin queue\n",
-					      qpair->ctrlr->endpoint->trid.traddr);
-				unmap_admin_queue(qpair->ctrlr);
-			}
-		}
-	}
-
-	qpair->ctrlr->prop_req.dir = MUSER_NVMF_INVALID;
-	err = sem_post(&qpair->ctrlr->prop_req.wait);
-
-	return err;
 }
 
 static int
@@ -2649,55 +2451,17 @@ out:
 static int
 muser_ctrlr_poll(struct muser_ctrlr *ctrlr)
 {
-	struct spdk_nvmf_request *req;
-	struct muser_req *muser_req;
-	int err = 0;
-
 	if (ctrlr == NULL) {
 		return 0;
 	}
 
-	if (ctrlr->prop_req.dir == MUSER_NVMF_INVALID) {
-		return err;
+	if (!ctrlr->ready) {
+		return 0;
 	}
 
-	assert(ctrlr != NULL);
-
-	/* TODO: This should examine the prop_req and intercept
-	 * register writes that aren't valid for fabrics devices like
-	 * AQA. */
-
-	req = get_nvmf_req(ctrlr->qp[0]);
-	if (req == NULL) {
-		return -1;
-	}
-
-	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
-	muser_req->cb_fn = handle_prop_rsp;
-	muser_req->cb_arg = ctrlr->qp[0];
-
-	/* Generate a fake fabrics property set command */
-	req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
-	req->cmd->prop_set_cmd.cid = 0;
-	req->cmd->prop_set_cmd.attrib.size = (ctrlr->prop_req.count / 4) - 1;
-	req->cmd->prop_set_cmd.ofst = ctrlr->prop_req.pos;
-	if (ctrlr->prop_req.dir == MUSER_NVMF_WRITE) {
-		req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
-		if (req->cmd->prop_set_cmd.attrib.size) {
-			req->cmd->prop_set_cmd.value.u64 = *(uint64_t *)ctrlr->prop_req.buf;
-		} else {
-			req->cmd->prop_set_cmd.value.u32.high = 0;
-			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)ctrlr->prop_req.buf;
-		}
-	} else {
-		req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
-	}
-	req->length = 0;
-	req->data = NULL;
-
-	spdk_nvmf_request_exec_fabrics(req);
-
-	return 0;
+	/* This will call access_bar0_fn() if there are any writes
+	 * to the portion of the BAR that is not mmap'd */
+	return lm_ctx_poll(ctrlr->lm_ctx);
 }
 
 static void
