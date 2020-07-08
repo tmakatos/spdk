@@ -273,7 +273,9 @@ fail_ctrlr(struct muser_ctrlr *ctrlr)
 {
 	assert(ctrlr != NULL);
 
-	SPDK_ERRLOG(":%s failing controller\n", ctrlr->endpoint->trid.traddr);
+	if (ctrlr->cfs == 0) {
+		SPDK_ERRLOG(":%s failing controller\n", ctrlr->endpoint->trid.traddr);
+	}
 
 	ctrlr->cfs = 1U;
 }
@@ -2568,6 +2570,13 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			ctrlr = muser_qpair->ctrlr;
 
 			if (muser_ctrlr_poll(ctrlr) != 0) {
+				/*
+				 * FIXME now that the controller has failed, do
+				 * we just remove from this list all queue pairs
+				 * that belong to this controller? Or do we
+				 * completely destroy the controller? Or do we
+				 * just destroy the queues?
+				 */
 				fail_ctrlr(ctrlr);
 				return -1;
 			}
