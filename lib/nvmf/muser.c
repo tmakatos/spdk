@@ -110,6 +110,9 @@ struct muser_req  {
 	muser_req_cb_fn				cb_fn;
 	void					*cb_arg;
 
+	dma_sg_t				sg;
+	struct iovec				iov;
+
 	TAILQ_ENTRY(muser_req)			link;
 };
 
@@ -377,10 +380,9 @@ max_queue_size(struct muser_ctrlr const *ctrlr)
 
 /* TODO this should be a libmuser public function */
 static void *
-map_one(void *prv, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
+map_one(lm_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 {
 	int ret;
-	lm_ctx_t *ctx = (lm_ctx_t *)prv;
 	dma_sg_t tmp_sg;
 	struct iovec tmp_iov;
 
@@ -391,7 +393,7 @@ map_one(void *prv, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 
 	ret = lm_addr_to_sg(ctx, addr, len, &tmp_sg, 1);
 	if (ret != 1) {
-		SPDK_ERRLOG("failed to map 0x%lx-0x%lx\n", addr, addr + len);
+		SPDK_ERRLOG("failed to map %#lx-%#lx\n", addr, addr + len);
 		errno = ret;
 		return NULL;
 	}
@@ -467,7 +469,7 @@ asq_map(struct muser_ctrlr *ctrlr)
 	q.head = ctrlr->doorbells[0] = 0;
 	q.cqid = 0;
 	q.addr = map_one(ctrlr->lm_ctx, regs->asq,
-			 q.size * sizeof(struct spdk_nvme_cmd), NULL, NULL);
+			 q.size * sizeof(struct spdk_nvme_cmd), &q.sg, &q.iov);
 	if (q.addr == NULL) {
 		return -1;
 	}
@@ -542,7 +544,7 @@ acq_map(struct muser_ctrlr *ctrlr)
 	q->size = regs->aqa.bits.acqs + 1;
 	q->tail = 0;
 	q->addr = map_one(ctrlr->lm_ctx, regs->acq,
-			  q->size * sizeof(struct spdk_nvme_cpl), NULL, NULL);
+			  q->size * sizeof(struct spdk_nvme_cpl), &q->sg, &q->iov);
 	if (q->addr == NULL) {
 		return -1;
 	}
@@ -556,14 +558,22 @@ acq_map(struct muser_ctrlr *ctrlr)
 static void *
 _map_one(void *prv, uint64_t addr, uint64_t len)
 {
-	return map_one(prv, addr, len, NULL, NULL);
+	struct muser_req *m_req;
+	struct muser_qpair *m_qpair;
+
+	assert(prv != NULL);
+
+	m_req = SPDK_CONTAINEROF(prv, struct muser_req, cmd);
+	m_qpair = SPDK_CONTAINEROF(m_req->req.qpair, struct muser_qpair, qpair);
+
+	return map_one(m_qpair->ctrlr->lm_ctx, addr, len, &m_req->sg, NULL);
 }
 
 static int
 muser_map_prps(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	       struct iovec *iov, uint32_t length)
 {
-	return spdk_nvme_map_prps(ctrlr->lm_ctx, cmd, iov, length,
+	return spdk_nvme_map_prps(cmd, cmd, iov, length,
 				  NVMF_MEMORY_PAGE_SIZE,
 				  _map_one);
 }
@@ -1124,6 +1134,8 @@ handle_cmd_rsp(struct muser_req *req, void *cb_arg)
 			break;
 		}
 	}
+
+	lm_unmap_sg(qpair->ctrlr->lm_ctx, &req->sg, &req->iov, 1);
 
 	return post_completion(qpair->ctrlr, &req->req.cmd->nvme_cmd,
 			       &qpair->ctrlr->qp[req->req.qpair->qid]->cq,
@@ -1766,6 +1778,38 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 	return 0;
 }
 
+static int
+spdk_unmap_dma(void *pvt, uint64_t iova) {
+
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+	int i;
+
+	assert(muser_ep != NULL);
+
+	if (muser_ep->ctrlr == NULL) {
+		return 0;
+	}
+
+	ctrlr = muser_ep->ctrlr;
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: unmap IOVA %#lx\n",
+		      ctrlr->endpoint->trid.traddr, iova);
+
+	for (i = 0; i < MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		if (ctrlr->qp[i] == NULL) {
+			continue;
+		}
+		if (ctrlr->qp[i]->cq.sg.dma_addr == iova || 
+		    ctrlr->qp[i]->sq.sg.dma_addr == iova) {
+
+			destroy_qp(ctrlr, ctrlr->qp[i]->qpair.qid);
+		}
+	}
+
+	return 0;	
+}
+
 static void
 muser_create_ctrlr(struct muser_transport *muser_transport,
 		   struct muser_endpoint *muser_ep)
@@ -1902,6 +1946,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	dev_info.pvt = muser_ep;
 	dev_info.uuid = muser_ep->trid.traddr;
 	muser_dev_info_fill(&dev_info);
+	dev_info.unmap_dma = &spdk_unmap_dma;
 
 	muser_ep->lm_ctx = lm_ctx_create(&dev_info);
 	if (muser_ep->lm_ctx == NULL) {
@@ -2321,7 +2366,7 @@ map_admin_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 
 	switch (cmd->opc) {
 	case SPDK_NVME_OPC_IDENTIFY:
-		len = 4096;
+		len = 4096; /* FIXME there should be a define somewhere for this */
 		break;
 	case SPDK_NVME_OPC_GET_LOG_PAGE:
 		len = (cmd->cdw10_bits.get_log_page.numdl + 1) * 4;
@@ -2334,7 +2379,8 @@ map_admin_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 
 	iovcnt = muser_map_prps(ctrlr, cmd, req->iov, len);
 	if (iovcnt < 0) {
-		SPDK_ERRLOG("%s: map Admin Opc %x failed\n", ctrlr->endpoint->trid.traddr, cmd->opc);
+		SPDK_ERRLOG("%s: map Admin Opc %x failed\n",
+			    ctrlr->endpoint->trid.traddr, cmd->opc);
 		return -1;
 	}
 
@@ -2411,7 +2457,7 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	assert(cmd != NULL);
 
 	/*
-	 * FIXME this means that there are not free requests available,
+	 * FIXME this means that there are no free requests available,
 	 * returning -1 will fail the controller. Theoretically this error can
 	 * be avoided completely by ensuring we have as many requests as slots
 	 * in the SQ, plus one for the the property request.
@@ -2442,6 +2488,12 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	return 0;
 
 out:
+	/*
+	 * FIXME must unmap PRRs.  handle_cmd_rsp already does that. In the
+	 * error case we should call handle_cmd_rsp (having set
+	 * req->req.rsp->nvme_cpl.* with the error values) instead of
+	 * post_completion so that there is a single complete path.
+	 */
 	return post_completion(ctrlr, cmd, &ctrlr->qp[req->qpair->qid]->cq, 0,
 			       SPDK_NVME_SC_INTERNAL_DEVICE_ERROR,
 			       SPDK_NVME_SCT_GENERIC);
