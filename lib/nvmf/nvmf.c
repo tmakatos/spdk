@@ -1419,6 +1419,8 @@ nvmf_poll_group_resume_subsystem(struct spdk_nvmf_poll_group *group,
 
 	sgroup = &group->sgroups[subsystem->id];
 
+	assert(sgroup->state == SPDK_NVMF_SUBSYSTEM_PAUSED);
+
 	rc = poll_group_update_subsystem(group, subsystem);
 	if (rc) {
 		goto fini;
