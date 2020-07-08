@@ -1418,7 +1418,7 @@ handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc *const mxc)
 				      ctrlr->endpoint->trid.traddr);
 		} else {
 			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-				      "%s: vector's mask bit determines whether vector is masked",
+				      "%s: vector's mask bit determines whether vector is masked\n",
 				      ctrlr->endpoint->trid.traddr);
 		}
 		ctrlr->msixcap.mxc.fm = mxc->fm;
