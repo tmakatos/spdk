@@ -1654,6 +1654,10 @@ muser_dev_info_fill(lm_dev_info_t *dev_info)
 				      .size = sizeof(struct msixcap),
 				      .fn = msixcap_access
 				     };
+	static struct lm_sparse_mmap_areas mmap_area = {.nr_mmap_areas = 1,
+		       .areas[0].start = DOORBELLS,
+				.areas[0].size = PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2),
+	};
 
 	lm_reg_info_t *reg_info;
 
@@ -1701,12 +1705,7 @@ muser_dev_info_fill(lm_dev_info_t *dev_info)
 	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
 	reg_info[LM_DEV_BAR0_REG_IDX].flags |= LM_REG_FLAG_MMAP;
 	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
-	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(
-				struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
-	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
-	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
-	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(
-				MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
+	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = &mmap_area;
 	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
 	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar0_fn;
 
