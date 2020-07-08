@@ -755,6 +755,9 @@ destroy_io_qp(struct muser_qpair *qp)
 	if (qp->ctrlr == NULL) {
 		return;
 	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "destroy I/O QP%d\n", qp->qpair.qid);
+
 	destroy_io_q(qp->ctrlr->lm_ctx, &qp->sq);
 	destroy_io_q(qp->ctrlr->lm_ctx, &qp->cq);
 }
@@ -1803,7 +1806,11 @@ spdk_unmap_dma(void *pvt, uint64_t iova) {
 		if (ctrlr->qp[i]->cq.sg.dma_addr == iova || 
 		    ctrlr->qp[i]->sq.sg.dma_addr == iova) {
 
-			destroy_qp(ctrlr, ctrlr->qp[i]->qpair.qid);
+			if (i == 0) {
+				destroy_io_qp(ctrlr->qp[0]);
+			} else {
+				destroy_qp(ctrlr, ctrlr->qp[i]->qpair.qid);
+			}
 		}
 	}
 
