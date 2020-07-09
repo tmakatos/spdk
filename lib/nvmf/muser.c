@@ -1282,8 +1282,6 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 		      muser_ep->trid.traddr, is_write ? "write" : "read", ctrlr, count,
 		      pos);
 
-	assert(pos < DOORBELLS);
-
 	/* Construct a Fabric Property Get/Set command and send it */
 
 	req = get_muser_req(ctrlr->qp[0]);
