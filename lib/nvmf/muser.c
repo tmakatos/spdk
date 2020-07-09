@@ -75,13 +75,21 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define MUSER_DEFAULT_AQ_DEPTH 32
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
 #define MUSER_DEFAULT_IN_CAPSULE_DATA_SIZE 0
+
+/* 
+ * By setting spdk_nvmf_transport_opts.max_io_size = MUSER_DEFAULT_MAX_IO_SIZE
+ * we're effectively setting MDTS.
+ */
+#define MUSER_MDTS 32
+
+/* TODO: Move to nvmf_internal.h, SPDK NVMf uses fixed 4KiB */
+#define NVMF_MEMORY_PAGE_SIZE 4096
+
 #define MUSER_DEFAULT_MAX_IO_SIZE 131072
-#define MUSER_DEFAULT_IO_UNIT_SIZE 131072
+#define MUSER_DEFAULT_IO_UNIT_SIZE (MUSER_MDTS * NVMF_MEMORY_PAGE_SIZE)
 #define MUSER_DEFAULT_NUM_SHARED_BUFFERS 512 /* internal buf size */
 #define MUSER_DEFAULT_BUFFER_CACHE_SIZE 0
 #define MUSER_DOORBELLS_SIZE PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2)
-/* TODO: Move to nvmf_internal.h, SPDK NVMf uses fixed 4KiB */
-#define NVMF_MEMORY_PAGE_SIZE 4096
 
 #define NVME_REG_CFG_SIZE       0x1000
 #define NVME_REG_BAR0_SIZE      0x4000
@@ -101,6 +109,7 @@ struct muser_qpair;
 
 typedef int (*muser_req_cb_fn)(struct muser_req *req, void *cb_arg);
 
+#define MUSER_MAX_IOVEC (MUSER_MDTS + 1)
 struct muser_req  {
 	struct spdk_nvmf_request		req;
 	struct spdk_nvme_cpl			rsp;
@@ -110,8 +119,14 @@ struct muser_req  {
 	muser_req_cb_fn				cb_fn;
 	void					*cb_arg;
 
-	dma_sg_t				sg;
-	struct iovec				iov;
+	dma_sg_t				sg[MUSER_MAX_IOVEC];
+	struct iovec				iov[MUSER_MAX_IOVEC];
+
+	/*
+	 * Must be large enough to accomodate MUSER_MDTS + 1.
+	 * TODO add static assert.
+	 */
+	uint8_t					iovcnt;
 
 	TAILQ_ENTRY(muser_req)			link;
 };
@@ -385,8 +400,6 @@ static void *
 map_one(lm_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 {
 	int ret;
-	dma_sg_t tmp_sg;
-	struct iovec tmp_iov;
 
 	assert(ctx != NULL);
 	assert(sg != NULL);
@@ -412,6 +425,7 @@ map_one(lm_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *
 	}
 
 	/* FIXME 0 might be a legitimate address, right? */
+	assert(iov->iov_base != NULL);
 	return iov->iov_base;
 }
 
@@ -566,7 +580,15 @@ _map_one(void *prv, uint64_t addr, uint64_t len)
 	m_req = SPDK_CONTAINEROF(prv, struct muser_req, cmd);
 	m_qpair = SPDK_CONTAINEROF(m_req->req.qpair, struct muser_qpair, qpair);
 
-	return map_one(m_qpair->ctrlr->lm_ctx, addr, len, &m_req->sg, &m_req->iov);
+	assert(m_req->iovcnt >= 0);
+	assert(m_req->iovcnt <= MUSER_MAX_IOVEC);
+	ret = map_one(m_qpair->ctrlr->lm_ctx, addr, len,
+		      &m_req->sg[m_req->iovcnt],
+		      &m_req->iov[m_req->iovcnt]);
+	if (spdk_likely(ret != NULL)) {
+		m_req->iovcnt++;
+	}
+	return ret;
 }
 
 static int
@@ -1139,7 +1161,7 @@ handle_cmd_rsp(struct muser_req *req, void *cb_arg)
 		}
 	}
 
-	lm_unmap_sg(qpair->ctrlr->lm_ctx, &req->sg, &req->iov, 1);
+	lm_unmap_sg(qpair->ctrlr->lm_ctx, req->sg, req->iov, req->iovcnt);
 
 	return post_completion(qpair->ctrlr, &req->req.cmd->nvme_cmd,
 			       &qpair->ctrlr->qp[req->req.qpair->qid]->cq,
@@ -2378,6 +2400,7 @@ get_muser_req(struct muser_qpair *qpair)
 	TAILQ_REMOVE(&qpair->reqs, req, link);
 	memset(&req->cmd, 0, sizeof(req->cmd));
 	memset(&req->rsp, 0, sizeof(req->rsp));
+	req->iovcnt = 0;
 
 	return req;
 }
@@ -2527,6 +2550,9 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 		return -1;
 	}
 
+	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
+	muser_req->cb_fn = handle_cmd_rsp;
+	muser_req->cb_arg = SPDK_CONTAINEROF(req->qpair, struct muser_qpair, qpair);
 	req->cmd->nvme_cmd = *cmd;
 	if (nvmf_qpair_is_admin_queue(req->qpair)) {
 		err = map_admin_cmd_req(ctrlr, req);
@@ -2540,20 +2566,22 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 		goto out;
 	}
 
-	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
-	muser_req->cb_fn = handle_cmd_rsp;
-	muser_req->cb_arg = SPDK_CONTAINEROF(req->qpair, struct muser_qpair, qpair);
-
 	spdk_nvmf_request_exec(req);
 
 	return 0;
 
 out:
 	/*
-	 * FIXME must unmap PRRs.  handle_cmd_rsp already does that. In the
+	 * FIXME must unmap PRRs. handle_cmd_rsp already does that. In the
 	 * error case we should call handle_cmd_rsp (having set
 	 * req->req.rsp->nvme_cpl.* with the error values) instead of
 	 * post_completion so that there is a single complete path.
+	 *
+	 * AFAIK functions map_XXX_cmd_req don't fail after muser_map_prps has
+	 * been successfully called, and muser_map_prps/_map_one expects only
+	 * one segment. If the guest submits a request that spans two DMA
+	 * regions then this code won't work. We need to fix it. I've added an
+	 * assertion to guarantee this in order to avoid nasty surprises.
 	 */
 	return post_completion(ctrlr, cmd, &ctrlr->qp[req->qpair->qid]->cq, 0,
 			       SPDK_NVME_SC_INTERNAL_DEVICE_ERROR,
