@@ -388,34 +388,31 @@ map_one(lm_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *
 	dma_sg_t tmp_sg;
 	struct iovec tmp_iov;
 
+	assert(ctx != NULL);
+	assert(sg != NULL);
+	assert(iov != NULL);
+
 	/*
 	 * TODO struct muser_ep* == ctx->pvt, but lm_ctx_t is opaque, need
 	 * a function to return pvt from lm_ctx_t.
 	 */
 
-	ret = lm_addr_to_sg(ctx, addr, len, &tmp_sg, 1);
+	ret = lm_addr_to_sg(ctx, addr, len, sg, 1);
 	if (ret != 1) {
 		SPDK_ERRLOG("failed to map %#lx-%#lx\n", addr, addr + len);
 		errno = ret;
 		return NULL;
 	}
 
-	ret = lm_map_sg(ctx, &tmp_sg, &tmp_iov, 1);
+	ret = lm_map_sg(ctx, sg, iov, 1);
 	if (ret != 0) {
 		SPDK_ERRLOG("failed to map segment: %d\n", ret);
 		errno = ret;
 		return NULL;
 	}
 
-	if (sg) {
-		*sg = tmp_sg;
-	}
-
-	if (iov) {
-		*iov = tmp_iov;
-	}
-
-	return tmp_iov.iov_base;
+	/* FIXME 0 might be a legitimate address, right? */
+	return iov->iov_base;
 }
 
 static uint32_t
@@ -562,13 +559,14 @@ _map_one(void *prv, uint64_t addr, uint64_t len)
 {
 	struct muser_req *m_req;
 	struct muser_qpair *m_qpair;
+	void *ret;
 
 	assert(prv != NULL);
 
 	m_req = SPDK_CONTAINEROF(prv, struct muser_req, cmd);
 	m_qpair = SPDK_CONTAINEROF(m_req->req.qpair, struct muser_qpair, qpair);
 
-	return map_one(m_qpair->ctrlr->lm_ctx, addr, len, &m_req->sg, NULL);
+	return map_one(m_qpair->ctrlr->lm_ctx, addr, len, &m_req->sg, &m_req->iov);
 }
 
 static int
