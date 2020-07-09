@@ -1624,16 +1624,7 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 		return (unsigned long)MAP_FAILED;
 	}
 
-	if (ctrlr->doorbells != NULL) {
-		goto out;
-	}
-
-	ctrlr->doorbells = lm_mmap(ctrlr->lm_ctx, off, len);
-	if (ctrlr->doorbells == MAP_FAILED) {
-		SPDK_ERRLOG("%s: failed to allocate device memory: %m\n",
-			    ctrlr->endpoint->trid.traddr);
-	}
-out:
+	assert(ctrlr->doorbells != NULL);
 
 	return (unsigned long)ctrlr->endpoint->fd;
 }
@@ -1673,7 +1664,7 @@ muser_dev_info_fill(lm_dev_info_t *dev_info)
 				     };
 	static struct lm_sparse_mmap_areas mmap_area = {.nr_mmap_areas = 1,
 		       .areas[0].start = DOORBELLS,
-				.areas[0].size = PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2),
+				.areas[0].size = MUSER_DOORBELLS_SIZE,
 	};
 
 	lm_reg_info_t *reg_info;
@@ -1784,7 +1775,8 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 }
 
 static int
-spdk_unmap_dma(void *pvt, uint64_t iova) {
+spdk_unmap_dma(void *pvt, uint64_t iova)
+{
 
 	struct muser_endpoint *muser_ep = pvt;
 	struct muser_ctrlr *ctrlr;
@@ -1805,7 +1797,7 @@ spdk_unmap_dma(void *pvt, uint64_t iova) {
 		if (ctrlr->qp[i] == NULL) {
 			continue;
 		}
-		if (ctrlr->qp[i]->cq.sg.dma_addr == iova || 
+		if (ctrlr->qp[i]->cq.sg.dma_addr == iova ||
 		    ctrlr->qp[i]->sq.sg.dma_addr == iova) {
 
 			if (i == 0) {
@@ -1816,7 +1808,7 @@ spdk_unmap_dma(void *pvt, uint64_t iova) {
 		}
 	}
 
-	return 0;	
+	return 0;
 }
 
 static void
