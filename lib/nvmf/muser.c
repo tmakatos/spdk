@@ -1941,7 +1941,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	}
 
 	muser_ep->fd = fd;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n", muser_ep->trid.traddr,
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: doorbells %p\n", muser_ep->trid.traddr,
 		      muser_ep->doorbells);
 
 	dev_info.pvt = muser_ep;
