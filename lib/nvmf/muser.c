@@ -2523,7 +2523,7 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	 * be avoided completely by ensuring we have as many requests as slots
 	 * in the SQ, plus one for the the property request.
 	 */
-	if (req == NULL) {
+	if (spdk_unlikely(req == NULL)) {
 		return -1;
 	}
 
@@ -2534,7 +2534,7 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 		err = map_io_cmd_req(ctrlr, req);
 	}
 
-	if (err < 0) {
+	if (spdk_unlikely(err < 0)) {
 		SPDK_ERRLOG("%s: map NVMe command opc 0x%x failed\n",
 			    ctrlr->endpoint->trid.traddr, cmd->opc);
 		goto out;
