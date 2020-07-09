@@ -2501,7 +2501,6 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 			return -EFAULT;
 		}
 		req->iovcnt = err;
-		return 0;
 	}
 
 	return 0;
