@@ -1111,7 +1111,8 @@ consume_admin_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 				       cmd->opc == SPDK_NVME_OPC_DELETE_IO_CQ);
 	}
 
-	SPDK_NOTICELOG("%s: unsupported command 0x%x\n", ctrlr->endpoint->trid.traddr, cmd->opc);
+	SPDK_NOTICELOG("%s: unsupported command 0x%x\n",
+		       ctrlr->endpoint->trid.traddr, cmd->opc);
 	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0,
 			       SPDK_NVME_SC_INVALID_OPCODE,
 			       SPDK_NVME_SCT_GENERIC);
@@ -2478,7 +2479,8 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 		break;
 	default:
 		SPDK_ERRLOG("%s: SQ%d invalid I/O request type 0x%x\n",
-			    ctrlr->endpoint->trid.traddr, req->qpair->qid, req->cmd->nvme_cmd.opc);
+			    ctrlr->endpoint->trid.traddr, req->qpair->qid,
+			    req->cmd->nvme_cmd.opc);
 		return -EINVAL;
 	}
 
@@ -2494,8 +2496,8 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 		err = muser_map_prps(ctrlr, &req->cmd->nvme_cmd, req->iov,
 				     req->length);
 		if (err < 0) {
-			SPDK_ERRLOG("%s: failed to map PRP: %d\n", ctrlr->endpoint->trid.traddr,
-				    err);
+			SPDK_ERRLOG("%s: failed to map PRP: %d\n",
+				    ctrlr->endpoint->trid.traddr, err);
 			return -EFAULT;
 		}
 		req->iovcnt = err;
