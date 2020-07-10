@@ -123,7 +123,7 @@ struct muser_req  {
 	struct iovec				iov[MUSER_MAX_IOVEC];
 
 	/*
-	 * Must be large enough to accomodate MUSER_MDTS + 1.
+	 * Must be large enough to accomodate MUSER_MAX_IOVEC.
 	 * TODO add static assert.
 	 */
 	uint8_t					iovcnt;
@@ -581,7 +581,7 @@ _map_one(void *prv, uint64_t addr, uint64_t len)
 	m_qpair = SPDK_CONTAINEROF(m_req->req.qpair, struct muser_qpair, qpair);
 
 	assert(m_req->iovcnt >= 0);
-	assert(m_req->iovcnt <= MUSER_MAX_IOVEC);
+	assert(m_req->iovcnt < MUSER_MAX_IOVEC);
 	ret = map_one(m_qpair->ctrlr->lm_ctx, addr, len,
 		      &m_req->sg[m_req->iovcnt],
 		      &m_req->iov[m_req->iovcnt]);
