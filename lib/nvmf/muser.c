@@ -2080,12 +2080,11 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 				}
 			}
 			muser_destroy_endpoint(muser_ep);
+			return;
 		}
 	}
 
-	if (muser_ep == NULL) {
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: not found\n", trid->traddr);
-	}
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: not found\n", trid->traddr);
 }
 
 static void
