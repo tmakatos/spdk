@@ -2605,6 +2605,19 @@ muser_qpair_poll(struct muser_qpair *qpair)
 	}
 }
 
+static void
+muser_poll_group_remove_queues(struct muser_poll_group *muser_group,
+	                       struct muser_ctrlr *ctrlr)
+{
+	struct muser_qpair *muser_qpair, *tmp;
+
+	TAILQ_FOREACH_SAFE(muser_qpair, &muser_group->qps, link, tmp) {
+		if (muser_qpair->ctrlr == ctrlr) {
+			TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
+		}
+	}
+}
+
 /*
  * Called unconditionally, periodically, very frequently from SPDK to ask
  * whether there's work to be done.  This functions consumes requests generated
@@ -2628,9 +2641,19 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	TAILQ_FOREACH_SAFE(muser_qpair, &muser_group->qps, link, tmp) {
 
 		if (nvmf_qpair_is_admin_queue(&muser_qpair->qpair)) {
+			int err;
+
 			ctrlr = muser_qpair->ctrlr;
 
-			if (muser_ctrlr_poll(ctrlr) != 0) {
+			err = muser_ctrlr_poll(ctrlr);
+			if (spdk_unlikely(err) != 0) {
+				if (err == -ENOTCONN) {
+					muser_poll_group_remove_queues(muser_group, ctrlr);
+					muser_stop_listen(&ctrlr->transport->transport,
+						          &ctrlr->endpoint->trid);
+					continue;
+				}
+
 				/*
 				 * FIXME now that the controller has failed, do
 				 * we just remove from this list all queue pairs
