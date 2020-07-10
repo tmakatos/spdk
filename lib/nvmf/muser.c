@@ -798,6 +798,7 @@ static void
 destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid)
 {
 	struct muser_qpair *qpair;
+	int ret;
 
 	if (ctrlr == NULL) {
 		return;
@@ -816,7 +817,6 @@ destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid)
 	 */
 	destroy_io_qp(qpair);
 	tear_down_qpair(qpair);
-	free(qpair);
 	ctrlr->qp[qid] = NULL;
 }
 
@@ -1838,11 +1838,15 @@ init_pci_config_space(lm_pci_config_space_t *p)
 static int
 destroy_ctrlr(struct muser_ctrlr *ctrlr)
 {
+	int i;
+
 	if (ctrlr == NULL) {
 		return 0;
 	}
 
-	destroy_qp(ctrlr, 0);
+	for (i = 0; i < MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		destroy_qp(ctrlr, i);
+	}
 
 	if (ctrlr->endpoint) {
 		ctrlr->endpoint->ctrlr = NULL;
@@ -1881,7 +1885,8 @@ spdk_unmap_dma(void *pvt, uint64_t iova)
 			if (i == 0) {
 				destroy_io_qp(ctrlr->qp[0]);
 			} else {
-				destroy_qp(ctrlr, ctrlr->qp[i]->qpair.qid);
+				destroy_io_qp(ctrlr->qp[i]);
+				ctrlr->qp[i]->del = true;
 			}
 		}
 	}
@@ -2684,11 +2689,12 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		 * consolidated into a single flag, e.g. 'active'?
 		 */
 		if (muser_qpair->del) {
+			TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
+			destroy_qp(ctrlr, muser_qpair->qpair.qid);
 			continue;
 		}
 
 		muser_qpair_poll(muser_qpair);
-
 	}
 
 	return 0;
