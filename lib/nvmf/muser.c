@@ -2648,9 +2648,8 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			err = muser_ctrlr_poll(ctrlr);
 			if (spdk_unlikely(err) != 0) {
 				if (err == -ENOTCONN) {
-					muser_poll_group_remove_queues(muser_group, ctrlr);
-					muser_stop_listen(&ctrlr->transport->transport,
-						          &ctrlr->endpoint->trid);
+					TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
+					ctrlr->ready = false;
 					continue;
 				}
 
