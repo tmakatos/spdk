@@ -1714,18 +1714,14 @@ bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 static void
 muser_log(void *pvt, lm_log_lvl_t lvl, char const *msg)
 {
-	struct muser_endpoint *muser_ep = pvt;
-	struct muser_ctrlr *ctrlr;
-
-	ctrlr = muser_ep->ctrlr;
-	assert(ctrlr != NULL);
+	struct muser_endpoint *endpoint = pvt;
 
 	if (lvl >= LM_DBG) {
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: %s", ctrlr->endpoint->trid.traddr, msg);
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: %s", endpoint->trid.traddr, msg);
 	} else if (lvl >= LM_INF) {
-		SPDK_NOTICELOG("%s: %s", ctrlr->endpoint->trid.traddr, msg);
+		SPDK_NOTICELOG("%s: %s", endpoint->trid.traddr, msg);
 	} else {
-		SPDK_ERRLOG("%s: %s", ctrlr->endpoint->trid.traddr, msg);
+		SPDK_ERRLOG("%s: %s", endpoint->trid.traddr, msg);
 	}
 }
 
