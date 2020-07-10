@@ -2563,29 +2563,14 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	if (spdk_unlikely(err < 0)) {
 		SPDK_ERRLOG("%s: map NVMe command opc 0x%x failed\n",
 			    ctrlr->endpoint->trid.traddr, cmd->opc);
-		goto out;
+		req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+		return handle_cmd_rsp(muser_req, muser_req->cb_arg);
 	}
 
 	spdk_nvmf_request_exec(req);
 
 	return 0;
-
-out:
-	/*
-	 * FIXME must unmap PRRs. handle_cmd_rsp already does that. In the
-	 * error case we should call handle_cmd_rsp (having set
-	 * req->req.rsp->nvme_cpl.* with the error values) instead of
-	 * post_completion so that there is a single complete path.
-	 *
-	 * AFAIK functions map_XXX_cmd_req don't fail after muser_map_prps has
-	 * been successfully called, and muser_map_prps/_map_one expects only
-	 * one segment. If the guest submits a request that spans two DMA
-	 * regions then this code won't work. We need to fix it. I've added an
-	 * assertion to guarantee this in order to avoid nasty surprises.
-	 */
-	return post_completion(ctrlr, cmd, &ctrlr->qp[req->qpair->qid]->cq, 0,
-			       SPDK_NVME_SC_INTERNAL_DEVICE_ERROR,
-			       SPDK_NVME_SCT_GENERIC);
 }
 
 static int
