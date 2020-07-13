@@ -71,24 +71,25 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define PAGE_MASK (~(PAGE_SIZE-1))
 #define PAGE_ALIGN(x) ((x + PAGE_SIZE - 1) & PAGE_MASK)
 
-/*
- * Define TRAP_DOORBELLS to disable memory mapping the doorbells and trap instead.
- * This will incur significant performance penalty and is intended for debug
- * purposes.
- */
-//#define TRAP_DOORBELLS
-
 #define MUSER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define MUSER_DEFAULT_AQ_DEPTH 32
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
 #define MUSER_DEFAULT_IN_CAPSULE_DATA_SIZE 0
+
+/* 
+ * By setting spdk_nvmf_transport_opts.max_io_size = MUSER_DEFAULT_MAX_IO_SIZE
+ * we're effectively setting MDTS.
+ */
+#define MUSER_MDTS 32
+
+/* TODO: Move to nvmf_internal.h, SPDK NVMf uses fixed 4KiB */
+#define NVMF_MEMORY_PAGE_SIZE 4096
+
 #define MUSER_DEFAULT_MAX_IO_SIZE 131072
-#define MUSER_DEFAULT_IO_UNIT_SIZE 131072
+#define MUSER_DEFAULT_IO_UNIT_SIZE (MUSER_MDTS * NVMF_MEMORY_PAGE_SIZE)
 #define MUSER_DEFAULT_NUM_SHARED_BUFFERS 512 /* internal buf size */
 #define MUSER_DEFAULT_BUFFER_CACHE_SIZE 0
 #define MUSER_DOORBELLS_SIZE PAGE_ALIGN(MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2)
-/* TODO: Move to nvmf_internal.h, SPDK NVMf uses fixed 4KiB */
-#define NVMF_MEMORY_PAGE_SIZE 4096
 
 #define NVME_REG_CFG_SIZE       0x1000
 #define NVME_REG_BAR0_SIZE      0x4000
@@ -103,17 +104,12 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 SPDK_STATIC_ASSERT(DOORBELLS == offsetof(struct spdk_nvme_registers, doorbell[0].sq_tdbl),
 		   "Incorrect register offset");
 
-enum muser_nvmf_dir {
-	MUSER_NVMF_INVALID,
-	MUSER_NVMF_READ,
-	MUSER_NVMF_WRITE
-};
-
 struct muser_req;
 struct muser_qpair;
 
 typedef int (*muser_req_cb_fn)(struct muser_req *req, void *cb_arg);
 
+#define MUSER_MAX_IOVEC (MUSER_MDTS + 1)
 struct muser_req  {
 	struct spdk_nvmf_request		req;
 	struct spdk_nvme_cpl			rsp;
@@ -123,22 +119,16 @@ struct muser_req  {
 	muser_req_cb_fn				cb_fn;
 	void					*cb_arg;
 
-	TAILQ_ENTRY(muser_req)			link;
-};
+	dma_sg_t				sg[MUSER_MAX_IOVEC];
+	struct iovec				iov[MUSER_MAX_IOVEC];
 
-struct muser_nvmf_prop_req {
-	enum muser_nvmf_dir			dir;
-	sem_t					wait;
 	/*
-	 * TODO either this will be a register access or an internal command
-	 * (for now it's only about starting the NVMf subsystem. Convert into a
-	 * union.
+	 * Must be large enough to accomodate MUSER_MAX_IOVEC.
+	 * TODO add static assert.
 	 */
-	char					*buf;
-	size_t					count;
-	loff_t					pos;
-	ssize_t					ret;
-	struct muser_req			muser_req;
+	uint8_t					iovcnt;
+
+	TAILQ_ENTRY(muser_req)			link;
 };
 
 /*
@@ -190,6 +180,61 @@ struct muser_qpair {
 	TAILQ_ENTRY(muser_qpair)		link;
 };
 
+struct muser_poll_group {
+	struct spdk_nvmf_transport_poll_group	group;
+	TAILQ_HEAD(, muser_qpair)		qps;
+};
+
+struct muser_ctrlr {
+	struct muser_endpoint			*endpoint;
+	struct muser_transport			*transport;
+	lm_ctx_t				*lm_ctx;
+	lm_pci_config_space_t			*pci_config_space;
+
+	/* True when the admin queue is connected */
+	bool					ready;
+
+	/* PCI capabilities */
+	struct pmcap				pmcap;
+	struct msixcap				msixcap;
+	struct pxcap				pxcap;
+
+	uint16_t				cntlid;
+
+	struct muser_qpair			*qp[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
+
+	TAILQ_ENTRY(muser_ctrlr)		link;
+
+	/* even indices are SQ, odd indices are CQ */
+	volatile uint32_t			*doorbells;
+
+	/* internal CSTS.CFS register for MUSER fatal errors */
+	uint32_t				cfs : 1;
+};
+
+struct muser_endpoint {
+	lm_ctx_t				*lm_ctx;
+	int					fd;
+	volatile uint32_t			*doorbells;
+
+	struct spdk_nvme_transport_id		trid;
+	const struct spdk_nvmf_subsystem	*subsystem;
+
+	/* The current controller. NULL if nothing is
+	 * currently attached. */
+	struct muser_ctrlr			*ctrlr;
+
+	TAILQ_ENTRY(muser_endpoint)		link;
+};
+
+struct muser_transport {
+	struct spdk_nvmf_transport		transport;
+	pthread_mutex_t				lock;
+	TAILQ_HEAD(, muser_endpoint)		endpoints;
+
+	TAILQ_HEAD(, muser_qpair)		new_qps;
+};
+
 /*
  * function prototypes
  */
@@ -238,64 +283,14 @@ io_q_id(struct io_q *q)
 	return muser_qpair->qpair.qid;
 }
 
-struct muser_poll_group {
-	struct spdk_nvmf_transport_poll_group	group;
-	TAILQ_HEAD(, muser_qpair)		qps;
-};
-
-struct muser_ctrlr {
-	struct spdk_nvme_transport_id		trid;
-	struct muser_transport			*transport;
-	char					uuid[SPDK_NVME_NQN_FIELD_SIZE];
-	char					*id;
-	pthread_t				lm_thr;
-	lm_ctx_t				*lm_ctx;
-	lm_pci_config_space_t			*pci_config_space;
-
-	/*
-	 * TODO variables that are checked by poll_group_poll to see whether
-	 * commands need to be executed, in addition to checking the doorbells.
-	 * We now have 2 such different commands so we should introduce a queue,
-	 * or if we're going to have a single outstanding command we should
-	 * group them into a union.
-	 */
-	sem_t					sem;
-	struct muser_nvmf_prop_req		prop_req; /* read/write BAR0 */
-
-	spdk_nvmf_tgt_subsystem_listen_done_fn	cb_fn;
-	void					*cb_arg;
-
-	/* PCI capabilities */
-	struct pmcap				pmcap;
-	struct msixcap				msixcap;
-	struct pxcap				pxcap;
-
-	uint16_t				cntlid;
-
-	struct muser_qpair			*qp[MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
-
-	TAILQ_ENTRY(muser_ctrlr)		link;
-
-	/* even indices are SQ, odd indices are CQ */
-	volatile uint32_t			*doorbells;
-
-	/* internal CSTS.CFS register for MUSER fatal errors */
-	uint32_t				cfs : 1;
-
-	lm_trans_t				lm_trans;
-
-	/* for LM_TRAS_SOCK */
-	int					fd;
-	bool					initialized;
-};
-
-
 static void
 fail_ctrlr(struct muser_ctrlr *ctrlr)
 {
 	assert(ctrlr != NULL);
 
-	SPDK_ERRLOG(":%s failing controller\n", ctrlr->id);
+	if (ctrlr->cfs == 0) {
+		SPDK_ERRLOG(":%s failing controller\n", ctrlr->endpoint->trid.traddr);
+	}
 
 	ctrlr->cfs = 1U;
 }
@@ -308,19 +303,30 @@ ctrlr_interrupt_enabled(struct muser_ctrlr *ctrlr)
 	return (!pci->hdr.cmd.id || ctrlr->msixcap.mxc.mxe);
 }
 
-struct muser_transport {
-	struct spdk_nvmf_transport		transport;
-	pthread_mutex_t				lock;
-	TAILQ_HEAD(, muser_ctrlr)		ctrlrs;
+static void
+muser_destroy_endpoint(struct muser_endpoint *muser_ep)
+{
+	assert(muser_ep->ctrlr == NULL);
 
-	TAILQ_HEAD(, muser_qpair)		new_qps;
-};
+	if (muser_ep->doorbells) {
+		munmap((void *)muser_ep->doorbells, MUSER_DOORBELLS_SIZE);
+	}
+
+	if (muser_ep->fd > 0) {
+		close(muser_ep->fd);
+	}
+
+	lm_ctx_destroy(muser_ep->lm_ctx);
+
+	free(muser_ep);
+}
 
 /* called when process exits */
 static int
 muser_destroy(struct spdk_nvmf_transport *transport)
 {
 	struct muser_transport *muser_transport;
+	struct muser_endpoint *muser_ep, *tmp;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "destroy transport\n");
 
@@ -328,6 +334,19 @@ muser_destroy(struct spdk_nvmf_transport *transport)
 					   transport);
 
 	(void)pthread_mutex_destroy(&muser_transport->lock);
+
+	TAILQ_FOREACH_SAFE(muser_ep, &muser_transport->endpoints, link, tmp) {
+		TAILQ_REMOVE(&muser_transport->endpoints, muser_ep, link);
+		if (muser_ep->doorbells) {
+			munmap((void *)muser_ep->doorbells, MUSER_DOORBELLS_SIZE);
+		}
+
+		if (muser_ep->fd != -1) {
+			close(muser_ep->fd);
+		}
+
+		free(muser_ep);
+	}
 
 	free(muser_transport);
 
@@ -352,7 +371,7 @@ muser_create(struct spdk_nvmf_transport_opts *opts)
 		goto err;
 	}
 
-	TAILQ_INIT(&muser_transport->ctrlrs);
+	TAILQ_INIT(&muser_transport->endpoints);
 	TAILQ_INIT(&muser_transport->new_qps);
 
 	return &muser_transport->transport;
@@ -363,108 +382,8 @@ err:
 	return NULL;
 }
 
-#define MDEV_CREATE_PATH "/sys/class/muser/muser/mdev_supported_types/muser-1/create"
-
-static void
-mdev_remove(const char *uuid)
-{
-	char *s;
-	FILE *fp;
-
-	if (asprintf(&s, "/sys/class/muser/muser/%s/remove", uuid) == -1) {
-		return;
-	}
-
-	fp = fopen(s, "a");
-	if (fp == NULL) {
-		SPDK_ERRLOG("%s: failed to open %s: %m\n", uuid, s);
-		return;
-	}
-	if (fprintf(fp, "1\n") < 0) {
-		SPDK_ERRLOG("%s: failed to remove: %m\n", uuid);
-	}
-	fclose(fp);
-}
-
-static int
-mdev_wait(const char *uuid)
-{
-	char *s;
-	int err;
-
-	if (asprintf(&s, "/dev/muser/%s", uuid) == -1) {
-		return -errno;
-	}
-
-	while ((err = access(s, F_OK)) == -1) {
-		if (errno != ENOENT) {
-			break;
-		}
-		/* FIXME don't sleep, use a more intelligent way, e.g. inotify */
-		sleep(1);
-	}
-	free(s);
-	return err;
-}
-
-static int
-mdev_create(const char *uuid)
-{
-	int fd;
-	int err;
-
-	fd = open(MDEV_CREATE_PATH, O_WRONLY);
-	if (fd == -1) {
-		SPDK_ERRLOG("%s: error opening '%s': %m\n", uuid, MDEV_CREATE_PATH);
-		return -1;
-	}
-
-	err = write(fd, uuid, strlen(uuid));
-	if (err != (int)strlen(uuid)) {
-		SPDK_ERRLOG("%s: error creating device: %m\n", uuid);
-		err = -1;
-	} else {
-		err = 0;
-	}
-	(void)close(fd);
-	if (err != 0) {
-		return err;
-	}
-
-	return mdev_wait(uuid);
-}
-
-static int
-handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
-		  const size_t count, loff_t pos, const bool is_write);
-
 static void
 destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid);
-
-static int
-do_prop_req(struct muser_ctrlr *ctrlr, char *buf, size_t count, loff_t pos,
-	    bool is_write)
-{
-	int err;
-
-	assert(ctrlr != NULL);
-
-	err = sem_init(&ctrlr->prop_req.wait, 0, 0);
-	if (err != 0) {
-		return err;
-	}
-	ctrlr->prop_req.ret = 0;
-	ctrlr->prop_req.buf = buf;
-	ctrlr->prop_req.count = count;
-	ctrlr->prop_req.pos = pos;
-	spdk_wmb();
-	ctrlr->prop_req.dir = is_write ? MUSER_NVMF_WRITE : MUSER_NVMF_READ;
-	err = sem_wait(&ctrlr->prop_req.wait);
-	if (err != 0) {
-		return err;
-	}
-	return ctrlr->prop_req.ret;
-}
 
 static uint16_t
 max_queue_size(struct muser_ctrlr const *ctrlr)
@@ -478,41 +397,36 @@ max_queue_size(struct muser_ctrlr const *ctrlr)
 
 /* TODO this should be a libmuser public function */
 static void *
-map_one(void *prv, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
+map_one(lm_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
 {
 	int ret;
-	lm_ctx_t *ctx = (lm_ctx_t *)prv;
-	dma_sg_t tmp_sg;
-	struct iovec tmp_iov;
+
+	assert(ctx != NULL);
+	assert(sg != NULL);
+	assert(iov != NULL);
 
 	/*
-	 * TODO struct muser_ctrlr* == ctx->pvt, but lm_ctx_t is opaque, need
+	 * TODO struct muser_ep* == ctx->pvt, but lm_ctx_t is opaque, need
 	 * a function to return pvt from lm_ctx_t.
 	 */
 
-	ret = lm_addr_to_sg(ctx, addr, len, &tmp_sg, 1);
+	ret = lm_addr_to_sg(ctx, addr, len, sg, 1);
 	if (ret != 1) {
-		SPDK_ERRLOG("failed to map 0x%lx-0x%lx\n", addr, addr + len);
+		SPDK_ERRLOG("failed to map %#lx-%#lx\n", addr, addr + len);
 		errno = ret;
 		return NULL;
 	}
 
-	ret = lm_map_sg(ctx, &tmp_sg, &tmp_iov, 1);
+	ret = lm_map_sg(ctx, sg, iov, 1);
 	if (ret != 0) {
 		SPDK_ERRLOG("failed to map segment: %d\n", ret);
 		errno = ret;
 		return NULL;
 	}
 
-	if (sg) {
-		*sg = tmp_sg;
-	}
-
-	if (iov) {
-		*iov = tmp_iov;
-	}
-
-	return tmp_iov.iov_base;
+	/* FIXME 0 might be a legitimate address, right? */
+	assert(iov->iov_base != NULL);
+	return iov->iov_base;
 }
 
 static uint32_t
@@ -568,7 +482,7 @@ asq_map(struct muser_ctrlr *ctrlr)
 	q.head = ctrlr->doorbells[0] = 0;
 	q.cqid = 0;
 	q.addr = map_one(ctrlr->lm_ctx, regs->asq,
-			 q.size * sizeof(struct spdk_nvme_cmd), NULL, NULL);
+			 q.size * sizeof(struct spdk_nvme_cmd), &q.sg, &q.iov);
 	if (q.addr == NULL) {
 		return -1;
 	}
@@ -643,7 +557,7 @@ acq_map(struct muser_ctrlr *ctrlr)
 	q->size = regs->aqa.bits.acqs + 1;
 	q->tail = 0;
 	q->addr = map_one(ctrlr->lm_ctx, regs->acq,
-			  q->size * sizeof(struct spdk_nvme_cpl), NULL, NULL);
+			  q->size * sizeof(struct spdk_nvme_cpl), &q->sg, &q->iov);
 	if (q->addr == NULL) {
 		return -1;
 	}
@@ -657,14 +571,31 @@ acq_map(struct muser_ctrlr *ctrlr)
 static void *
 _map_one(void *prv, uint64_t addr, uint64_t len)
 {
-	return map_one(prv, addr, len, NULL, NULL);
+	struct muser_req *m_req;
+	struct muser_qpair *m_qpair;
+	void *ret;
+
+	assert(prv != NULL);
+
+	m_req = SPDK_CONTAINEROF(prv, struct muser_req, cmd);
+	m_qpair = SPDK_CONTAINEROF(m_req->req.qpair, struct muser_qpair, qpair);
+
+	assert(m_req->iovcnt >= 0);
+	assert(m_req->iovcnt < MUSER_MAX_IOVEC);
+	ret = map_one(m_qpair->ctrlr->lm_ctx, addr, len,
+		      &m_req->sg[m_req->iovcnt],
+		      &m_req->iov[m_req->iovcnt]);
+	if (spdk_likely(ret != NULL)) {
+		m_req->iovcnt++;
+	}
+	return ret;
 }
 
 static int
 muser_map_prps(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	       struct iovec *iov, uint32_t length)
 {
-	return spdk_nvme_map_prps(ctrlr->lm_ctx, cmd, iov, length,
+	return spdk_nvme_map_prps(cmd, cmd, iov, length,
 				  NVMF_MEMORY_PAGE_SIZE,
 				  _map_one);
 }
@@ -742,23 +673,23 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	/* FIXME */
 	if (ctrlr->qp[0]->qpair.ctrlr->vcprop.csts.bits.shst != SPDK_NVME_SHST_NORMAL) {
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-		              "%s: ignore completion SQ%d cid=%d status=%#x\n",
-			      ctrlr->id, qid, cmd->cid, sc);
+			      "%s: ignore completion SQ%d cid=%d status=%#x\n",
+			      ctrlr->endpoint->trid.traddr, qid, cmd->cid, sc);
 		return 0;
 	}
 
 	if (cq_is_full(ctrlr, cq)) {
 		SPDK_ERRLOG("%s: CQ%d full (tail=%d, head=%d)\n",
-			    ctrlr->id, qid, cq->tail, *hdbl(ctrlr, cq));
+			    ctrlr->endpoint->trid.traddr, qid, cq->tail, *hdbl(ctrlr, cq));
 		return -1;
 	}
 
 	cpl = ((struct spdk_nvme_cpl *)cq->addr) + cq->tail;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-	              "%s: request complete SQ%d cid=%d status=%#x SQ head=%#x CQ tail=%#x\n",
-		      ctrlr->id, qid, cmd->cid, sc, ctrlr->qp[qid]->sq.head,
-	              cq->tail);
+		      "%s: request complete SQ%d cid=%d status=%#x SQ head=%#x CQ tail=%#x\n",
+		      ctrlr->endpoint->trid.traddr, qid, cmd->cid, sc, ctrlr->qp[qid]->sq.head,
+		      cq->tail);
 
 	if (qid == 0) {
 		switch (cmd->opc) {
@@ -792,7 +723,7 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 		err = lm_irq_trigger(ctrlr->lm_ctx, cq->iv);
 		if (err != 0) {
 			SPDK_ERRLOG("%s: failed to trigger interrupt: %m\n",
-			            ctrlr->id);
+				    ctrlr->endpoint->trid.traddr);
 			return err;
 		}
 	}
@@ -846,6 +777,9 @@ destroy_io_qp(struct muser_qpair *qp)
 	if (qp->ctrlr == NULL) {
 		return;
 	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "destroy I/O QP%d\n", qp->qpair.qid);
+
 	destroy_io_q(qp->ctrlr->lm_ctx, &qp->sq);
 	destroy_io_q(qp->ctrlr->lm_ctx, &qp->cq);
 }
@@ -882,7 +816,6 @@ destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid)
 	 */
 	destroy_io_qp(qpair);
 	tear_down_qpair(qpair);
-	free(qpair);
 	ctrlr->qp[qid] = NULL;
 }
 
@@ -913,7 +846,7 @@ init_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 
 	qpair->reqs_internal = calloc(qsize, sizeof(struct muser_req));
 	if (qpair->reqs_internal == NULL) {
-		SPDK_ERRLOG("%s: error allocating reqs: %m\n", ctrlr->id);
+		SPDK_ERRLOG("%s: error allocating reqs: %m\n", ctrlr->endpoint->trid.traddr);
 		err = -ENOMEM;
 		goto out;
 	}
@@ -949,7 +882,7 @@ add_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 	int err;
 	struct muser_transport *muser_transport;
 
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: request add QP%d\n", ctrlr->id, qid);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: request add QP%d\n", ctrlr->endpoint->trid.traddr, qid);
 
 	err = init_qp(ctrlr, transport, qsize, qid);
 	if (err != 0) {
@@ -996,22 +929,22 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	assert(cmd != NULL);
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-	              "%s: create I/O %cQ%d: QSIZE=%#x\n", ctrlr->id,
+		      "%s: create I/O %cQ%d: QSIZE=%#x\n", ctrlr->endpoint->trid.traddr,
 		      is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid,
 		      cmd->cdw10_bits.create_io_q.qsize);
 
 	if (cmd->cdw10_bits.create_io_q.qid >= MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
-		SPDK_ERRLOG("%s: invalid QID=%d, max=%d\n", ctrlr->id,
-			     cmd->cdw10_bits.create_io_q.qid,
-			     MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR);
+		SPDK_ERRLOG("%s: invalid QID=%d, max=%d\n", ctrlr->endpoint->trid.traddr,
+			    cmd->cdw10_bits.create_io_q.qid,
+			    MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR);
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
 		goto out;
 	}
 
 	if (lookup_io_q(ctrlr, cmd->cdw10_bits.create_io_q.qid, is_cq)) {
-		SPDK_ERRLOG("%s: %cQ%d already exists\n", ctrlr->id,
-		            is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid);
+		SPDK_ERRLOG("%s: %cQ%d already exists\n", ctrlr->endpoint->trid.traddr,
+			    is_cq ? 'C' : 'S', cmd->cdw10_bits.create_io_q.qid);
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
 		goto out;
@@ -1027,7 +960,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 			 * Support for CAP.CMBS is not mentioned in the NVMf
 			 * spec.
 			 */
-			SPDK_ERRLOG("%s: non-PC CQ not supporred\n", ctrlr->id);
+			SPDK_ERRLOG("%s: non-PC CQ not supporred\n", ctrlr->endpoint->trid.traddr);
 			sc = SPDK_NVME_SC_INVALID_CONTROLLER_MEM_BUF;
 			goto out;
 		}
@@ -1036,8 +969,8 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 	} else {
 		/* CQ must be created before SQ */
 		if (!lookup_io_q(ctrlr, cmd->cdw11_bits.create_io_sq.cqid, true)) {
-			SPDK_ERRLOG("%s: CQ%d does not exist\n", ctrlr->id,
-			            cmd->cdw11_bits.create_io_sq.cqid);
+			SPDK_ERRLOG("%s: CQ%d does not exist\n", ctrlr->endpoint->trid.traddr,
+				    cmd->cdw11_bits.create_io_sq.cqid);
 			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 			sc = SPDK_NVME_SC_COMPLETION_QUEUE_INVALID;
 			goto out;
@@ -1045,20 +978,20 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 
 		entry_size = sizeof(struct spdk_nvme_cmd);
 		if (cmd->cdw11_bits.create_io_sq.pc != 0x1) {
-			SPDK_ERRLOG("%s: non-PC SQ not supported\n", ctrlr->id);
+			SPDK_ERRLOG("%s: non-PC SQ not supported\n", ctrlr->endpoint->trid.traddr);
 			sc = SPDK_NVME_SC_INVALID_CONTROLLER_MEM_BUF;
 			goto out;
 		}
 
 		io_q.cqid = cmd->cdw11_bits.create_io_sq.cqid;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: SQ%d CQID=%d\n", ctrlr->id,
-		              cmd->cdw10_bits.create_io_q.qid, io_q.cqid);
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: SQ%d CQID=%d\n", ctrlr->endpoint->trid.traddr,
+			      cmd->cdw10_bits.create_io_q.qid, io_q.cqid);
 	}
 
 	io_q.size = cmd->cdw10_bits.create_io_q.qsize + 1;
 	if (io_q.size > max_queue_size(ctrlr)) {
-		SPDK_ERRLOG("%s: queue too big, want=%d, max=%d\n", ctrlr->id,
-		            io_q.size, max_queue_size(ctrlr));
+		SPDK_ERRLOG("%s: queue too big, want=%d, max=%d\n", ctrlr->endpoint->trid.traddr,
+			    io_q.size, max_queue_size(ctrlr));
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_SIZE;
 		goto out;
@@ -1068,15 +1001,15 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 			    io_q.size * entry_size, &io_q.sg, &io_q.iov);
 	if (io_q.addr == NULL) {
 		sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-		SPDK_ERRLOG("%s: failed to map I/O queue: %m\n", ctrlr->id);
+		SPDK_ERRLOG("%s: failed to map I/O queue: %m\n", ctrlr->endpoint->trid.traddr);
 		goto out;
 	}
 	memset(io_q.addr, 0, io_q.size * entry_size);
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n",
-		       ctrlr->id, is_cq ? 'C' : 'S',
-		       cmd->cdw10_bits.create_io_q.qid, cmd->dptr.prp.prp1,
-		       (unsigned long long)io_q.addr);
+		      ctrlr->endpoint->trid.traddr, is_cq ? 'C' : 'S',
+		      cmd->cdw10_bits.create_io_q.qid, cmd->dptr.prp.prp1,
+		      (unsigned long long)io_q.addr);
 
 	if (is_cq) {
 		err = add_qp(ctrlr, ctrlr->qp[0]->qpair.transport, io_q.size,
@@ -1105,12 +1038,12 @@ handle_del_io_q(struct muser_ctrlr *ctrlr,
 	uint16_t sc = SPDK_NVME_SC_SUCCESS;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: delete I/O %cQ: QID=%d\n",
-	              ctrlr->id, is_cq ? 'C' : 'S',
+		      ctrlr->endpoint->trid.traddr, is_cq ? 'C' : 'S',
 		      cmd->cdw10_bits.delete_io_q.qid);
 
 	if (lookup_io_q(ctrlr, cmd->cdw10_bits.delete_io_q.qid, is_cq) == NULL) {
-		SPDK_ERRLOG("%s: %cQ%d does not exist\n", ctrlr->id,
-		            is_cq ? 'C' : 'S', cmd->cdw10_bits.delete_io_q.qid);
+		SPDK_ERRLOG("%s: %cQ%d does not exist\n", ctrlr->endpoint->trid.traddr,
+			    is_cq ? 'C' : 'S', cmd->cdw10_bits.delete_io_q.qid);
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
 		goto out;
@@ -1163,7 +1096,7 @@ consume_admin_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	assert(cmd != NULL);
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: handle admin req opc=%#x cid=%d\n",
-	              ctrlr->id, cmd->opc, cmd->cid);
+		      ctrlr->endpoint->trid.traddr, cmd->opc, cmd->cid);
 
 	switch (cmd->opc) {
 	/* TODO put all cases in order */
@@ -1199,7 +1132,8 @@ consume_admin_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 				       cmd->opc == SPDK_NVME_OPC_DELETE_IO_CQ);
 	}
 
-	SPDK_NOTICELOG("%s: unsupported command 0x%x\n", ctrlr->id, cmd->opc);
+	SPDK_NOTICELOG("%s: unsupported command 0x%x\n",
+		       ctrlr->endpoint->trid.traddr, cmd->opc);
 	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0,
 			       SPDK_NVME_SC_INVALID_OPCODE,
 			       SPDK_NVME_SCT_GENERIC);
@@ -1225,6 +1159,8 @@ handle_cmd_rsp(struct muser_req *req, void *cb_arg)
 			break;
 		}
 	}
+
+	lm_unmap_sg(qpair->ctrlr->lm_ctx, req->sg, req->iov, req->iovcnt);
 
 	return post_completion(qpair->ctrlr, &req->req.cmd->nvme_cmd,
 			       &qpair->ctrlr->qp[req->req.qpair->qid]->cq,
@@ -1280,6 +1216,77 @@ handle_sq_tdbl_write(struct muser_ctrlr *ctrlr, const uint32_t new_tail,
 	return 0;
 }
 
+static int
+map_admin_queue(struct muser_ctrlr *ctrlr)
+{
+	int err;
+
+	assert(ctrlr != NULL);
+
+	err = acq_map(ctrlr);
+	if (err != 0) {
+		SPDK_ERRLOG("%s: failed to map CQ0: %d\n", ctrlr->endpoint->trid.traddr, err);
+		return err;
+	}
+	err = asq_map(ctrlr);
+	if (err != 0) {
+		SPDK_ERRLOG("%s: failed to map SQ0: %d\n", ctrlr->endpoint->trid.traddr, err);
+		return err;
+	}
+	return 0;
+}
+
+static void
+unmap_admin_queue(struct muser_ctrlr *ctrlr)
+{
+	assert(ctrlr->qp[0] != NULL);
+
+	destroy_io_qp(ctrlr->qp[0]);
+}
+
+static int
+muser_prop_req_rsp(struct muser_req *req, void *cb_arg)
+{
+	struct muser_qpair *qpair = cb_arg;
+
+	assert(qpair != NULL);
+	assert(req != NULL);
+
+	if (req->req.cmd->prop_get_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET) {
+		assert(qpair->ctrlr != NULL);
+		assert(req != NULL);
+
+		memcpy(req->req.data,
+		       &req->req.rsp->prop_get_rsp.value.u64,
+		       req->req.length);
+	} else {
+		assert(req->req.cmd->prop_set_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET);
+		assert(qpair->ctrlr != NULL);
+
+		if (req->req.cmd->prop_set_cmd.ofst == CC) {
+			union spdk_nvme_cc_register *cc;
+
+			cc = (union spdk_nvme_cc_register *)&req->req.cmd->prop_set_cmd.value.u64;
+
+			if (cc->bits.en == 1 && cc->bits.shn == 0) {
+				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+					      "%s: MAP Admin queue\n",
+					      qpair->ctrlr->endpoint->trid.traddr);
+				map_admin_queue(qpair->ctrlr);
+			} else if ((cc->bits.en == 0 && cc->bits.shn == 0) ||
+				   (cc->bits.en == 1 && cc->bits.shn != 0)) {
+				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+					      "%s: UNMAP Admin queue\n",
+					      qpair->ctrlr->endpoint->trid.traddr);
+				unmap_admin_queue(qpair->ctrlr);
+			}
+		}
+	}
+
+	qpair->ctrlr->ready = true;
+	return 0;
+}
+
 /*
  * Handles a write at offset 0x1000 or more.
  *
@@ -1298,7 +1305,7 @@ handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
 
 	if (count != sizeof(uint32_t)) {
 		SPDK_ERRLOG("%s: bad doorbell buffer size %ld\n",
-		            ctrlr->id, count);
+			    ctrlr->endpoint->trid.traddr, count);
 		return -EINVAL;
 	}
 
@@ -1306,7 +1313,7 @@ handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
 
 	/* pos must be dword aligned */
 	if ((pos & 0x3) != 0) {
-		SPDK_ERRLOG("%s: bad doorbell offset %#lx\n", ctrlr->id, pos);
+		SPDK_ERRLOG("%s: bad doorbell offset %#lx\n", ctrlr->endpoint->trid.traddr, pos);
 		return -EINVAL;
 	}
 
@@ -1318,7 +1325,7 @@ handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
 		 * FIXME need to emit a "Write to Invalid Doorbell Register"
 		 * asynchronous event
 		 */
-		SPDK_ERRLOG("%s: bad doorbell index %#lx\n", ctrlr->id, pos);
+		SPDK_ERRLOG("%s: bad doorbell index %#lx\n", ctrlr->endpoint->trid.traddr, pos);
 		return -EINVAL;
 	}
 
@@ -1336,19 +1343,17 @@ static ssize_t
 access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 	       bool is_write)
 {
-	struct muser_ctrlr *ctrlr = pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+	struct muser_req *req;
 	int ret;
 
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-	              "%s: bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
-	              ctrlr->id, is_write ? "write" : "read", ctrlr, count,
-		      pos);
+	ctrlr = muser_ep->ctrlr;
 
-#if 0
-	if (is_write && SPDK_LOG_MUSER.enabled) {
-		spdk_log_dump(stdout, "muser_write", buf, count);
-	}
-#endif
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+		      "%s: bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
+		      muser_ep->trid.traddr, is_write ? "write" : "read", ctrlr, count,
+		      pos);
 
 	if (pos >= DOORBELLS) {
 		ret = handle_dbl_access(ctrlr, (uint32_t *)buf, count,
@@ -1360,12 +1365,37 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 		return ret;
 	}
 
-	ret = do_prop_req(ctrlr, buf, count, pos, is_write);
-	if (ret != 0) {
-		SPDK_WARNLOG("%s: failed to %s %lx@%lx BAR0\n", ctrlr->id,
-			      is_write ? "write" : "read", pos, count);
+	/* Construct a Fabric Property Get/Set command and send it */
+
+	req = get_muser_req(ctrlr->qp[0]);
+	if (req == NULL) {
 		return -1;
 	}
+
+	req->cb_fn = muser_prop_req_rsp;
+	req->cb_arg = ctrlr->qp[0];
+	req->req.cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
+	req->req.cmd->prop_set_cmd.cid = 0;
+	req->req.cmd->prop_set_cmd.attrib.size = (count / 4) - 1;
+	req->req.cmd->prop_set_cmd.ofst = pos;
+	if (is_write) {
+		req->req.cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
+		if (req->req.cmd->prop_set_cmd.attrib.size) {
+			req->req.cmd->prop_set_cmd.value.u64 = *(uint64_t *)buf;
+		} else {
+			req->req.cmd->prop_set_cmd.value.u32.high = 0;
+			req->req.cmd->prop_set_cmd.value.u32.low = *(uint32_t *)buf;
+		}
+	} else {
+		req->req.cmd->prop_get_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
+	}
+	req->req.length = count;
+	req->req.data = buf;
+
+	/* Mark the controller as busy to limit the queue depth for fabric get/set to 1 */
+	ctrlr->ready = false;
+
+	spdk_nvmf_request_exec_fabrics(&req->req);
 
 	return count;
 }
@@ -1378,7 +1408,10 @@ static ssize_t
 access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 		  const bool is_write)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+
+	ctrlr = muser_ep->ctrlr;
 
 	if (is_write) {
 		fprintf(stderr, "writes not supported\n");
@@ -1409,19 +1442,19 @@ handle_pmcs_write(struct muser_ctrlr *ctrlr, const struct pmcs *const pmcs)
 
 	if (ctrlr->pmcap.pmcs.ps != pmcs->ps) {
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: power state set to %#x\n",
-		              ctrlr->id, pmcs->ps);
+			      ctrlr->endpoint->trid.traddr, pmcs->ps);
 	}
 	if (ctrlr->pmcap.pmcs.pmee != pmcs->pmee) {
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: PME enable set to %#x\n",
-		              ctrlr->id, pmcs->pmee);
+			      ctrlr->endpoint->trid.traddr, pmcs->pmee);
 	}
 	if (ctrlr->pmcap.pmcs.dse != pmcs->dse) {
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: data select set to %#x\n",
-		              ctrlr->id, pmcs->dse);
+			      ctrlr->endpoint->trid.traddr, pmcs->dse);
 	}
 	if (ctrlr->pmcap.pmcs.pmes != pmcs->pmes) {
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: PME status set to %#x\n",
-		              ctrlr->id, pmcs->pmes);
+			      ctrlr->endpoint->trid.traddr, pmcs->pmes);
 	}
 	ctrlr->pmcap.pmcs = *pmcs;
 	return 0;
@@ -1450,7 +1483,10 @@ static ssize_t
 pmcap_access(void *pvt, const uint8_t id, char *const buf, const size_t count,
 	     const loff_t offset, const bool is_write)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+
+	ctrlr = muser_ep->ctrlr;
 
 	if (is_write) {
 		return handle_pmcap_write(ctrlr, buf, count, offset);
@@ -1468,20 +1504,20 @@ handle_mxc_write(struct muser_ctrlr *ctrlr, const struct mxc *const mxc)
 	assert(mxc != NULL);
 
 	if (mxc->mxe != ctrlr->msixcap.mxc.mxe) {
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: %s MSI-X\n", ctrlr->id,
-		              mxc->mxe ? "enable" : "disable");
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: %s MSI-X\n", ctrlr->endpoint->trid.traddr,
+			      mxc->mxe ? "enable" : "disable");
 		ctrlr->msixcap.mxc.mxe = mxc->mxe;
 	}
 
 	if (mxc->fm != ctrlr->msixcap.mxc.fm) {
 		if (mxc->fm) {
 			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-			              "%s: all MSI-X vectors masked\n",
-			              ctrlr->id);
+				      "%s: all MSI-X vectors masked\n",
+				      ctrlr->endpoint->trid.traddr);
 		} else {
 			SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-			              "%s: vector's mask bit determines whether vector is masked",
-			              ctrlr->id);
+				      "%s: vector's mask bit determines whether vector is masked\n",
+				      ctrlr->endpoint->trid.traddr);
 		}
 		ctrlr->msixcap.mxc.fm = mxc->fm;
 	}
@@ -1499,11 +1535,11 @@ handle_msix_write(struct muser_ctrlr *ctrlr, char *const buf, const size_t count
 			return handle_mxc_write(ctrlr, (struct mxc *)buf);
 		default:
 			SPDK_ERRLOG("%s: invalid MSI-X write offset %ld\n",
-			            ctrlr->id, offset);
+				    ctrlr->endpoint->trid.traddr, offset);
 			return -EINVAL;
 		}
 	}
-	SPDK_ERRLOG("%s: invalid MSI-X write size %lu\n", ctrlr->id, count);
+	SPDK_ERRLOG("%s: invalid MSI-X write size %lu\n", ctrlr->endpoint->trid.traddr, count);
 	return -EINVAL;
 }
 
@@ -1511,7 +1547,10 @@ static ssize_t
 msixcap_access(void *pvt, const uint8_t id, char *const buf, size_t count,
 	       loff_t offset, const bool is_write)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+
+	ctrlr = muser_ep->ctrlr;
 
 	if (is_write) {
 		return handle_msix_write(ctrlr, buf, count, offset);
@@ -1530,73 +1569,73 @@ handle_pxcap_pxdc_write(struct muser_ctrlr *const c, const union pxdc *const p)
 
 	if (p->cere != c->pxcap.pxdc.cere) {
 		c->pxcap.pxdc.cere = p->cere;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: CERE %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: CERE %s\n", c->endpoint->trid.traddr,
 			      p->cere ? "enable" : "disable");
 	}
 
 	if (p->nfere != c->pxcap.pxdc.nfere) {
 		c->pxcap.pxdc.nfere = p->nfere;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: NFERE %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: NFERE %s\n", c->endpoint->trid.traddr,
 			      p->nfere ? "enable" : "disable");
 	}
 
 	if (p->fere != c->pxcap.pxdc.fere) {
 		c->pxcap.pxdc.fere = p->fere;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: FERE %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: FERE %s\n", c->endpoint->trid.traddr,
 			      p->fere ? "enable" : "disable");
 	}
 
 	if (p->urre != c->pxcap.pxdc.urre) {
 		c->pxcap.pxdc.urre = p->urre;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: URRE %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: URRE %s\n", c->endpoint->trid.traddr,
 			      p->urre ? "enable" : "disable");
 	}
 
 	if (p->ero != c->pxcap.pxdc.ero) {
 		c->pxcap.pxdc.ero = p->ero;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: ERO %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: ERO %s\n", c->endpoint->trid.traddr,
 			      p->ero ? "enable" : "disable");
 	}
 
 	if (p->mps != c->pxcap.pxdc.mps) {
 		c->pxcap.pxdc.mps = p->mps;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: MPS set to %d\n", c->id,
-		              p->mps);
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: MPS set to %d\n", c->endpoint->trid.traddr,
+			      p->mps);
 	}
 
 	if (p->ete != c->pxcap.pxdc.ete) {
 		c->pxcap.pxdc.ete = p->ete;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: ETE %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: ETE %s\n", c->endpoint->trid.traddr,
 			      p->ete ? "enable" : "disable");
 	}
 
 	if (p->pfe != c->pxcap.pxdc.pfe) {
 		c->pxcap.pxdc.pfe = p->pfe;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: PFE %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: PFE %s\n", c->endpoint->trid.traddr,
 			      p->pfe ? "enable" : "disable");
 	}
 
 	if (p->appme != c->pxcap.pxdc.appme) {
 		c->pxcap.pxdc.appme = p->appme;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: APPME %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: APPME %s\n", c->endpoint->trid.traddr,
 			      p->appme ? "enable" : "disable");
 	}
 
 	if (p->ens != c->pxcap.pxdc.ens) {
 		c->pxcap.pxdc.ens = p->ens;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: ENS %s\n", c->id,
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: ENS %s\n", c->endpoint->trid.traddr,
 			      p->ens ? "enable" : "disable");
 	}
 
 	if (p->mrrs != c->pxcap.pxdc.mrrs) {
 		c->pxcap.pxdc.mrrs = p->mrrs;
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: MRRS set to %d\n", c->id,
-		              p->mrrs);
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: MRRS set to %d\n", c->endpoint->trid.traddr,
+			      p->mrrs);
 	}
 
 	if (p->iflr) {
 		SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-		              "%s: initiate function level reset\n", c->id);
+			      "%s: initiate function level reset\n", c->endpoint->trid.traddr);
 	}
 
 	return 0;
@@ -1632,7 +1671,10 @@ static ssize_t
 pxcap_access(void *pvt, const uint8_t id, char *const buf, size_t count,
 	     loff_t offset, const bool is_write)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr *)pvt;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+
+	ctrlr = muser_ep->ctrlr;
 
 	if (is_write) {
 		return handle_pxcap_write(ctrlr, buf, count, offset);
@@ -1643,86 +1685,47 @@ pxcap_access(void *pvt, const uint8_t id, char *const buf, size_t count,
 	return count;
 }
 
-#ifndef TRAP_DOORBELLS
 static unsigned long
 bar0_mmap(void *pvt, unsigned long off, unsigned long len)
 {
+	struct muser_endpoint *muser_ep = pvt;
 	struct muser_ctrlr *ctrlr;
 
-	ctrlr = pvt;
+	ctrlr = muser_ep->ctrlr;
 
 	assert(ctrlr != NULL);
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %#lx-%#lx\n",
-	              ctrlr->id, off, off + len);
+		      ctrlr->endpoint->trid.traddr, off, off + len);
 
 	if (off != DOORBELLS || len != MUSER_DOORBELLS_SIZE) {
-		SPDK_ERRLOG("%s: bad map region %#lx-%#lx\n", ctrlr->id, off,
+		SPDK_ERRLOG("%s: bad map region %#lx-%#lx\n", ctrlr->endpoint->trid.traddr, off,
 			    off + len);
 		errno = EINVAL;
 		return (unsigned long)MAP_FAILED;
 	}
 
-	if (ctrlr->doorbells != NULL) {
-		goto out;
-	}
+	assert(ctrlr->doorbells != NULL);
 
-	ctrlr->doorbells = lm_mmap(ctrlr->lm_ctx, off, len);
-	if (ctrlr->doorbells == MAP_FAILED) {
-		SPDK_ERRLOG("%s: failed to allocate device memory: %m\n",
-		            ctrlr->id);
-	}
-out:
-	if (ctrlr->lm_trans == LM_TRANS_SOCK) { /* FIXME */
-		return (unsigned long)ctrlr->fd;
-	}
-	return (unsigned long)ctrlr->doorbells;
-}
-#endif
-
-static void
-nvme_reg_info_fill(lm_reg_info_t *reg_info)
-{
-	assert(reg_info != NULL);
-
-	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
-
-	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
-#ifndef TRAP_DOORBELLS
-	reg_info[LM_DEV_BAR0_REG_IDX].flags |= LM_REG_FLAG_MMAP;
-	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
-#endif
-	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
-	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar0_fn;
-
-	reg_info[LM_DEV_BAR4_REG_IDX].flags = LM_REG_FLAG_RW;
-	reg_info[LM_DEV_BAR4_REG_IDX].size  = PAGE_SIZE;
-
-	reg_info[LM_DEV_BAR5_REG_IDX].flags = LM_REG_FLAG_RW;
-	reg_info[LM_DEV_BAR5_REG_IDX].size  = PAGE_SIZE;
-
-	reg_info[LM_DEV_CFG_REG_IDX].flags = LM_REG_FLAG_RW;
-	reg_info[LM_DEV_CFG_REG_IDX].size  = NVME_REG_CFG_SIZE;
-	reg_info[LM_DEV_CFG_REG_IDX].fn  = access_pci_config;
+	return (unsigned long)ctrlr->endpoint->fd;
 }
 
 static void
 muser_log(void *pvt, lm_log_lvl_t lvl, char const *msg)
 {
-	struct muser_ctrlr *ctrlr = (struct muser_ctrlr*)pvt;
-	assert(ctrlr != NULL);
+	struct muser_endpoint *endpoint = pvt;
 
 	if (lvl >= LM_DBG) {
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: %s", ctrlr->id, msg);
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: %s", endpoint->trid.traddr, msg);
 	} else if (lvl >= LM_INF) {
-		SPDK_NOTICELOG("%s: %s", ctrlr->id, msg);
+		SPDK_NOTICELOG("%s: %s", endpoint->trid.traddr, msg);
 	} else {
-		SPDK_ERRLOG("%s: %s", ctrlr->id, msg);
+		SPDK_ERRLOG("%s: %s", endpoint->trid.traddr, msg);
 	}
 }
 
 static void
-nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
+muser_dev_info_fill(lm_dev_info_t *dev_info)
 {
 	static const lm_cap_t pm = {.id = PCI_CAP_ID_PM,
 				    .size = sizeof(struct pmcap),
@@ -1736,13 +1739,17 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 				      .size = sizeof(struct msixcap),
 				      .fn = msixcap_access
 				     };
+	static struct lm_sparse_mmap_areas mmap_area = {.nr_mmap_areas = 1,
+		       .areas[0].start = DOORBELLS,
+				.areas[0].size = MUSER_DOORBELLS_SIZE,
+	};
+
+	lm_reg_info_t *reg_info;
 
 	assert(dev_info != NULL);
-	assert(muser_ctrlr != NULL);
 
-	dev_info->pvt = muser_ctrlr;
-
-	dev_info->uuid = muser_ctrlr->uuid;
+	dev_info->trans = LM_TRANS_SOCK;
+	dev_info->flags |= LM_FLAG_ATTACH_NB;
 
 	dev_info->pci_info.id.vid = 0x4e58;     /* TODO: LE ? */
 	dev_info->pci_info.id.did = 0x0001;
@@ -1767,8 +1774,6 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 
 	dev_info->extended = true;
 
-	nvme_reg_info_fill(dev_info->pci_info.reg_info);
-
 	dev_info->log = muser_log;
 
 	if (spdk_log_get_print_level() >= SPDK_LOG_DEBUG) {
@@ -1778,38 +1783,26 @@ nvme_dev_info_fill(lm_dev_info_t *dev_info, struct muser_ctrlr *muser_ctrlr)
 	} else {
 		dev_info->log_lvl = LM_ERR;
 	}
-}
 
-/*
- * Returns (void*)0 on success, (void*)-errno on error.
- */
-static void *
-drive(void *arg)
-{
-	int err;
-	lm_ctx_t *lm_ctx = arg;
+	reg_info = dev_info->pci_info.reg_info;
+	memset(reg_info, 0, sizeof(*reg_info) * LM_DEV_NUM_REGS);
 
-	assert(arg != NULL);
+	reg_info[LM_DEV_BAR0_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_BAR0_REG_IDX].flags |= LM_REG_FLAG_MMAP;
+	reg_info[LM_DEV_BAR0_REG_IDX].map  = bar0_mmap;
+	reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = &mmap_area;
+	reg_info[LM_DEV_BAR0_REG_IDX].size  = NVME_REG_BAR0_SIZE;
+	reg_info[LM_DEV_BAR0_REG_IDX].fn  = access_bar0_fn;
 
-	/* 
-	 * TODO need accesor for lm_ctx_t.pvt == struct muser_ctrlr*
-	 * so that we can include the ID when printing
-	 */
+	reg_info[LM_DEV_BAR4_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_BAR4_REG_IDX].size  = PAGE_SIZE;
 
-	err = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-	if (err != 0)  {
-		SPDK_ERRLOG("failed to set pthread cancel state: %s\n",
-			    strerror(err));
-		return (void *)((long) - err);
-	}
-	err = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-	if (err != 0)  {
-		SPDK_ERRLOG("failed to set pthread cancel type: %s\n",
-			    strerror(err));
-		return (void *)((long) - err);
-	}
+	reg_info[LM_DEV_BAR5_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_BAR5_REG_IDX].size  = PAGE_SIZE;
 
-	return (void *)((long)lm_ctx_drive(lm_ctx));
+	reg_info[LM_DEV_CFG_REG_IDX].flags = LM_REG_FLAG_RW;
+	reg_info[LM_DEV_CFG_REG_IDX].size  = NVME_REG_CFG_SIZE;
+	reg_info[LM_DEV_CFG_REG_IDX].fn  = access_pci_config;
 }
 
 static void
@@ -1842,235 +1835,70 @@ init_pci_config_space(lm_pci_config_space_t *p)
 }
 
 static int
-muser_snprintf_subnqn(struct muser_ctrlr *ctrlr, uint8_t *subnqn)
-{
-	int ret;
-
-	assert(ctrlr != NULL);
-	assert(subnqn != NULL);
-
-	ret = snprintf(subnqn, SPDK_NVME_NQN_FIELD_SIZE,
-		       "nqn.2019-07.io.spdk.muser:%s", ctrlr->uuid);
-	return (size_t)ret >= SPDK_NVME_NQN_FIELD_SIZE ? -1 : 0;
-}
-
-static int
-destroy_pci_dev(struct muser_ctrlr *ctrlr)
-{
-
-	int err;
-	void *res;
-
-	if (ctrlr == NULL || ctrlr->lm_ctx == NULL) {
-		return 0;
-	}
-	if (ctrlr->lm_thr != 0) {
-		err = pthread_cancel(ctrlr->lm_thr);
-		if (err == 0) {
-			err = pthread_join(ctrlr->lm_thr, &res);
-			if (err != 0) {
-				SPDK_ERRLOG("%s: failed to join thread: %s\n",
-				            ctrlr->id, strerror(err));
-				return -err;
-			}
-			if (res != PTHREAD_CANCELED) {
-				SPDK_ERRLOG("%s: thread exited: %s\n",
-				            ctrlr->id, strerror(-(intptr_t)res));
-				/* thread died, not much we can do here */
-			}
-		} else if (err != ESRCH) {
-			SPDK_ERRLOG("%s: failed to cancel thread: %s\n",
-			            ctrlr->id, strerror(err));
-			return -err;
-		}
-	}
-	lm_ctx_destroy(ctrlr->lm_ctx);
-	ctrlr->lm_ctx = NULL;
-	return 0;
-}
-
-static int
-init_pci_dev(struct muser_ctrlr *ctrlr)
-{
-	lm_dev_info_t dev_info = { 0 };
-
-	dev_info.trans = ctrlr->lm_trans;
-
-	/* LM setup */
-	nvme_dev_info_fill(&dev_info, ctrlr);
-
-#ifdef TRAP_DOORBELLS
-	ctrlr->doorbells = calloc(1, MUSER_DOORBELLS_SIZE);
-	if (ctrlr->doorbells == NULL) {
-		return -ENOMEM;
-	}
-#else
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas = alloca(sizeof(
-				struct lm_sparse_mmap_areas) + sizeof(struct lm_mmap_area));
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->nr_mmap_areas = 1;
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].start = DOORBELLS;
-	dev_info.pci_info.reg_info[LM_DEV_BAR0_REG_IDX].mmap_areas->areas[0].size = PAGE_ALIGN(
-				MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * sizeof(uint32_t) * 2);
-#endif
-
-	/* PM */
-	ctrlr->pmcap.pmcs.nsfrst = 0x1;
-
-	/*
-	 * MSI-X
-	 *
-	 * TODO for now we put table BIR and PBA BIR in BAR4 because
-	 * it's just easier, otherwise in order to put it in BAR0 we'd
-	 * have to figure out where exactly doorbells end.
-	 */
-	ctrlr->msixcap.mxc.ts = NVME_IRQ_MSIX_NUM - 1;
-	ctrlr->msixcap.mtab.tbir = 0x4;
-	ctrlr->msixcap.mtab.to = 0x0;
-	ctrlr->msixcap.mpba.pbir = 0x5;
-	ctrlr->msixcap.mpba.pbao = 0x0;
-
-	/* EXP */
-	ctrlr->pxcap.pxcaps.ver = 0x2;
-	ctrlr->pxcap.pxdcap.per = 0x1;
-	ctrlr->pxcap.pxdcap.flrc = 0x1;
-	ctrlr->pxcap.pxdcap2.ctds = 0x1;
-	/* FIXME check PXCAPS.DPT */
-
-	dev_info.flags |= LM_FLAG_ATTACH_NB;
-
-	ctrlr->lm_ctx = lm_ctx_create(&dev_info);
-	if (ctrlr->lm_ctx == NULL) {
-		/* TODO: lm_create doesn't set errno */
-		SPDK_ERRLOG("%s: error creating libmuser context: %m\n",
-		            ctrlr->id);
-		return -1;
-	}
-
-	ctrlr->pci_config_space = lm_get_pci_config_space(ctrlr->lm_ctx);
-	init_pci_config_space(ctrlr->pci_config_space);
-
-	return 0;
-}
-
-static int
 destroy_ctrlr(struct muser_ctrlr *ctrlr)
 {
-	int err;
+	int i;
 
 	if (ctrlr == NULL) {
 		return 0;
 	}
-	destroy_qp(ctrlr, 0);
-	err = destroy_pci_dev(ctrlr);
-	if (err != 0) {
-		SPDK_ERRLOG("%s: failed to tear down PCI device: %s\n",
-			    ctrlr->id, strerror(-err));
-		return err;
-	}
-	if (ctrlr->doorbells != NULL) { /* TODO does it work if it's NULL? */
-#ifdef TRAP_DOORBELLS
-		free(ctrlr->doorbells);
-#else
 
-		SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: unmap doorbells %p\n",
-		              ctrlr->id, ctrlr->doorbells);
-		if (munmap((void *)ctrlr->doorbells, MUSER_DOORBELLS_SIZE) != 0) {
-			/* TODO shall return the error */
-			SPDK_ERRLOG("%s: failed to unmap doorbells: %m\n",
-			            ctrlr->id);
-		}
-#endif
+	for (i = 0; i < MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		destroy_qp(ctrlr, i);
 	}
-	if (ctrlr->lm_trans == LM_TRANS_KERNEL) {
-		mdev_remove(ctrlr->uuid);
+
+	if (ctrlr->endpoint) {
+		ctrlr->endpoint->ctrlr = NULL;
 	}
+
 	free(ctrlr);
 	return 0;
 }
 
 static int
-muser_init_dev_mem(struct muser_ctrlr *ctrlr)
+spdk_unmap_dma(void *pvt, uint64_t iova)
 {
-	char *path = NULL;
-	int fd = -1;
-	int ret = 0;
 
-	/*
-	 * TODO create directory /dev/shm/muser and create device mem files in
-	 * there
-	 */
-	ret = asprintf(&path, "%s/bar0", ctrlr->uuid);
-	if (ret == -1) {
-		return ret;
-	}
-	fd = open(path, O_RDWR | O_CREAT);
-	if (fd == -1) {
-		SPDK_ERRLOG("%s: failed to open device memory at %s: %m\n",
-		            ctrlr->id, path);
-		ret = fd;
-		goto out;
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+	int i;
+
+	assert(muser_ep != NULL);
+
+	if (muser_ep->ctrlr == NULL) {
+		return 0;
 	}
 
-	ret = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
-	if (ret != 0) {
-		goto out;
-	}
-	ctrlr->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
-				PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
-	if (ctrlr->doorbells == MAP_FAILED) {
-		ctrlr->doorbells = NULL;
-		ret = -errno;
-		goto out;
-	}
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map doorbells %p\n", ctrlr->id,
-	              ctrlr->doorbells);
+	ctrlr = muser_ep->ctrlr;
 
-out:
-	if (ret != 0) {
-		if (fd != -1) {
-			close(fd);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: unmap IOVA %#lx\n",
+		      ctrlr->endpoint->trid.traddr, iova);
+
+	for (i = 0; i < MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		if (ctrlr->qp[i] == NULL) {
+			continue;
 		}
-		unlink(path); /* FIXME check return value */
-	} else {
-		ctrlr->fd = fd;
+		if (ctrlr->qp[i]->cq.sg.dma_addr == iova ||
+		    ctrlr->qp[i]->sq.sg.dma_addr == iova) {
+
+			if (i == 0) {
+				destroy_io_qp(ctrlr->qp[0]);
+			} else {
+				destroy_io_qp(ctrlr->qp[i]);
+				ctrlr->qp[i]->del = true;
+			}
+		}
 	}
-	free(path);
-	return ret;
+
+	return 0;
 }
 
-/* 
- * TODO this assumes that the last two components are <domain UUID>/<IOMMU group>, e.g.
- * /var/run/muser/domain/49abd9e2-efa1-488f-8d4f-5a5f8e592fe9/2
- * It's a hack, but the way it's implpemented means that it won't break
- * should the above change. We should find a better way of extracting a
- * reasonable length ID.
- */
-static const char*
-muser_ctrlr_id(const char *s)
+static void
+muser_create_ctrlr(struct muser_transport *muser_transport,
+		   struct muser_endpoint *muser_ep)
 {
-	const char *p = strrchr(s, '/');
-	if (p != NULL) {
-		while (p > s && *(p - 1) != '/') {
-			p--;
-		}
-	} else {
-		p = s;
-	}
-	return p;
-
-}
-
-static int
-muser_listen(struct spdk_nvmf_transport *transport,
-	     const struct spdk_nvme_transport_id *trid)
-{
-	struct muser_transport *muser_transport = NULL;
-	struct muser_ctrlr *muser_ctrlr = NULL;
-	struct spdk_nvmf_poll_group *pg;
+	struct muser_ctrlr *muser_ctrlr;
 	int err;
-
-	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
-					   transport);
 
 	/* First, construct a muser controller */
 	muser_ctrlr = calloc(1, sizeof(*muser_ctrlr));
@@ -2080,56 +1908,46 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	}
 	muser_ctrlr->cntlid = 0xffff;
 	muser_ctrlr->transport = muser_transport;
-	memcpy(muser_ctrlr->uuid, trid->traddr, sizeof(muser_ctrlr->uuid));
-	muser_ctrlr->id = (char *)muser_ctrlr_id(muser_ctrlr->uuid);
-	
-	memcpy(&muser_ctrlr->trid, trid, sizeof(muser_ctrlr->trid));
+	muser_ctrlr->endpoint = muser_ep;
+	muser_ctrlr->lm_ctx = muser_ep->lm_ctx;
+	muser_ctrlr->doorbells = muser_ep->doorbells;
 
-	muser_ctrlr->prop_req.muser_req.req.rsp = (union nvmf_c2h_msg *)
-			&muser_ctrlr->prop_req.muser_req.rsp;
-	muser_ctrlr->prop_req.muser_req.req.cmd = (union nvmf_h2c_msg *)
-			&muser_ctrlr->prop_req.muser_req.cmd;
-	muser_ctrlr->fd = -1;
+	muser_ep->ctrlr = muser_ctrlr;
 
-	err = sem_init(&muser_ctrlr->sem, 0, 0);
-	if (err != 0) {
-		goto out;
-	}
+	/* PM */
+	muser_ctrlr->pmcap.pmcs.nsfrst = 0x1;
 
-	/* TODO this should be a command-line option or env. var. */
-	muser_ctrlr->lm_trans = LM_TRANS_SOCK;
+	/*
+	 * MSI-X
+	 *
+	 * TODO for now we put table BIR and PBA BIR in BAR4 because
+	 * it's just easier, otherwise in order to put it in BAR0 we'd
+	 * have to figure out where exactly doorbells end.
+	 */
+	muser_ctrlr->msixcap.mxc.ts = NVME_IRQ_MSIX_NUM - 1;
+	muser_ctrlr->msixcap.mtab.tbir = 0x4;
+	muser_ctrlr->msixcap.mtab.to = 0x0;
+	muser_ctrlr->msixcap.mpba.pbir = 0x5;
+	muser_ctrlr->msixcap.mpba.pbao = 0x0;
 
-	if (muser_ctrlr->lm_trans == LM_TRANS_KERNEL) {
-		err = mdev_create(muser_ctrlr->uuid);
-		if (err != 0) {
-			goto out;
-		}
-	} else if (muser_ctrlr->lm_trans == LM_TRANS_SOCK) {
-		err = muser_init_dev_mem(muser_ctrlr);
-		if (err != 0) {
-			goto out;
-		}
-	}
+	/* EXP */
+	muser_ctrlr->pxcap.pxcaps.ver = 0x2;
+	muser_ctrlr->pxcap.pxdcap.per = 0x1;
+	muser_ctrlr->pxcap.pxdcap.flrc = 0x1;
+	muser_ctrlr->pxcap.pxdcap2.ctds = 0x1;
+	/* FIXME check PXCAPS.DPT */
 
-	err = init_pci_dev(muser_ctrlr);
-	if (err != 0) {
-		goto out;
-	}
+	muser_ctrlr->pci_config_space = lm_get_pci_config_space(muser_ctrlr->lm_ctx);
+	init_pci_config_space(muser_ctrlr->pci_config_space);
 
 	/* Then, construct an admin queue pair */
-	err = init_qp(muser_ctrlr, transport, MUSER_DEFAULT_AQ_DEPTH, 0);
+	err = init_qp(muser_ctrlr, &muser_transport->transport, MUSER_DEFAULT_AQ_DEPTH, 0);
 	if (err != 0) {
 		goto out;
 	}
 
-	pg = spdk_nvmf_poll_group_create(muser_transport->transport.tgt);
-	assert(pg != NULL);
-	/* Add this qpair to our internal poll group, just so that it has one assigned. */
-	spdk_nvmf_poll_group_add(pg, &muser_ctrlr->qp[0]->qpair);
-
-	/* Add this controller to the list. The rest of the work will be done
-	 * when this is assigned to a subsystem. */
-	TAILQ_INSERT_TAIL(&muser_transport->ctrlrs, muser_ctrlr, link);
+	/* Notify the generic layer about the new admin queue pair */
+	TAILQ_INSERT_TAIL(&muser_ctrlr->transport->new_qps, muser_ctrlr->qp[0], link);
 
 out:
 	if (err != 0) {
@@ -2138,10 +1956,95 @@ out:
 		 * <domain UUID>/<IOMMU group>, fix.
 		 */
 		SPDK_ERRLOG("%s: failed to create MUSER controller: %s\n",
-			    trid->traddr, strerror(-err));
+			    muser_ep->trid.traddr, strerror(-err));
 		if (destroy_ctrlr(muser_ctrlr) != 0) {
-			SPDK_ERRLOG("%s: failed to clean up\n", trid->traddr);
+			SPDK_ERRLOG("%s: failed to clean up\n", muser_ep->trid.traddr);
 		}
+	}
+}
+
+static int
+muser_listen(struct spdk_nvmf_transport *transport,
+	     const struct spdk_nvme_transport_id *trid)
+{
+	struct muser_transport *muser_transport;
+	struct muser_endpoint *muser_ep, *tmp;
+	char *path = NULL;
+	int fd;
+	int err;
+	lm_dev_info_t dev_info = { 0 };
+
+	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
+					   transport);
+
+	TAILQ_FOREACH_SAFE(muser_ep, &muser_transport->endpoints, link, tmp) {
+		/* Only compare traddr */
+		if (strncmp(muser_ep->trid.traddr, trid->traddr, sizeof(muser_ep->trid.traddr)) == 0) {
+			return -EEXIST;
+		}
+	}
+
+	muser_ep = calloc(1, sizeof(*muser_ep));
+	if (!muser_ep) {
+		return -ENOMEM;
+	}
+
+	muser_ep->fd = -1;
+	memcpy(&muser_ep->trid, trid, sizeof(muser_ep->trid));
+
+	err = asprintf(&path, "%s/bar0", muser_ep->trid.traddr);
+	if (err == -1) {
+		goto out;
+	}
+
+	fd = open(path, O_RDWR | O_CREAT);
+	if (fd == -1) {
+		SPDK_ERRLOG("%s: failed to open device memory at %s: %m\n",
+			    muser_ep->trid.traddr, path);
+		err = fd;
+		free(path);
+		goto out;
+	}
+
+	unlink(path);
+	free(path);
+
+	err = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
+	if (err != 0) {
+		goto out;
+	}
+
+	muser_ep->doorbells = mmap(NULL, MUSER_DOORBELLS_SIZE,
+				   PROT_READ | PROT_WRITE, MAP_SHARED, fd, DOORBELLS);
+	if (muser_ep->doorbells == MAP_FAILED) {
+		muser_ep->doorbells = NULL;
+		err = -errno;
+		goto out;
+	}
+
+	muser_ep->fd = fd;
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: doorbells %p\n", muser_ep->trid.traddr,
+		      muser_ep->doorbells);
+
+	dev_info.pvt = muser_ep;
+	dev_info.uuid = muser_ep->trid.traddr;
+	muser_dev_info_fill(&dev_info);
+	dev_info.unmap_dma = &spdk_unmap_dma;
+
+	muser_ep->lm_ctx = lm_ctx_create(&dev_info);
+	if (muser_ep->lm_ctx == NULL) {
+		/* TODO: lm_create doesn't set errno */
+		SPDK_ERRLOG("%s: error creating libmuser context: %m\n",
+			    muser_ep->trid.traddr);
+		err = -1;
+		goto out;
+	}
+
+	TAILQ_INSERT_TAIL(&muser_transport->endpoints, muser_ep, link);
+
+out:
+	if (err != 0) {
+		muser_destroy_endpoint(muser_ep);
 	}
 
 	return err;
@@ -2152,91 +2055,35 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 		  const struct spdk_nvme_transport_id *trid)
 {
 	struct muser_transport *muser_transport;
-	struct muser_ctrlr *ctrlr, *tmp;
-	char *id;
+	struct muser_endpoint *muser_ep, *mtmp;
+	int err;
 
 	assert(trid != NULL);
 	assert(trid->traddr != NULL);
 
-	id = (char *)muser_ctrlr_id(trid->traddr);
-
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: stop listen\n", id);
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: stop listen\n", trid->traddr);
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
 
 	/* FIXME should acquire lock */
 
-	TAILQ_FOREACH_SAFE(ctrlr, &muser_transport->ctrlrs, link, tmp) {
-		if (strcmp(trid->traddr, ctrlr->trid.traddr) == 0) {
-			int err;
-			TAILQ_REMOVE(&muser_transport->ctrlrs, ctrlr, link);
-			err = destroy_ctrlr(ctrlr);
-			if (err != 0) {
-				SPDK_ERRLOG("%s: failed destroy controller: %s\n",
-				 	    ctrlr->id, strerror(-err));
+	TAILQ_FOREACH_SAFE(muser_ep, &muser_transport->endpoints, link, mtmp) {
+		if (strcmp(trid->traddr, muser_ep->trid.traddr) == 0) {
+			TAILQ_REMOVE(&muser_transport->endpoints, muser_ep, link);
+			if (muser_ep->ctrlr) {
+				err = destroy_ctrlr(muser_ep->ctrlr);
+				if (err != 0) {
+					SPDK_ERRLOG("%s: failed destroy controller: %s\n",
+						    muser_ep->ctrlr->endpoint->trid.traddr, strerror(-err));
+				}
 			}
+			muser_destroy_endpoint(muser_ep);
 			return;
 		}
 	}
 
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: not found\n", id);
-	return;
-}
-
-static void
-_muser_notify_new_admin_qpair(void *ctx)
-{
-	struct muser_qpair *mqpair;
-	struct spdk_nvmf_qpair *qpair;
-	struct muser_ctrlr *mctrlr;
-
-	mctrlr = ctx;
-	assert(mctrlr != NULL);
-
-	mqpair = mctrlr->qp[0];
-	assert(mqpair != NULL);
-	qpair = &mqpair->qpair;
-
-	/* We're ready to show this new qpair to the upper layer. Remove it from
-	 * our internal poll group. Currently there's no API to do that.
-	 * TODO: Add an API. */
-	assert(TAILQ_EMPTY(&qpair->outstanding));
-	mctrlr->cntlid = qpair->ctrlr->cntlid;
-
-	/* destroy the internal poll group created in muser_listen */
-	spdk_nvmf_poll_group_remove(qpair);
-	spdk_nvmf_poll_group_destroy(qpair->group, NULL, NULL);
-	/* Queue the admin queue up so that it gets discovered and assigned to
-	 * a poll group.
-	 */
-	pthread_mutex_lock(&mctrlr->transport->lock);
-	TAILQ_INSERT_TAIL(&mctrlr->transport->new_qps, mqpair, link);
-	pthread_mutex_unlock(&mctrlr->transport->lock);
-}
-
-static int
-_muser_handle_admin_connect_rsp(struct muser_req *req, void *cb_arg)
-{
-	struct muser_ctrlr *mctrlr;
-
-	mctrlr = cb_arg;
-	assert(mctrlr != NULL);
-
-	free(req->req.data);
-
-	if (spdk_nvme_cpl_is_error(&req->req.rsp->nvme_cpl)) {
-		mctrlr->cb_fn(mctrlr->cb_arg, -1);
-		return -1;
-	}
-
-	mctrlr->cb_fn(mctrlr->cb_arg, 0);
-
-	/* Send a message to ourself to allow the request handling stack
-	 * to unwind before continuing. */
-	spdk_thread_send_msg(spdk_get_thread(), _muser_notify_new_admin_qpair, mctrlr);
-
-	return 0;
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: not found\n", trid->traddr);
 }
 
 static void
@@ -2247,62 +2094,24 @@ muser_listen_associate(struct spdk_nvmf_transport *transport,
 		       void *cb_arg)
 {
 	struct muser_transport *mtransport;
-	struct muser_qpair *muser_qpair;
-	struct muser_req *muser_req;
-	struct muser_ctrlr *muser_ctrlr;
-	struct spdk_nvmf_request *req;
-	struct spdk_nvmf_fabric_connect_data *data;
+	struct muser_endpoint *muser_ep;
 
 	mtransport = SPDK_CONTAINEROF(transport, struct muser_transport, transport);
 
-	/* Look up the controller using the UUID in the trid */
-	TAILQ_FOREACH(muser_ctrlr, &mtransport->ctrlrs, link) {
-		if (strncmp(muser_ctrlr->uuid, trid->traddr, sizeof(muser_ctrlr->uuid)) == 0) {
+	TAILQ_FOREACH(muser_ep, &mtransport->endpoints, link) {
+		if (strncmp(muser_ep->trid.traddr, trid->traddr, sizeof(muser_ep->trid.traddr)) == 0) {
 			break;
 		}
 	}
 
-	if (muser_ctrlr == NULL) {
+	if (muser_ep == NULL) {
 		cb_fn(cb_arg, -ENOENT);
 		return;
 	}
 
-	muser_ctrlr->cb_fn = cb_fn;
-	muser_ctrlr->cb_arg = cb_arg;
+	muser_ep->subsystem = subsystem;
 
-	/* Send a fabric connect */
-	muser_qpair = muser_ctrlr->qp[0];
-
-	muser_req = get_muser_req(muser_qpair);
-	if (muser_req == NULL) {
-		cb_fn(cb_arg, -ENOMEM);
-		return;
-	}
-
-	req = &muser_req->req;
-	req->cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
-	req->cmd->connect_cmd.cid = 0;
-	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
-	req->cmd->connect_cmd.recfmt = 0;
-	req->cmd->connect_cmd.sqsize = muser_qpair->qsize - 1;
-	req->cmd->connect_cmd.qid = 0;
-
-	req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
-	req->data = calloc(1, req->length);
-	if (req->data == NULL) {
-		muser_req_free(req);
-		cb_fn(cb_arg, -ENOMEM);
-		return;
-	}
-
-	data = (struct spdk_nvmf_fabric_connect_data *)req->data;
-	data->cntlid = 0xFFFF;
-	snprintf(data->subnqn, sizeof(data->subnqn), "%s", spdk_nvmf_subsystem_get_nqn(subsystem));
-
-	muser_req->cb_fn = _muser_handle_admin_connect_rsp;
-	muser_req->cb_arg = muser_ctrlr;
-
-	spdk_nvmf_ctrlr_connect(req);
+	cb_fn(cb_arg, 0);
 }
 
 /*
@@ -2316,7 +2125,7 @@ muser_accept(struct spdk_nvmf_transport *transport)
 	int err;
 	struct muser_transport *muser_transport;
 	struct muser_qpair *qp, *tmp_qp;
-	struct muser_ctrlr *ctrlr;
+	struct muser_endpoint *muser_ep;
 
 	muser_transport = SPDK_CONTAINEROF(transport, struct muser_transport,
 					   transport);
@@ -2327,28 +2136,22 @@ muser_accept(struct spdk_nvmf_transport *transport)
 		return -EFAULT;
 	}
 
-	/* FIXME this should be done properly using the list_done callback etc */
-	TAILQ_FOREACH(ctrlr, &muser_transport->ctrlrs, link) {
-		if (!ctrlr->initialized) {
-			err = lm_ctx_try_attach(ctrlr->lm_ctx);
-			if (err == -1) {
-				if (errno == EAGAIN || errno == EWOULDBLOCK) {
-					continue;
-				}
-				SPDK_ERRLOG("%s: failed to attach: %m\n",
-				            ctrlr->id);
-				assert(false); /* FIXME */
-				return -EFAULT;
-			}
-			err = pthread_create(&ctrlr->lm_thr, NULL, drive, ctrlr->lm_ctx);
-			if (err != 0) {
-				SPDK_ERRLOG("%s: failed to create lm_drive thread: %s\n",
-					    ctrlr->id, strerror(err));
-				assert(false); /* FIXME */
-				return -EFAULT;
-			}
-			ctrlr->initialized = true;
+	TAILQ_FOREACH(muser_ep, &muser_transport->endpoints, link) {
+		if (muser_ep->ctrlr != NULL) {
+			continue;
 		}
+
+		err = lm_ctx_try_attach(muser_ep->lm_ctx);
+		if (err == -1) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				continue;
+			}
+			SPDK_ERRLOG("%s: failed to attach: %m\n", muser_ep->trid.traddr);
+			return -EFAULT;
+		}
+
+		/* Construct a controller */
+		muser_create_ctrlr(muser_transport, muser_ep);
 	}
 
 	TAILQ_FOREACH_SAFE(qp, &muser_transport->new_qps, link, tmp_qp) {
@@ -2405,16 +2208,31 @@ muser_poll_group_destroy(struct spdk_nvmf_transport_poll_group *group)
 }
 
 static int
-handle_io_queue_connect_rsp(struct muser_req *req, void *cb_arg)
+handle_queue_connect_rsp(struct muser_req *req, void *cb_arg)
 {
 	struct muser_poll_group *muser_group;
 	struct muser_qpair *qpair = cb_arg;
+	struct muser_ctrlr *ctrlr;
 
 	assert(qpair != NULL);
 	assert(req != NULL);
 
 	muser_group = SPDK_CONTAINEROF(qpair->group, struct muser_poll_group, group);
 	TAILQ_INSERT_TAIL(&muser_group->qps, qpair, link);
+
+	ctrlr = qpair->ctrlr;
+	assert(ctrlr != NULL);
+
+	if (spdk_nvme_cpl_is_error(&req->req.rsp->nvme_cpl)) {
+		destroy_qp(ctrlr, qpair->qpair.qid);
+		destroy_ctrlr(ctrlr);
+		return -1;
+	}
+
+	if (nvmf_qpair_is_admin_queue(&qpair->qpair)) {
+		ctrlr->cntlid = qpair->qpair.ctrlr->cntlid;
+		ctrlr->ready = true;
+	}
 
 	free(req->req.data);
 	req->req.data = NULL;
@@ -2435,7 +2253,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	struct muser_ctrlr *muser_ctrlr;
 	struct spdk_nvmf_request *req;
 	struct spdk_nvmf_fabric_connect_data *data;
-	int err;
+	bool admin;
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
@@ -2443,13 +2261,10 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	muser_ctrlr = muser_qpair->ctrlr;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-	              "%s: add QP%d=%p(%p) to poll_group=%p\n", muser_ctrlr->id,
+		      "%s: add QP%d=%p(%p) to poll_group=%p\n", muser_ctrlr->endpoint->trid.traddr,
 		      muser_qpair->qpair.qid, muser_qpair, qpair, muser_group);
 
-	if (nvmf_qpair_is_admin_queue(&muser_qpair->qpair)) {
-		TAILQ_INSERT_TAIL(&muser_group->qps, muser_qpair, link);
-		return 0;
-	}
+	admin = nvmf_qpair_is_admin_queue(&muser_qpair->qpair);
 
 	muser_req = get_muser_req(muser_qpair);
 	if (muser_req == NULL) {
@@ -2462,36 +2277,29 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
 	req->cmd->connect_cmd.recfmt = 0;
 	req->cmd->connect_cmd.sqsize = muser_qpair->qsize - 1;
-	req->cmd->connect_cmd.qid = qpair->qid;
+	req->cmd->connect_cmd.qid = admin ? 0 : qpair->qid;
 
 	req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
 	req->data = calloc(1, req->length);
 	if (req->data == NULL) {
-		err = -1;
-		goto out;
+		muser_req_free(req);
+		return -ENOMEM;
 	}
 
 	data = (struct spdk_nvmf_fabric_connect_data *)req->data;
-	data->cntlid = muser_ctrlr->cntlid;
-	err = muser_snprintf_subnqn(muser_ctrlr, data->subnqn);
-	if (err != 0) {
-		goto out;
-	}
+	data->cntlid = admin ? 0xFFFF : muser_ctrlr->cntlid;
+	snprintf(data->subnqn, sizeof(data->subnqn), "%s",
+		 spdk_nvmf_subsystem_get_nqn(muser_ctrlr->endpoint->subsystem));
 
-	muser_req->cb_fn = handle_io_queue_connect_rsp;
+	muser_req->cb_fn = handle_queue_connect_rsp;
 	muser_req->cb_arg = muser_qpair;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-	              "%s: sending connect fabrics command for QID=%#x cntlid=%#x\n",
-		      muser_ctrlr->id, qpair->qid, data->cntlid);
+		      "%s: sending connect fabrics command for QID=%#x cntlid=%#x\n",
+		      muser_ctrlr->endpoint->trid.traddr, qpair->qid, data->cntlid);
 
 	spdk_nvmf_request_exec_fabrics(req);
-out:
-	if (err != 0) {
-		free(req->data);
-		muser_req_free(req);
-	}
-	return err;
+	return 0;
 }
 
 static int
@@ -2505,8 +2313,8 @@ muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 
 	/* TODO maybe this is where we should delete the I/O queue? */
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-	              "%s: remove NVMf QP%d=%p from NVMf poll_group=%p\n",
-		      muser_qpair->ctrlr->id, qpair->qid, qpair, group);
+		      "%s: remove NVMf QP%d=%p from NVMf poll_group=%p\n",
+		      muser_qpair->ctrlr->endpoint->trid.traddr, qpair->qid, qpair, group);
 
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
@@ -2514,85 +2322,6 @@ muser_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
 
 	return 0;
-}
-
-static int
-map_admin_queue(struct muser_ctrlr *ctrlr)
-{
-	int err;
-
-	assert(ctrlr != NULL);
-
-	err = acq_map(ctrlr);
-	if (err != 0) {
-		SPDK_ERRLOG("%s: failed to map CQ0: %d\n", ctrlr->id, err);
-		return err;
-	}
-	err = asq_map(ctrlr);
-	if (err != 0) {
-		SPDK_ERRLOG("%s: failed to map SQ0: %d\n", ctrlr->id, err);
-		return err;
-	}
-	return 0;
-}
-
-static void
-unmap_admin_queue(struct muser_ctrlr *ctrlr)
-{
-	assert(ctrlr->qp[0] != NULL);
-
-	destroy_io_qp(ctrlr->qp[0]);
-}
-
-static int
-handle_prop_rsp(struct muser_req *req, void *cb_arg)
-{
-	struct muser_qpair *qpair = cb_arg;
-	int err = 0;
-
-	assert(qpair != NULL);
-	assert(req != NULL);
-
-	if (qpair->ctrlr->prop_req.dir == MUSER_NVMF_READ) {
-		assert(qpair->ctrlr != NULL);
-		assert(req != NULL);
-
-		memcpy(qpair->ctrlr->prop_req.buf,
-		       &req->req.rsp->prop_get_rsp.value.u64,
-		       qpair->ctrlr->prop_req.count);
-	} else {
-		assert(qpair->ctrlr->prop_req.dir == MUSER_NVMF_WRITE);
-
-		assert(qpair->ctrlr != NULL);
-
-		if (qpair->ctrlr->prop_req.pos == CC) {
-			union spdk_nvme_cc_register *cc;
-
-			assert(qpair->ctrlr != NULL);
-
-			spdk_rmb();
-
-			cc = (union spdk_nvme_cc_register *)qpair->ctrlr->prop_req.buf;
-
-			if (cc->bits.en == 1 && cc->bits.shn == 0) {
-				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-				              "%s: MAP Admin queue\n",
-				              qpair->ctrlr->id);
-				qpair->ctrlr->prop_req.ret = map_admin_queue(qpair->ctrlr);
-			} else if ((cc->bits.en == 0 && cc->bits.shn == 0) ||
-				   (cc->bits.en == 1 && cc->bits.shn != 0)) {
-				SPDK_DEBUGLOG(SPDK_LOG_MUSER,
-				              "%s: UNMAP Admin queue\n",
-				              qpair->ctrlr->id);
-				unmap_admin_queue(qpair->ctrlr);
-			}
-		}
-	}
-
-	qpair->ctrlr->prop_req.dir = MUSER_NVMF_INVALID;
-	err = sem_post(&qpair->ctrlr->prop_req.wait);
-
-	return err;
 }
 
 static int
@@ -2670,6 +2399,7 @@ get_muser_req(struct muser_qpair *qpair)
 	TAILQ_REMOVE(&qpair->reqs, req, link);
 	memset(&req->cmd, 0, sizeof(req->cmd));
 	memset(&req->rsp, 0, sizeof(req->rsp));
+	req->iovcnt = 0;
 
 	return req;
 }
@@ -2719,7 +2449,7 @@ map_admin_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 
 	switch (cmd->opc) {
 	case SPDK_NVME_OPC_IDENTIFY:
-		len = 4096;
+		len = 4096; /* FIXME there should be a define somewhere for this */
 		break;
 	case SPDK_NVME_OPC_GET_LOG_PAGE:
 		len = (cmd->cdw10_bits.get_log_page.numdl + 1) * 4;
@@ -2732,7 +2462,8 @@ map_admin_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 
 	iovcnt = muser_map_prps(ctrlr, cmd, req->iov, len);
 	if (iovcnt < 0) {
-		SPDK_ERRLOG("%s: map Admin Opc %x failed\n", ctrlr->id, cmd->opc);
+		SPDK_ERRLOG("%s: map Admin Opc %x failed\n",
+			    ctrlr->endpoint->trid.traddr, cmd->opc);
 		return -1;
 	}
 
@@ -2770,7 +2501,8 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 		break;
 	default:
 		SPDK_ERRLOG("%s: SQ%d invalid I/O request type 0x%x\n",
-			    ctrlr->id, req->qpair->qid, req->cmd->nvme_cmd.opc);
+			    ctrlr->endpoint->trid.traddr, req->qpair->qid,
+			    req->cmd->nvme_cmd.opc);
 		return -EINVAL;
 	}
 
@@ -2786,12 +2518,11 @@ map_io_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 		err = muser_map_prps(ctrlr, &req->cmd->nvme_cmd, req->iov,
 				     req->length);
 		if (err < 0) {
-			SPDK_ERRLOG("%s: failed to map PRP: %d\n", ctrlr->id,
-			            err);
+			SPDK_ERRLOG("%s: failed to map PRP: %d\n",
+				    ctrlr->endpoint->trid.traddr, err);
 			return -EFAULT;
 		}
 		req->iovcnt = err;
-		return 0;
 	}
 
 	return 0;
@@ -2809,15 +2540,18 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	assert(cmd != NULL);
 
 	/*
-	 * FIXME this means that there are not free requests available,
+	 * FIXME this means that there are no free requests available,
 	 * returning -1 will fail the controller. Theoretically this error can
 	 * be avoided completely by ensuring we have as many requests as slots
 	 * in the SQ, plus one for the the property request.
 	 */
-	if (req == NULL) {
+	if (spdk_unlikely(req == NULL)) {
 		return -1;
 	}
 
+	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
+	muser_req->cb_fn = handle_cmd_rsp;
+	muser_req->cb_arg = SPDK_CONTAINEROF(req->qpair, struct muser_qpair, qpair);
 	req->cmd->nvme_cmd = *cmd;
 	if (nvmf_qpair_is_admin_queue(req->qpair)) {
 		err = map_admin_cmd_req(ctrlr, req);
@@ -2825,78 +2559,33 @@ handle_cmd_req(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 		err = map_io_cmd_req(ctrlr, req);
 	}
 
-	if (err < 0) {
+	if (spdk_unlikely(err < 0)) {
 		SPDK_ERRLOG("%s: map NVMe command opc 0x%x failed\n",
-		            ctrlr->id, cmd->opc);
-		goto out;
+			    ctrlr->endpoint->trid.traddr, cmd->opc);
+		req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+		req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+		return handle_cmd_rsp(muser_req, muser_req->cb_arg);
 	}
-
-	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
-	muser_req->cb_fn = handle_cmd_rsp;
-	muser_req->cb_arg = SPDK_CONTAINEROF(req->qpair, struct muser_qpair, qpair);
 
 	spdk_nvmf_request_exec(req);
 
 	return 0;
-
-out:
-	return post_completion(ctrlr, cmd, &ctrlr->qp[req->qpair->qid]->cq, 0,
-			       SPDK_NVME_SC_INTERNAL_DEVICE_ERROR,
-			       SPDK_NVME_SCT_GENERIC);
 }
 
 static int
 muser_ctrlr_poll(struct muser_ctrlr *ctrlr)
 {
-	struct spdk_nvmf_request *req;
-	struct muser_req *muser_req;
-	int err = 0;
-
 	if (ctrlr == NULL) {
 		return 0;
 	}
 
-	if (ctrlr->prop_req.dir == MUSER_NVMF_INVALID) {
-		return err;
+	if (!ctrlr->ready) {
+		return 0;
 	}
 
-	assert(ctrlr != NULL);
-
-	/* TODO: This should examine the prop_req and intercept
-	 * register writes that aren't valid for fabrics devices like
-	 * AQA. */
-
-	req = get_nvmf_req(ctrlr->qp[0]);
-	if (req == NULL) {
-		return -1;
-	}
-
-	muser_req = SPDK_CONTAINEROF(req, struct muser_req, req);
-	muser_req->cb_fn = handle_prop_rsp;
-	muser_req->cb_arg = ctrlr->qp[0];
-
-	/* Generate a fake fabrics property set command */
-	req->cmd->prop_set_cmd.opcode = SPDK_NVME_OPC_FABRIC;
-	req->cmd->prop_set_cmd.cid = 0;
-	req->cmd->prop_set_cmd.attrib.size = (ctrlr->prop_req.count / 4) - 1;
-	req->cmd->prop_set_cmd.ofst = ctrlr->prop_req.pos;
-	if (ctrlr->prop_req.dir == MUSER_NVMF_WRITE) {
-		req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_SET;
-		if (req->cmd->prop_set_cmd.attrib.size) {
-			req->cmd->prop_set_cmd.value.u64 = *(uint64_t *)ctrlr->prop_req.buf;
-		} else {
-			req->cmd->prop_set_cmd.value.u32.high = 0;
-			req->cmd->prop_set_cmd.value.u32.low = *(uint32_t *)ctrlr->prop_req.buf;
-		}
-	} else {
-		req->cmd->prop_set_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_PROPERTY_GET;
-	}
-	req->length = 0;
-	req->data = NULL;
-
-	spdk_nvmf_request_exec_fabrics(req);
-
-	return 0;
+	/* This will call access_bar0_fn() if there are any writes
+	 * to the portion of the BAR that is not mmap'd */
+	return lm_ctx_poll(ctrlr->lm_ctx);
 }
 
 static void
@@ -2915,6 +2604,19 @@ muser_qpair_poll(struct muser_qpair *qpair)
 		if (err != 0) {
 			fail_ctrlr(ctrlr);
 			return;
+		}
+	}
+}
+
+static void
+muser_poll_group_remove_queues(struct muser_poll_group *muser_group,
+	                       struct muser_ctrlr *ctrlr)
+{
+	struct muser_qpair *muser_qpair, *tmp;
+
+	TAILQ_FOREACH_SAFE(muser_qpair, &muser_group->qps, link, tmp) {
+		if (muser_qpair->ctrlr == ctrlr) {
+			TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
 		}
 	}
 }
@@ -2942,9 +2644,25 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	TAILQ_FOREACH_SAFE(muser_qpair, &muser_group->qps, link, tmp) {
 
 		if (nvmf_qpair_is_admin_queue(&muser_qpair->qpair)) {
+			int err;
+
 			ctrlr = muser_qpair->ctrlr;
 
-			if (muser_ctrlr_poll(ctrlr) != 0) {
+			err = muser_ctrlr_poll(ctrlr);
+			if (spdk_unlikely(err) != 0) {
+				if (err == -ENOTCONN) {
+					TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
+					ctrlr->ready = false;
+					continue;
+				}
+
+				/*
+				 * FIXME now that the controller has failed, do
+				 * we just remove from this list all queue pairs
+				 * that belong to this controller? Or do we
+				 * completely destroy the controller? Or do we
+				 * just destroy the queues?
+				 */
 				fail_ctrlr(ctrlr);
 				return -1;
 			}
@@ -2968,11 +2686,12 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		 * consolidated into a single flag, e.g. 'active'?
 		 */
 		if (muser_qpair->del) {
+			TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
+			destroy_qp(ctrlr, muser_qpair->qpair.qid);
 			continue;
 		}
 
 		muser_qpair_poll(muser_qpair);
-
 	}
 
 	return 0;
@@ -2988,7 +2707,7 @@ muser_qpair_get_local_trid(struct spdk_nvmf_qpair *qpair,
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	muser_ctrlr = muser_qpair->ctrlr;
 
-	memcpy(trid, &muser_ctrlr->trid, sizeof(*trid));
+	memcpy(trid, &muser_ctrlr->endpoint->trid, sizeof(*trid));
 	return 0;
 }
 
@@ -3009,7 +2728,7 @@ muser_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
 	muser_ctrlr = muser_qpair->ctrlr;
 
-	memcpy(trid, &muser_ctrlr->trid, sizeof(*trid));
+	memcpy(trid, &muser_ctrlr->endpoint->trid, sizeof(*trid));
 	return 0;
 }
 

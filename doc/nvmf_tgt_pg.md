@@ -83,21 +83,14 @@ Namespaces are bdevs. See @ref bdev for more information about the SPDK bdev
 layer. A bdev may be obtained by calling spdk_bdev_get_by_name().
 
 Once a subsystem exists and the target is listening on an address, new
-connections may be accepted by polling spdk_nvmf_tgt_accept().
+connections will be automatically assigned to poll groups as they are
+detected.
 
 All I/O to a subsystem is driven by a poll group, which polls for incoming
 network I/O. Poll groups may be created by calling
 spdk_nvmf_poll_group_create(). They automatically request to begin polling
 upon creation on the thread from which they were created. Most importantly, *a
 poll group may only be accessed from the thread on which it was created.*
-
-When spdk_nvmf_tgt_accept() detects a new connection, it will construct a new
-struct spdk_nvmf_qpair object and call the user provided `new_qpair_fn`
-callback for each new qpair. In response to this callback, the user must
-assign the qpair to a poll group by calling spdk_nvmf_poll_group_add().
-Remember, a poll group may only be accessed from the thread on which it was created,
-so making a call to spdk_nvmf_poll_group_add() may require passing a message
-to the appropriate thread.
 
 ## Access Control
 
@@ -111,9 +104,7 @@ and hosts may only be added to inactive or paused subsystems.
 
 A discovery subsystem, as defined by the NVMe-oF specification, is
 automatically created for each NVMe-oF target constructed. Connections to the
-discovery subsystem are handled in the same way as any other subsystem - new
-qpairs are created in response to spdk_nvmf_tgt_accept() and they must be
-assigned to a poll group.
+discovery subsystem are handled in the same way as any other subsystem.
 
 ## Transports
 
@@ -132,15 +123,7 @@ fabrics simultaneously.
 The SPDK NVMe-oF target library does not strictly dictate threading model, but
 poll groups do all of their polling and I/O processing on the thread they are
 created on. Given that, it almost always makes sense to create one poll group
-per thread used in the application. New qpairs created in response to
-spdk_nvmf_tgt_accept() can be handed out round-robin to the poll groups. This
-is how the SPDK NVMe-oF target application currently functions.
-
-More advanced algorithms for distributing qpairs to poll groups are possible.
-For instance, a NUMA-aware algorithm would be an improvement over basic
-round-robin, where NUMA-aware means assigning qpairs to poll groups running on
-CPU cores that are on the same NUMA node as the network adapter and storage
-device. Load-aware algorithms also may have benefits.
+per thread used in the application.
 
 ## Scaling Across CPU Cores
 
