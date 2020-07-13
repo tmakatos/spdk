@@ -1884,7 +1884,8 @@ spdk_unmap_dma(void *pvt, uint64_t iova)
 			if (i == 0) {
 				destroy_io_qp(ctrlr->qp[0]);
 			} else {
-				destroy_qp(ctrlr, ctrlr->qp[i]->qpair.qid);
+				destroy_io_qp(ctrlr->qp[i]);
+				ctrlr->qp[i]->del = true;
 			}
 		}
 	}
