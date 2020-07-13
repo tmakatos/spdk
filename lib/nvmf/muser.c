@@ -1837,11 +1837,15 @@ init_pci_config_space(lm_pci_config_space_t *p)
 static int
 destroy_ctrlr(struct muser_ctrlr *ctrlr)
 {
+	int i;
+
 	if (ctrlr == NULL) {
 		return 0;
 	}
 
-	destroy_qp(ctrlr, 0);
+	for (i = 0; i < MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		destroy_qp(ctrlr, i);
+	}
 
 	if (ctrlr->endpoint) {
 		ctrlr->endpoint->ctrlr = NULL;
