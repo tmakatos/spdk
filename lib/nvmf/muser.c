@@ -816,7 +816,6 @@ destroy_qp(struct muser_ctrlr *ctrlr, uint16_t qid)
 	 */
 	destroy_io_qp(qpair);
 	tear_down_qpair(qpair);
-	free(qpair);
 	ctrlr->qp[qid] = NULL;
 }
 
