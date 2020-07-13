@@ -2686,11 +2686,12 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		 * consolidated into a single flag, e.g. 'active'?
 		 */
 		if (muser_qpair->del) {
+			TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
+			destroy_qp(ctrlr, muser_qpair->qpair.qid);
 			continue;
 		}
 
 		muser_qpair_poll(muser_qpair);
-
 	}
 
 	return 0;
