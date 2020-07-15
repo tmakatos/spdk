@@ -2338,19 +2338,6 @@ muser_qpair_poll(struct muser_qpair *qpair)
 	}
 }
 
-static void
-muser_poll_group_remove_queues(struct muser_poll_group *muser_group,
-	                       struct muser_ctrlr *ctrlr)
-{
-	struct muser_qpair *muser_qpair, *tmp;
-
-	TAILQ_FOREACH_SAFE(muser_qpair, &muser_group->qps, link, tmp) {
-		if (muser_qpair->ctrlr == ctrlr) {
-			TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
-		}
-	}
-}
-
 /*
  * Called unconditionally, periodically, very frequently from SPDK to ask
  * whether there's work to be done.  This functions consumes requests generated
