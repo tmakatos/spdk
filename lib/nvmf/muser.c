@@ -188,7 +188,6 @@ struct muser_poll_group {
 struct muser_ctrlr {
 	struct muser_endpoint			*endpoint;
 	struct muser_transport			*transport;
-	lm_ctx_t				*lm_ctx;
 	lm_pci_config_space_t			*pci_config_space;
 
 	/* True when the admin queue is connected */
@@ -477,7 +476,7 @@ asq_map(struct muser_ctrlr *ctrlr)
 	q.size = regs->aqa.bits.asqs + 1;
 	q.head = ctrlr->doorbells[0] = 0;
 	q.cqid = 0;
-	q.addr = map_one(ctrlr->lm_ctx, regs->asq,
+	q.addr = map_one(ctrlr->endpoint->lm_ctx, regs->asq,
 			 q.size * sizeof(struct spdk_nvme_cmd), &q.sg, &q.iov);
 	if (q.addr == NULL) {
 		return -1;
@@ -552,7 +551,7 @@ acq_map(struct muser_ctrlr *ctrlr)
 
 	q->size = regs->aqa.bits.acqs + 1;
 	q->tail = 0;
-	q->addr = map_one(ctrlr->lm_ctx, regs->acq,
+	q->addr = map_one(ctrlr->endpoint->lm_ctx, regs->acq,
 			  q->size * sizeof(struct spdk_nvme_cpl), &q->sg, &q->iov);
 	if (q->addr == NULL) {
 		return -1;
@@ -578,7 +577,7 @@ _map_one(void *prv, uint64_t addr, uint64_t len)
 
 	assert(m_req->iovcnt >= 0);
 	assert(m_req->iovcnt < MUSER_MAX_IOVEC);
-	ret = map_one(m_qpair->ctrlr->lm_ctx, addr, len,
+	ret = map_one(m_qpair->ctrlr->endpoint->lm_ctx, addr, len,
 		      &m_req->sg[m_req->iovcnt],
 		      &m_req->iov[m_req->iovcnt]);
 	if (spdk_likely(ret != NULL)) {
@@ -716,7 +715,7 @@ post_completion(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	 * check for race conditions.
 	 */
 	if (ctrlr_interrupt_enabled(ctrlr) && cq->ien) {
-		err = lm_irq_trigger(ctrlr->lm_ctx, cq->iv);
+		err = lm_irq_trigger(ctrlr->endpoint->lm_ctx, cq->iv);
 		if (err != 0) {
 			SPDK_ERRLOG("%s: failed to trigger interrupt: %m\n",
 				    ctrlr->endpoint->trid.traddr);
@@ -776,8 +775,8 @@ destroy_io_qp(struct muser_qpair *qp)
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "destroy I/O QP%d\n", qp->qpair.qid);
 
-	destroy_io_q(qp->ctrlr->lm_ctx, &qp->sq);
-	destroy_io_q(qp->ctrlr->lm_ctx, &qp->cq);
+	destroy_io_q(qp->ctrlr->endpoint->lm_ctx, &qp->sq);
+	destroy_io_q(qp->ctrlr->endpoint->lm_ctx, &qp->cq);
 }
 
 static void
@@ -993,7 +992,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		goto out;
 	}
 
-	io_q.addr = map_one(ctrlr->lm_ctx, cmd->dptr.prp.prp1,
+	io_q.addr = map_one(ctrlr->endpoint->lm_ctx, cmd->dptr.prp.prp1,
 			    io_q.size * entry_size, &io_q.sg, &io_q.iov);
 	if (io_q.addr == NULL) {
 		sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
@@ -1156,7 +1155,7 @@ handle_cmd_rsp(struct muser_req *req, void *cb_arg)
 		}
 	}
 
-	lm_unmap_sg(qpair->ctrlr->lm_ctx, req->sg, req->iov, req->iovcnt);
+	lm_unmap_sg(qpair->ctrlr->endpoint->lm_ctx, req->sg, req->iov, req->iovcnt);
 
 	return post_completion(qpair->ctrlr, &req->req.cmd->nvme_cmd,
 			       &qpair->ctrlr->qp[req->req.qpair->qid]->cq,
@@ -1654,12 +1653,11 @@ muser_create_ctrlr(struct muser_transport *muser_transport,
 	muser_ctrlr->cntlid = 0xffff;
 	muser_ctrlr->transport = muser_transport;
 	muser_ctrlr->endpoint = muser_ep;
-	muser_ctrlr->lm_ctx = muser_ep->lm_ctx; /* FIXME we can already access lm_ctx via muser_ctrlr->endpoint->lm_ctx */
 	muser_ctrlr->doorbells = muser_ep->doorbells;
 
 	muser_ep->ctrlr = muser_ctrlr;
 
-	muser_ctrlr->pci_config_space = lm_get_pci_config_space(muser_ctrlr->lm_ctx);
+	muser_ctrlr->pci_config_space = lm_get_pci_config_space(muser_ctrlr->endpoint->lm_ctx);
 	init_pci_config_space(muser_ctrlr->pci_config_space);
 
 	/* Then, construct an admin queue pair */
@@ -2311,7 +2309,7 @@ muser_ctrlr_poll(struct muser_ctrlr *ctrlr)
 
 	/* This will call access_bar0_fn() if there are any writes
 	 * to the portion of the BAR that is not mmap'd */
-	return lm_ctx_poll(ctrlr->lm_ctx);
+	return lm_ctx_poll(ctrlr->endpoint->lm_ctx);
 }
 
 static void
