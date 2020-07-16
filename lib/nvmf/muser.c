@@ -1557,12 +1557,8 @@ muser_dev_info_fill(lm_dev_info_t *dev_info)
 static void
 init_pci_config_space(lm_pci_config_space_t *p)
 {
-	struct nvme_pcie_mlbar *mlbar;
-	struct nvme_pcie_bar2 *nvme_bar2;
-
 	/* MLBAR */
-	mlbar = (struct nvme_pcie_mlbar *)&p->hdr.bars[0];
-	memset(mlbar, 0, sizeof(*mlbar));
+	memset(&p->hdr.bars[0], 0, sizeof(struct nvme_pcie_mlbar));
 
 	/* MUBAR */
 	p->hdr.bars[1].raw = 0x0;
@@ -1570,9 +1566,8 @@ init_pci_config_space(lm_pci_config_space_t *p)
 	/*
 	 * BAR2, index/data pair register base address or vendor specific (optional)
 	 */
-	nvme_bar2 = (struct nvme_pcie_bar2 *)&p->hdr.bars[2].raw;
-	memset(nvme_bar2, 0, sizeof(*nvme_bar2));
-	nvme_bar2->rte = 0x1;
+	memset(&p->hdr.bars[2].raw, 0, sizeof(struct nvme_pcie_bar2));
+	((struct nvme_pcie_bar2 *)&p->hdr.bars[2].raw)->rte = 0x1;
 
 	/* vendor specific, let's set them to zero for now */
 	p->hdr.bars[3].raw = 0x0;
