@@ -1410,13 +1410,14 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 	ctrlr = muser_ep->ctrlr;
 
 	if (is_write) {
-		fprintf(stderr, "writes not supported\n");
+		SPDK_ERRLOG("%s: write %#lx-%#lx not supported\n",
+			    muser_ep->trid.traddr, offset, offset + count);
 		return -EINVAL;
 	}
 
 	if (offset + count > PCI_CFG_SPACE_EXP_SIZE) {
-		fprintf(stderr, "access past end of extended PCI configuration space, want=%ld+%ld, max=%d\n",
-			offset, count, PCI_CFG_SPACE_EXP_SIZE);
+		SPDK_ERRLOG("%s: access past end of extended PCI configuration space, want=%ld+%ld, max=%d\n",
+			muser_ep->trid.traddr, offset, count, PCI_CFG_SPACE_EXP_SIZE);
 		return -ERANGE;
 	}
 
