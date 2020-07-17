@@ -1485,20 +1485,22 @@ static void
 muser_dev_info_fill(lm_dev_info_t *dev_info)
 {
 	static lm_cap_t pm = {
-		.id = PCI_CAP_ID_PM,
-		.cap.pm.pmcs.nsfrst = 0x1
+		.pm = {
+			.hdr.id = PCI_CAP_ID_PM,
+			.pmcs.nsfrst = 0x1
+		}
 	};
 	static lm_cap_t px = {
-		.id = PCI_CAP_ID_EXP,
-		.cap.px = {
+		.px = {
+			.hdr.id = PCI_CAP_ID_EXP,
 			.pxcaps.ver = 0x2,
 			.pxdcap = {.per = 0x1, .flrc = 0x1},
-			.pxdcap2.ctds = 0x1,
+			.pxdcap2.ctds = 0x1
 		}
 	};
 	static lm_cap_t msix = {
-		.id = PCI_CAP_ID_MSIX,
-		.cap.msix = {
+		.msix = {
+			.hdr.id = PCI_CAP_ID_MSIX,
 			.mxc.ts = NVME_IRQ_MSIX_NUM - 1,
 			.mtab = {.tbir = 0x4, .to = 0x0},
 			.mpba = {.pbir = 0x5, .pbao = 0x0}
