@@ -1618,6 +1618,25 @@ destroy_ctrlr(struct muser_ctrlr *ctrlr)
 	return 0;
 }
 
+static void
+spdk_map_dma(void *pvt, uint64_t iova, uint64_t len)
+{
+	struct muser_endpoint *muser_ep = pvt;
+	struct muser_ctrlr *ctrlr;
+	int i;
+
+	assert(muser_ep != NULL);
+
+	if (muser_ep->ctrlr == NULL) {
+		return 0;
+	}
+
+	ctrlr = muser_ep->ctrlr;
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map IOVA %#lx-%#lx\n",
+		      ctrlr_id(ctrlr), iova, len);
+}
+
 static int
 spdk_unmap_dma(void *pvt, uint64_t iova)
 {
@@ -1769,6 +1788,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	dev_info.pvt = muser_ep;
 	dev_info.uuid = endpoint_id(muser_ep);
 	muser_dev_info_fill(&dev_info);
+	dev_info.map_dma = &spdk_map_dma;
 	dev_info.unmap_dma = &spdk_unmap_dma;
 
 	muser_ep->lm_ctx = lm_ctx_create(&dev_info);
