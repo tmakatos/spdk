@@ -151,6 +151,7 @@ struct io_q {
 	 * there.
 	 */
 	uint32_t size;
+	uint64_t prp1;
 
 	union {
 		struct {
@@ -175,6 +176,7 @@ struct muser_qpair {
 	struct io_q				cq;
 	struct io_q				sq;
 	bool					del;
+	bool					unmapped;
 
 	TAILQ_HEAD(, muser_req)			reqs;
 	TAILQ_ENTRY(muser_qpair)		link;
@@ -1015,6 +1017,7 @@ handle_create_io_q(struct muser_ctrlr *ctrlr,
 		SPDK_ERRLOG("%s: failed to map I/O queue: %m\n", ctrlr_id(ctrlr));
 		goto out;
 	}
+	io_q.prp1 = cmd->dptr.prp.prp1;
 	memset(io_q.addr, 0, io_q.size * entry_size);
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: mapped %cQ%d IOVA=%#lx vaddr=%#llx\n",
@@ -1089,6 +1092,9 @@ static int
 handle_abort_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 {
 	assert(ctrlr != NULL);
+
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: abort CID %u in SQID %u\n", ctrlr_id(ctrlr),
+		      cmd->cdw10_bits.abort.cid, cmd->cdw10_bits.abort.sqid);
 
 	/* abort command not yet implemented */
 	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 1,
@@ -1623,18 +1629,52 @@ spdk_map_dma(void *pvt, uint64_t iova, uint64_t len)
 {
 	struct muser_endpoint *muser_ep = pvt;
 	struct muser_ctrlr *ctrlr;
-	int i;
+	struct muser_qpair *muser_qpair;
+	int i, ret;
 
 	assert(muser_ep != NULL);
 
 	if (muser_ep->ctrlr == NULL) {
-		return 0;
+		return;
 	}
 
 	ctrlr = muser_ep->ctrlr;
 
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: map IOVA %#lx-%#lx\n",
 		      ctrlr_id(ctrlr), iova, len);
+
+	for (i = 0; i < MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		muser_qpair = ctrlr->qp[i];
+		if (muser_qpair == NULL) {
+			continue;
+		}
+
+		if (!muser_qpair->unmapped) {
+			continue;
+		}
+
+		if (nvmf_qpair_is_admin_queue(&muser_qpair->qpair)) {
+			ret = map_admin_queue(ctrlr);
+			if (ret) {
+				continue;
+			}
+			muser_qpair->unmapped = false;
+		} else {
+			struct io_q *sq = &muser_qpair->sq;
+			struct io_q *cq = &muser_qpair->cq;
+
+			sq->addr = map_one(ctrlr->endpoint->lm_ctx, sq->prp1, sq->size * 64, &sq->sg, &sq->iov);
+			if (!sq->addr) {
+				continue;
+			}
+			cq->addr = map_one(ctrlr->endpoint->lm_ctx, cq->prp1, cq->size * 16, &cq->sg, &cq->iov);
+			if (!cq->addr) {
+				continue;
+			}
+
+			muser_qpair->unmapped = false;
+		}
+	}
 }
 
 static int
@@ -1662,13 +1702,8 @@ spdk_unmap_dma(void *pvt, uint64_t iova)
 		}
 		if (ctrlr->qp[i]->cq.sg.dma_addr == iova ||
 		    ctrlr->qp[i]->sq.sg.dma_addr == iova) {
-
-			if (i == 0) {
-				destroy_io_qp(ctrlr->qp[0]);
-			} else {
-				destroy_io_qp(ctrlr->qp[i]);
-				ctrlr->qp[i]->del = true;
-			}
+			destroy_io_qp(ctrlr->qp[i]);
+			ctrlr->qp[i]->unmapped = true;
 		}
 	}
 
@@ -2440,6 +2475,10 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 		if (muser_qpair->del) {
 			TAILQ_REMOVE(&muser_group->qps, muser_qpair, link);
 			destroy_qp(ctrlr, muser_qpair->qpair.qid);
+			continue;
+		}
+
+		if (muser_qpair->unmapped) {
 			continue;
 		}
 
