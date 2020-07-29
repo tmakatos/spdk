@@ -76,7 +76,7 @@ struct spdk_log_flag SPDK_LOG_MUSER = {.enabled = true};
 #define MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR 64
 #define MUSER_DEFAULT_IN_CAPSULE_DATA_SIZE 0
 
-/* 
+/*
  * By setting spdk_nvmf_transport_opts.max_io_size = MUSER_DEFAULT_MAX_IO_SIZE
  * we're effectively setting MDTS.
  */
@@ -167,6 +167,14 @@ struct io_q {
 	};
 };
 
+enum muser_qpair_state {
+	MUSER_QPAIR_UNINITIALIZED = 0,
+	MUSER_QPAIR_ACTIVE,
+	MUSER_QPAIR_DELETED,
+	MUSER_QPAIR_INACTIVE,
+	MUSER_QPAIR_ERROR,
+};
+
 struct muser_qpair {
 	struct spdk_nvmf_qpair			qpair;
 	struct spdk_nvmf_transport_poll_group	*group;
@@ -175,8 +183,7 @@ struct muser_qpair {
 	uint16_t				qsize; /* TODO aren't all queues the same size? */
 	struct io_q				cq;
 	struct io_q				sq;
-	bool					del;
-	bool					unmapped;
+	enum muser_qpair_state			state;
 
 	TAILQ_HEAD(, muser_req)			reqs;
 	TAILQ_ENTRY(muser_qpair)		link;
@@ -1065,22 +1072,23 @@ handle_del_io_q(struct muser_ctrlr *ctrlr,
 
 	if (is_cq) {
 		/* SQ must have been deleted first */
-		if (!ctrlr->qp[cmd->cdw10_bits.delete_io_q.qid]->del) {
-			/* TODO add error message */
+		if (ctrlr->qp[cmd->cdw10_bits.delete_io_q.qid]->state != MUSER_QPAIR_DELETED) {
+			SPDK_ERRLOG("%s: the associated SQ must be deleted first\n", ctrlr_id(ctrlr));
 			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 			sc = SPDK_NVME_SC_INVALID_QUEUE_DELETION;
 			goto out;
 		}
 	} else {
 		/*
-		 * FIXME this doesn't actually delete the I/O queue, we can't
+		 * This doesn't actually delete the I/O queue, we can't
 		 * do that anyway because NVMf doesn't support it. We're merely
 		 * telling the poll_group_poll function to skip checking this
 		 * queue. The only workflow this works is when CC.EN is set to
 		 * 0 and we're stopping the subsystem, so we know that the
 		 * relevant callbacks to destroy the queues will be called.
 		 */
-		ctrlr->qp[cmd->cdw10_bits.delete_io_q.qid]->del = true;
+		assert(ctrlr->qp[cmd->cdw10_bits.delete_io_q.qid]->state == MUSER_QPAIR_ACTIVE);
+		ctrlr->qp[cmd->cdw10_bits.delete_io_q.qid]->state = MUSER_QPAIR_DELETED;
 	}
 
 out:
@@ -1438,8 +1446,8 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 
 	if (offset + count > PCI_CFG_SPACE_EXP_SIZE) {
 		SPDK_ERRLOG("%s: access past end of extended PCI configuration space, want=%ld+%ld, max=%d\n",
-			endpoint_id(muser_ep), offset, count,
-			PCI_CFG_SPACE_EXP_SIZE);
+			    endpoint_id(muser_ep), offset, count,
+			    PCI_CFG_SPACE_EXP_SIZE);
 		return -ERANGE;
 	}
 
@@ -1649,7 +1657,7 @@ spdk_map_dma(void *pvt, uint64_t iova, uint64_t len)
 			continue;
 		}
 
-		if (!muser_qpair->unmapped) {
+		if (muser_qpair->state != MUSER_QPAIR_INACTIVE) {
 			continue;
 		}
 
@@ -1658,7 +1666,7 @@ spdk_map_dma(void *pvt, uint64_t iova, uint64_t len)
 			if (ret) {
 				continue;
 			}
-			muser_qpair->unmapped = false;
+			muser_qpair->state = MUSER_QPAIR_ACTIVE;
 		} else {
 			struct io_q *sq = &muser_qpair->sq;
 			struct io_q *cq = &muser_qpair->cq;
@@ -1672,7 +1680,7 @@ spdk_map_dma(void *pvt, uint64_t iova, uint64_t len)
 				continue;
 			}
 
-			muser_qpair->unmapped = false;
+			muser_qpair->state = MUSER_QPAIR_ACTIVE;
 		}
 	}
 }
@@ -1703,7 +1711,7 @@ spdk_unmap_dma(void *pvt, uint64_t iova)
 		if (ctrlr->qp[i]->cq.sg.dma_addr == iova ||
 		    ctrlr->qp[i]->sq.sg.dma_addr == iova) {
 			destroy_io_qp(ctrlr->qp[i]);
-			ctrlr->qp[i]->unmapped = true;
+			ctrlr->qp[i]->state = MUSER_QPAIR_INACTIVE;
 		}
 	}
 
@@ -1834,10 +1842,10 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		err = -1;
 		goto out;
 	}
-	muser_ep->msix = (struct msixcap*)lm_ctx_get_cap(muser_ep->lm_ctx,
-                                                         PCI_CAP_ID_MSIX);
+	muser_ep->msix = (struct msixcap *)lm_ctx_get_cap(muser_ep->lm_ctx,
+			 PCI_CAP_ID_MSIX);
 	assert(muser_ep->msix != NULL);
-	
+
 
 	TAILQ_INSERT_TAIL(&muser_transport->endpoints, muser_ep, link);
 
@@ -2019,6 +2027,7 @@ handle_queue_connect_rsp(struct muser_req *req, void *cb_arg)
 
 	muser_group = SPDK_CONTAINEROF(qpair->group, struct muser_poll_group, group);
 	TAILQ_INSERT_TAIL(&muser_group->qps, qpair, link);
+	qpair->state = MUSER_QPAIR_ACTIVE;
 
 	ctrlr = qpair->ctrlr;
 	assert(ctrlr != NULL);
@@ -2455,28 +2464,7 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			}
 		}
 
-		/*
-		 * TODO In init_qp the last thing we do is to point
-		 * ctrlr->qp[qid] to the newly allocated qpair, which isn't
-		 * fully initialized yet, and then request NVMf to add it. A
-		 * better way to check whether the queue has been initialized
-		 * is not to add it to ctrlr->qp[qid], so we'd only have to
-		 * check whether ctrlr->qp[qid] is NULL.
-		 */
-		if (muser_qpair->sq.size == 0) {
-			continue;
-		}
-
-		/*
-		 * TODO queue is being deleted, don't check. Maybe we earlier
-		 * check regarding the queue size and this check could be
-		 * consolidated into a single flag, e.g. 'active'?
-		 */
-		if (muser_qpair->del) {
-			continue;
-		}
-
-		if (muser_qpair->unmapped) {
+		if (muser_qpair->state != MUSER_QPAIR_ACTIVE) {
 			continue;
 		}
 
