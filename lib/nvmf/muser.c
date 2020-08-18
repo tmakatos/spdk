@@ -1746,7 +1746,6 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
-	unlink(path);
 	free(path);
 
 	err = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
