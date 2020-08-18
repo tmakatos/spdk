@@ -1124,27 +1124,6 @@ consume_admin_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 		      ctrlr_id(ctrlr), cmd->opc, cmd->cid);
 
 	switch (cmd->opc) {
-	/* TODO put all cases in order */
-	/* FIXME we pass the async event request to NVMf so if we ever need to
-	 * send an event to the host we won't be able to. We'll have to somehow
-	 * grab this request from NVMf. If we don't forward the request to NVMf
-	 * then NVMf won't be able to issue an async event response if it needs
-	 * to. One way to solve this problem is to keep the request and then
-	 * generate another one for NVMf. If NVMf ever completes it then we copy
-	 * it to the one we kept and complete it.
-	 */
-	case SPDK_NVME_OPC_ASYNC_EVENT_REQUEST:
-	case SPDK_NVME_OPC_IDENTIFY:
-	case SPDK_NVME_OPC_SET_FEATURES:
-	case SPDK_NVME_OPC_GET_FEATURES:
-	case SPDK_NVME_OPC_GET_LOG_PAGE:
-	/*
-	 * NVMf correctly fails this request with sc=0x01 (Invalid Command
-	 * Opcode) as it does not advertise support for the namespace management
-	 * capability (oacs.ns_manage is set to 0 in the identify response).
-	 */
-	case SPDK_NVME_OPC_NS_MANAGEMENT:
-		return handle_cmd_req(ctrlr, cmd, get_nvmf_req(ctrlr->qp[0]));
 	case SPDK_NVME_OPC_CREATE_IO_CQ:
 	case SPDK_NVME_OPC_CREATE_IO_SQ:
 		return handle_create_io_q(ctrlr, cmd,
@@ -1155,13 +1134,9 @@ consume_admin_cmd(struct muser_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd)
 	case SPDK_NVME_OPC_DELETE_IO_CQ:
 		return handle_del_io_q(ctrlr, cmd,
 				       cmd->opc == SPDK_NVME_OPC_DELETE_IO_CQ);
+	default:
+		return handle_cmd_req(ctrlr, cmd, get_nvmf_req(ctrlr->qp[0]));
 	}
-
-	SPDK_NOTICELOG("%s: unsupported command 0x%x\n",
-		       ctrlr_id(ctrlr), cmd->opc);
-	return post_completion(ctrlr, cmd, &ctrlr->qp[0]->cq, 0,
-			       SPDK_NVME_SC_INVALID_OPCODE,
-			       SPDK_NVME_SCT_GENERIC);
 }
 
 static int
