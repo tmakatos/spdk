@@ -40,7 +40,7 @@ APP = stub
 C_SRCS := stub.c
 
 SPDK_LIB_LIST = $(SOCK_MODULES_LIST)
-SPDK_LIB_LIST += event conf nvme log trace rpc jsonrpc json thread util sock notify
+SPDK_LIB_LIST += event conf nvme log trace rpc jsonrpc json thread util sock notify vfio_user
 
 ifeq ($(CONFIG_RDMA),y)
 SPDK_LIB_LIST += rdma

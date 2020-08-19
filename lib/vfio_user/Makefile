@@ -1,4 +1,6 @@
 #
+#  BSD LICENSE
+#
 #  Copyright (c) Intel Corporation.
 #  All rights reserved.
 #
@@ -29,21 +31,15 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../..)
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
-include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 
-APP = nvme_fuzz
+SO_VER := 1
+SO_MINOR := 0
 
-CFLAGS += -I$(SPDK_ROOT_DIR)/test/app/fuzz/common
+C_SRCS = vfio_user_pci.c vfio_user.c
+LIBNAME = vfio_user
 
-C_SRCS := nvme_fuzz.c
+SPDK_MAP_FILE = $(abspath $(CURDIR)/spdk_vfio_user.map)
 
-SPDK_LIB_LIST += $(SOCK_MODULES_LIST)
-SPDK_LIB_LIST += conf event json jsonrpc log nvme rpc sock thread trace util vfio_user
-
-ifeq ($(CONFIG_RDMA),y)
-SPDK_LIB_LIST += rdma
-endif
-
-include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk

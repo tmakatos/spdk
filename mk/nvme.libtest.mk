@@ -39,7 +39,7 @@ include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 C_SRCS := $(APP:%=%.c)
 
 SPDK_LIB_LIST = $(SOCK_MODULES_LIST)
-SPDK_LIB_LIST += nvme thread util log sock vmd jsonrpc json rpc
+SPDK_LIB_LIST += nvme thread util log sock vmd jsonrpc json rpc vfio_user
 
 ifeq ($(CONFIG_RDMA),y)
 SPDK_LIB_LIST += rdma
