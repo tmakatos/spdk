@@ -48,6 +48,7 @@ DIRS-$(CONFIG_VHOST) += vhost
 DIRS-$(CONFIG_VIRTIO) += virtio
 DIRS-$(CONFIG_REDUCE) += reduce
 DIRS-$(CONFIG_RDMA) += rdma
+DIRS-$(CONFIG_VFIO_USER) += vfio_user
 
 # If CONFIG_ENV is pointing at a directory in lib, build it.
 # Out-of-tree env implementations must be built separately by the user.
