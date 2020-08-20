@@ -1856,7 +1856,8 @@ muser_accept(struct spdk_nvmf_transport *transport)
 	}
 
 	TAILQ_FOREACH(muser_ep, &muser_transport->endpoints, link) {
-		if (muser_ep->ctrlr != NULL) {
+		/* we need try to attach the controller again after reset or shutdown */
+		if (muser_ep->ctrlr != NULL && muser_ep->ctrlr->ready) {
 			continue;
 		}
 
@@ -2300,10 +2301,6 @@ muser_ctrlr_poll(struct muser_ctrlr *ctrlr)
 		return 0;
 	}
 
-	if (!ctrlr->ready) {
-		return 0;
-	}
-
 	/* This will call access_bar0_fn() if there are any writes
 	 * to the portion of the BAR that is not mmap'd */
 	return lm_ctx_poll(ctrlr->endpoint->lm_ctx);
@@ -2350,11 +2347,13 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 
 	TAILQ_FOREACH_SAFE(muser_qpair, &muser_group->qps, link, tmp) {
+		ctrlr = muser_qpair->ctrlr;
+		if (!ctrlr->ready) {
+			continue;
+		}
 
 		if (nvmf_qpair_is_admin_queue(&muser_qpair->qpair)) {
 			int err;
-
-			ctrlr = muser_qpair->ctrlr;
 
 			err = muser_ctrlr_poll(ctrlr);
 			if (spdk_unlikely(err) != 0) {
@@ -2376,7 +2375,7 @@ muser_poll_group_poll(struct spdk_nvmf_transport_poll_group *group)
 			}
 		}
 
-		if (muser_qpair->state != MUSER_QPAIR_ACTIVE) {
+		if (muser_qpair->state != MUSER_QPAIR_ACTIVE || !muser_qpair->sq.size) {
 			continue;
 		}
 
