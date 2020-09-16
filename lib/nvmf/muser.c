@@ -1288,13 +1288,12 @@ muser_prop_req_rsp(struct muser_req *req, void *cb_arg)
 }
 
 /*
+ * XXX Do NOT remove, see comment in access_bar0_fn.
+ *
  * Handles a write at offset 0x1000 or more.
  *
  * DSTRD is set to fixed value 0 for NVMf.
  *
- * TODO this function won't be called when sparse mapping is used, however it
- * might be used when we dynamically switch off polling, so I'll leave it here
- * for now.
  */
 static int
 handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
@@ -1356,6 +1355,12 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 		      ctrlr, count, pos);
 
 	if (pos >= DOORBELLS) {
+		/*
+		 * XXX The fact that the doorbells can be memory mapped doesn't
+		 * mean thath the client (VFIO in QEMU) is obliged to memory
+		 * map them, it might still elect to access them via regular
+		 * read/write.
+		 */
 		ret = handle_dbl_access(ctrlr, (uint32_t *)buf, count,
 					pos, is_write);
 		if (ret == 0) {
