@@ -49,6 +49,10 @@
 #include "spdk/log.h"
 #include "spdk/likely.h"
 
+#ifdef SPDK_CONFIG_URING
+#include <liburing.h>
+#endif
+
 #if HAVE_LIBAIO
 #include <libaio.h>
 #endif
@@ -67,6 +71,7 @@ struct ctrlr_entry {
 enum entry_type {
 	ENTRY_TYPE_NVME_NS,
 	ENTRY_TYPE_AIO_FILE,
+	ENTRY_TYPE_URING_FILE,
 };
 
 struct ns_fn_table;
@@ -80,9 +85,14 @@ struct ns_entry {
 			struct spdk_nvme_ctrlr	*ctrlr;
 			struct spdk_nvme_ns	*ns;
 		} nvme;
-#if HAVE_LIBAIO
+#ifdef SPDK_CONFIG_URING
 		struct {
 			int			fd;
+		} uring;
+#endif
+#if HAVE_LIBAIO
+		struct {
+			int                     fd;
 		} aio;
 #endif
 	} u;
@@ -119,13 +129,17 @@ static const double g_latency_cutoffs[] = {
 	-1,
 };
 
-struct ns_worker_ctx {
-	struct ns_entry		*entry;
+struct ns_worker_stats {
 	uint64_t		io_completed;
 	uint64_t		last_io_completed;
 	uint64_t		total_tsc;
 	uint64_t		min_tsc;
 	uint64_t		max_tsc;
+};
+
+struct ns_worker_ctx {
+	struct ns_entry		*entry;
+	struct ns_worker_stats	stats;
 	uint64_t		current_queue_depth;
 	uint64_t		offset_in_ios;
 	bool			is_draining;
@@ -139,6 +153,15 @@ struct ns_worker_ctx {
 			int				last_qpair;
 		} nvme;
 
+#ifdef SPDK_CONFIG_URING
+		struct {
+			struct io_uring		ring;
+			uint64_t		io_inflight;
+			uint64_t		io_pending;
+			struct io_uring_cqe	**cqes;
+
+		} uring;
+#endif
 #if HAVE_LIBAIO
 		struct {
 			struct io_event		*events;
@@ -213,16 +236,20 @@ static int g_queue_depth;
 static int g_nr_io_queues_per_ns = 1;
 static int g_nr_unused_io_queues;
 static int g_time_in_sec;
+static int g_warmup_time_in_sec;
 static uint32_t g_max_completions;
 static int g_dpdk_mem;
 static int g_shm_id = -1;
 static uint32_t g_disable_sq_cmb;
+static bool g_use_uring;
 static bool g_no_pci;
 static bool g_warn;
 static bool g_header_digest;
 static bool g_data_digest;
 static bool g_no_shn_notification;
 static bool g_mix_specified;
+/* The flag is used to exit the program while keep alive fails on the transport */
+static bool g_exit;
 /* Default to 10 seconds for the keep alive value. This value is arbitrary. */
 static uint32_t g_keep_alive_timeout_in_ms = 10000;
 
@@ -236,12 +263,126 @@ struct trid_entry {
 
 static TAILQ_HEAD(, trid_entry) g_trid_list = TAILQ_HEAD_INITIALIZER(g_trid_list);
 
-static int g_aio_optind; /* Index of first AIO filename in argv */
+static int g_file_optind; /* Index of first filename in argv */
 
 static inline void
 task_complete(struct perf_task *task);
 
-#if HAVE_LIBAIO
+#ifdef SPDK_CONFIG_URING
+
+static void
+uring_setup_payload(struct perf_task *task, uint8_t pattern)
+{
+	task->iov.iov_base = spdk_dma_zmalloc(g_io_size_bytes, g_io_align, NULL);
+	task->iov.iov_len = g_io_size_bytes;
+	if (task->iov.iov_base == NULL) {
+		fprintf(stderr, "spdk_dma_zmalloc() for task->iov.iov_base failed\n");
+		exit(1);
+	}
+	memset(task->iov.iov_base, pattern, task->iov.iov_len);
+}
+
+static int
+uring_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
+		struct ns_entry *entry, uint64_t offset_in_ios)
+{
+	struct io_uring_sqe *sqe;
+
+	sqe = io_uring_get_sqe(&ns_ctx->u.uring.ring);
+	if (!sqe) {
+		fprintf(stderr, "Cannot get sqe\n");
+		return -1;
+	}
+
+	if (task->is_read) {
+		io_uring_prep_readv(sqe, entry->u.uring.fd, &task->iov, 1, offset_in_ios * task->iov.iov_len);
+	} else {
+		io_uring_prep_writev(sqe, entry->u.uring.fd, &task->iov, 1, offset_in_ios * task->iov.iov_len);
+	}
+
+	io_uring_sqe_set_data(sqe, task);
+	ns_ctx->u.uring.io_pending++;
+
+	return 0;
+}
+
+static void
+uring_check_io(struct ns_worker_ctx *ns_ctx)
+{
+	int i, count, to_complete, to_submit, ret = 0;
+	struct perf_task *task;
+
+	to_submit = ns_ctx->u.uring.io_pending;
+
+	if (to_submit > 0) {
+		/* If there are I/O to submit, use io_uring_submit here.
+		 * It will automatically call spdk_io_uring_enter appropriately. */
+		ret = io_uring_submit(&ns_ctx->u.uring.ring);
+		if (ret < 0) {
+			return;
+		}
+		ns_ctx->u.uring.io_pending = 0;
+		ns_ctx->u.uring.io_inflight += to_submit;
+	}
+
+	to_complete = ns_ctx->u.uring.io_inflight;
+	if (to_complete > 0) {
+		count = io_uring_peek_batch_cqe(&ns_ctx->u.uring.ring, ns_ctx->u.uring.cqes, to_complete);
+		ns_ctx->u.uring.io_inflight -= count;
+		for (i = 0; i < count; i++) {
+			assert(ns_ctx->u.uring.cqes[i] != NULL);
+			task = (struct perf_task *)ns_ctx->u.uring.cqes[i]->user_data;
+			if (ns_ctx->u.uring.cqes[i]->res != (int)task->iov.iov_len) {
+				fprintf(stderr, "cqe[i]->status=%d\n", ns_ctx->u.uring.cqes[i]->res);
+				exit(0);
+			}
+			io_uring_cqe_seen(&ns_ctx->u.uring.ring, ns_ctx->u.uring.cqes[i]);
+			task_complete(task);
+		}
+	}
+}
+
+static void
+uring_verify_io(struct perf_task *task, struct ns_entry *entry)
+{
+}
+
+static int
+uring_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
+{
+	if (io_uring_queue_init(g_queue_depth, &ns_ctx->u.uring.ring, 0) < 0) {
+		SPDK_ERRLOG("uring I/O context setup failure\n");
+		return -1;
+	}
+
+	ns_ctx->u.uring.cqes = calloc(g_queue_depth, sizeof(struct io_uring_cqe *));
+	if (!ns_ctx->u.uring.cqes) {
+		io_uring_queue_exit(&ns_ctx->u.uring.ring);
+		return -1;
+	}
+
+	return 0;
+}
+
+static void
+uring_cleanup_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
+{
+	io_uring_queue_exit(&ns_ctx->u.uring.ring);
+	free(ns_ctx->u.uring.cqes);
+}
+
+static const struct ns_fn_table uring_fn_table = {
+	.setup_payload          = uring_setup_payload,
+	.submit_io              = uring_submit_io,
+	.check_io               = uring_check_io,
+	.verify_io              = uring_verify_io,
+	.init_ns_worker_ctx     = uring_init_ns_worker_ctx,
+	.cleanup_ns_worker_ctx  = uring_cleanup_ns_worker_ctx,
+};
+
+#endif
+
+#ifdef HAVE_LIBAIO
 static void
 aio_setup_payload(struct perf_task *task, uint8_t pattern)
 {
@@ -344,8 +485,12 @@ static const struct ns_fn_table aio_fn_table = {
 	.cleanup_ns_worker_ctx	= aio_cleanup_ns_worker_ctx,
 };
 
+#endif /* HAVE_LIBAIO */
+
+#if defined(HAVE_LIBAIO) || defined(SPDK_CONFIG_URING)
+
 static int
-register_aio_file(const char *path)
+register_file(const char *path)
 {
 	struct ns_entry *entry;
 
@@ -365,20 +510,20 @@ register_aio_file(const char *path)
 
 	fd = open(path, flags);
 	if (fd < 0) {
-		fprintf(stderr, "Could not open AIO device %s: %s\n", path, strerror(errno));
+		fprintf(stderr, "Could not open device %s: %s\n", path, strerror(errno));
 		return -1;
 	}
 
 	size = spdk_fd_get_size(fd);
 	if (size == 0) {
-		fprintf(stderr, "Could not determine size of AIO device %s\n", path);
+		fprintf(stderr, "Could not determine size of device %s\n", path);
 		close(fd);
 		return -1;
 	}
 
 	blklen = spdk_fd_get_blocklen(fd);
 	if (blklen == 0) {
-		fprintf(stderr, "Could not determine block size of AIO device %s\n", path);
+		fprintf(stderr, "Could not determine block size of device %s\n", path);
 		close(fd);
 		return -1;
 	}
@@ -394,13 +539,23 @@ register_aio_file(const char *path)
 	entry = malloc(sizeof(struct ns_entry));
 	if (entry == NULL) {
 		close(fd);
-		perror("aio ns_entry malloc");
+		perror("ns_entry malloc");
 		return -1;
 	}
 
-	entry->type = ENTRY_TYPE_AIO_FILE;
-	entry->fn_table = &aio_fn_table;
-	entry->u.aio.fd = fd;
+	if (g_use_uring) {
+#ifdef SPDK_CONFIG_URING
+		entry->type = ENTRY_TYPE_URING_FILE;
+		entry->fn_table = &uring_fn_table;
+		entry->u.uring.fd = fd;
+#endif
+	} else {
+#if HAVE_LIBAIO
+		entry->type = ENTRY_TYPE_AIO_FILE;
+		entry->fn_table = &aio_fn_table;
+		entry->u.aio.fd = fd;
+#endif
+	}
 	entry->size_in_ios = size / g_io_size_bytes;
 	entry->io_size_blocks = g_io_size_bytes / blklen;
 
@@ -414,20 +569,20 @@ register_aio_file(const char *path)
 }
 
 static int
-register_aio_files(int argc, char **argv)
+register_files(int argc, char **argv)
 {
 	int i;
 
-	/* Treat everything after the options as files for AIO */
-	for (i = g_aio_optind; i < argc; i++) {
-		if (register_aio_file(argv[i]) != 0) {
+	/* Treat everything after the options as files for AIO/URING */
+	for (i = g_file_optind; i < argc; i++) {
+		if (register_file(argv[i]) != 0) {
 			return 1;
 		}
 	}
 
 	return 0;
 }
-#endif /* HAVE_LIBAIO */
+#endif
 
 static void io_complete(void *ctx, const struct spdk_nvme_cpl *cpl);
 
@@ -612,7 +767,7 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 
 	ns_ctx->u.nvme.group = spdk_nvme_poll_group_create(NULL);
 	if (ns_ctx->u.nvme.group == NULL) {
-		return -1;
+		goto poll_group_failed;
 	}
 
 	group = ns_ctx->u.nvme.group;
@@ -622,21 +777,35 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 		qpair = ns_ctx->u.nvme.qpair[i];
 		if (!qpair) {
 			printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair failed\n");
-			return -1;
+			goto qpair_failed;
 		}
 
 		if (spdk_nvme_poll_group_add(group, qpair)) {
 			printf("ERROR: unable to add I/O qpair to poll group.\n");
-			return -1;
+			spdk_nvme_ctrlr_free_io_qpair(qpair);
+			goto qpair_failed;
 		}
 
 		if (spdk_nvme_ctrlr_connect_io_qpair(entry->u.nvme.ctrlr, qpair)) {
 			printf("ERROR: unable to connect I/O qpair.\n");
-			return -1;
+			spdk_nvme_poll_group_remove(group, qpair);
+			spdk_nvme_ctrlr_free_io_qpair(qpair);
+			goto qpair_failed;
 		}
 	}
 
 	return 0;
+
+qpair_failed:
+	for (; i > 0; --i) {
+		spdk_nvme_poll_group_remove(ns_ctx->u.nvme.group, ns_ctx->u.nvme.qpair[i - 1]);
+		spdk_nvme_ctrlr_free_io_qpair(ns_ctx->u.nvme.qpair[i - 1]);
+	}
+
+	spdk_nvme_poll_group_destroy(ns_ctx->u.nvme.group);
+poll_group_failed:
+	free(ns_ctx->u.nvme.qpair);
+	return -1;
 }
 
 static void
@@ -678,7 +847,10 @@ build_nvme_name(char *name, size_t length, struct spdk_nvme_ctrlr *ctrlr)
 		res = snprintf(name, length, "RDMA (addr:%s subnqn:%s)", trid->traddr, trid->subnqn);
 		break;
 	case SPDK_NVME_TRANSPORT_TCP:
-		res = snprintf(name, length, "TCP  (addr:%s subnqn:%s)", trid->traddr, trid->subnqn);
+		res = snprintf(name, length, "TCP (addr:%s subnqn:%s)", trid->traddr, trid->subnqn);
+		break;
+	case SPDK_NVME_TRANSPORT_CUSTOM:
+		res = snprintf(name, length, "CUSTOM (%s)", trid->traddr);
 		break;
 
 	default:
@@ -942,14 +1114,14 @@ task_complete(struct perf_task *task)
 	ns_ctx = task->ns_ctx;
 	entry = ns_ctx->entry;
 	ns_ctx->current_queue_depth--;
-	ns_ctx->io_completed++;
+	ns_ctx->stats.io_completed++;
 	tsc_diff = spdk_get_ticks() - task->submit_tsc;
-	ns_ctx->total_tsc += tsc_diff;
-	if (spdk_unlikely(ns_ctx->min_tsc > tsc_diff)) {
-		ns_ctx->min_tsc = tsc_diff;
+	ns_ctx->stats.total_tsc += tsc_diff;
+	if (spdk_unlikely(ns_ctx->stats.min_tsc > tsc_diff)) {
+		ns_ctx->stats.min_tsc = tsc_diff;
 	}
-	if (spdk_unlikely(ns_ctx->max_tsc < tsc_diff)) {
-		ns_ctx->max_tsc = tsc_diff;
+	if (spdk_unlikely(ns_ctx->stats.max_tsc < tsc_diff)) {
+		ns_ctx->stats.max_tsc = tsc_diff;
 	}
 	if (spdk_unlikely(g_latency_sw_tracking_level > 0)) {
 		spdk_histogram_data_tally(ns_ctx->histogram, tsc_diff);
@@ -1031,7 +1203,7 @@ cleanup_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 }
 
 static void
-print_periodic_performance(void)
+print_periodic_performance(bool warmup)
 {
 	uint64_t io_this_second;
 	double mb_this_second;
@@ -1050,15 +1222,15 @@ print_periodic_performance(void)
 	while (worker) {
 		ns_ctx = worker->ns_ctx;
 		while (ns_ctx) {
-			io_this_second += ns_ctx->io_completed - ns_ctx->last_io_completed;
-			ns_ctx->last_io_completed = ns_ctx->io_completed;
+			io_this_second += ns_ctx->stats.io_completed - ns_ctx->stats.last_io_completed;
+			ns_ctx->stats.last_io_completed = ns_ctx->stats.io_completed;
 			ns_ctx = ns_ctx->next;
 		}
 		worker = worker->next;
 	}
 
 	mb_this_second = (double)io_this_second * g_io_size_bytes / (1024 * 1024);
-	printf("%9ju IOPS, %8.2f MiB/s\r", io_this_second, mb_this_second);
+	printf("%s%9ju IOPS, %8.2f MiB/s\r", warmup ? "[warmup] " : "", io_this_second, mb_this_second);
 	fflush(stdout);
 }
 
@@ -1066,9 +1238,10 @@ static int
 work_fn(void *arg)
 {
 	uint64_t tsc_end, tsc_current, tsc_next_print;
-	struct worker_thread *worker = (struct worker_thread *)arg;
+	struct worker_thread *worker = (struct worker_thread *) arg;
 	struct ns_worker_ctx *ns_ctx = NULL;
 	uint32_t unfinished_ns_ctx;
+	bool warmup = false;
 
 	/* Allocate queue pairs for each namespace. */
 	ns_ctx = worker->ns_ctx;
@@ -1081,8 +1254,14 @@ work_fn(void *arg)
 	}
 
 	tsc_current = spdk_get_ticks();
-	tsc_end = tsc_current + g_time_in_sec * g_tsc_rate;
 	tsc_next_print = tsc_current + g_tsc_rate;
+
+	if (g_warmup_time_in_sec) {
+		warmup = true;
+		tsc_end = tsc_current + g_warmup_time_in_sec * g_tsc_rate;
+	} else {
+		tsc_end = tsc_current + g_time_in_sec * g_tsc_rate;
+	}
 
 	/* Submit initial I/O for each namespace. */
 	ns_ctx = worker->ns_ctx;
@@ -1091,7 +1270,7 @@ work_fn(void *arg)
 		ns_ctx = ns_ctx->next;
 	}
 
-	while (1) {
+	while (spdk_likely(!g_exit)) {
 		/*
 		 * Check for completed I/O for each controller. A new
 		 * I/O will be submitted in the io_complete callback
@@ -1107,11 +1286,30 @@ work_fn(void *arg)
 
 		if (worker->lcore == g_master_core && tsc_current > tsc_next_print) {
 			tsc_next_print += g_tsc_rate;
-			print_periodic_performance();
+			print_periodic_performance(warmup);
 		}
 
 		if (tsc_current > tsc_end) {
-			break;
+			if (warmup) {
+				/* Update test end time, clear statistics */
+				tsc_end = tsc_current + g_time_in_sec * g_tsc_rate;
+				ns_ctx = worker->ns_ctx;
+
+				while (ns_ctx != NULL) {
+					memset(&ns_ctx->stats, 0, sizeof(ns_ctx->stats));
+					ns_ctx->stats.min_tsc = UINT64_MAX;
+					ns_ctx = ns_ctx->next;
+				}
+
+				if (worker->lcore == g_master_core && isatty(STDOUT_FILENO)) {
+					/* warmup stage prints a longer string to stdout, need to erase it */
+					printf("%c[2K", 27);
+				}
+
+				warmup = false;
+			} else {
+				break;
+			}
 		}
 	}
 
@@ -1143,8 +1341,8 @@ work_fn(void *arg)
 static void usage(char *program_name)
 {
 	printf("%s options", program_name);
-#if HAVE_LIBAIO
-	printf(" [AIO device(s)]...");
+#if defined(SPDK_CONFIG_URING) || defined(HAVE_LIBAIO)
+	printf(" [Kernel device(s)]...");
 #endif
 	printf("\n");
 	printf("\t[-q io depth]\n");
@@ -1158,6 +1356,7 @@ static void usage(char *program_name)
 	printf("\t\t-L for latency summary, -LL for detailed histogram\n");
 	printf("\t[-l enable latency tracking via ssd (if supported), default: disabled]\n");
 	printf("\t[-t time in seconds]\n");
+	printf("\t[-a warmup time in seconds]\n");
 	printf("\t[-c core mask for I/O submission/completion.]\n");
 	printf("\t\t(default: 1)\n");
 	printf("\t[-D disable submission queue in controller memory buffer, default: enabled]\n");
@@ -1188,6 +1387,9 @@ static void usage(char *program_name)
 	printf("\t");
 	spdk_log_usage(stdout, "-T");
 	printf("\t[-V enable VMD enumeration]\n");
+#ifdef SPDK_CONFIG_URING
+	printf("\t[-R enable using liburing to drive kernel devices (Default: libaio)]\n");
+#endif
 #ifdef DEBUG
 	printf("\t[-G enable debug logging]\n");
 #else
@@ -1270,16 +1472,17 @@ print_performance(void)
 	while (worker) {
 		ns_ctx = worker->ns_ctx;
 		while (ns_ctx) {
-			if (ns_ctx->io_completed != 0) {
-				io_per_second = (double)ns_ctx->io_completed / g_time_in_sec;
+			if (ns_ctx->stats.io_completed != 0) {
+				io_per_second = (double)ns_ctx->stats.io_completed / g_time_in_sec;
 				mb_per_second = io_per_second * g_io_size_bytes / (1024 * 1024);
-				average_latency = ((double)ns_ctx->total_tsc / ns_ctx->io_completed) * 1000 * 1000 / g_tsc_rate;
-				min_latency = (double)ns_ctx->min_tsc * 1000 * 1000 / g_tsc_rate;
+				average_latency = ((double)ns_ctx->stats.total_tsc / ns_ctx->stats.io_completed) * 1000 * 1000 /
+						  g_tsc_rate;
+				min_latency = (double)ns_ctx->stats.min_tsc * 1000 * 1000 / g_tsc_rate;
 				if (min_latency < min_latency_so_far) {
 					min_latency_so_far = min_latency;
 				}
 
-				max_latency = (double)ns_ctx->max_tsc * 1000 * 1000 / g_tsc_rate;
+				max_latency = (double)ns_ctx->stats.max_tsc * 1000 * 1000 / g_tsc_rate;
 				if (max_latency > max_latency_so_far) {
 					max_latency_so_far = max_latency;
 				}
@@ -1290,8 +1493,8 @@ print_performance(void)
 				       average_latency, min_latency, max_latency);
 				total_io_per_second += io_per_second;
 				total_mb_per_second += mb_per_second;
-				total_io_completed += ns_ctx->io_completed;
-				total_io_tsc += ns_ctx->total_tsc;
+				total_io_completed += ns_ctx->stats.io_completed;
+				total_io_tsc += ns_ctx->stats.total_tsc;
 				ns_count++;
 			}
 			ns_ctx = ns_ctx->next;
@@ -1598,8 +1801,9 @@ parse_args(int argc, char **argv)
 	long int val;
 	int rc;
 
-	while ((op = getopt(argc, argv, "c:e:i:lo:q:r:k:s:t:w:C:DGHILM:NP:T:U:V")) != -1) {
+	while ((op = getopt(argc, argv, "a:c:e:i:lo:q:r:k:s:t:w:C:DGHILM:NP:RT:U:V")) != -1) {
 		switch (op) {
+		case 'a':
 		case 'i':
 		case 'C':
 		case 'P':
@@ -1616,6 +1820,9 @@ parse_args(int argc, char **argv)
 				return val;
 			}
 			switch (op) {
+			case 'a':
+				g_warmup_time_in_sec = val;
+				break;
 			case 'i':
 				g_shm_id = val;
 				break;
@@ -1695,6 +1902,15 @@ parse_args(int argc, char **argv)
 			break;
 		case 'N':
 			g_no_shn_notification = true;
+			break;
+		case 'R':
+#ifndef SPDK_CONFIG_URING
+			fprintf(stderr, "%s must be rebuilt with CONFIG_URING=y for -R flag.\n",
+				argv[0]);
+			usage(argv[0]);
+			return 0;
+#endif
+			g_use_uring = true;
 			break;
 		case 'T':
 			rc = spdk_log_set_flag(optarg);
@@ -1787,7 +2003,7 @@ parse_args(int argc, char **argv)
 		}
 	}
 
-	g_aio_optind = optind;
+	g_file_optind = optind;
 
 	return 0;
 }
@@ -1976,7 +2192,7 @@ associate_workers_with_ns(void)
 		}
 
 		printf("Associating %s with lcore %d\n", entry->name, worker->lcore);
-		ns_ctx->min_tsc = UINT64_MAX;
+		ns_ctx->stats.min_tsc = UINT64_MAX;
 		ns_ctx->entry = entry;
 		ns_ctx->next = worker->ns_ctx;
 		ns_ctx->histogram = spdk_histogram_data_alloc();
@@ -2002,6 +2218,7 @@ nvme_poll_ctrlrs(void *arg)
 {
 	struct ctrlr_entry *entry;
 	int oldstate;
+	int rc;
 
 	spdk_unaffinitize_thread();
 
@@ -2011,7 +2228,10 @@ nvme_poll_ctrlrs(void *arg)
 		entry = g_controllers;
 		while (entry) {
 			if (entry->trtype != SPDK_NVME_TRANSPORT_PCIE) {
-				spdk_nvme_ctrlr_process_admin_completions(entry->ctrlr);
+				rc = spdk_nvme_ctrlr_process_admin_completions(entry->ctrlr);
+				if (spdk_unlikely(rc < 0 && !g_exit)) {
+					g_exit = true;
+				}
 			}
 			entry = entry->next;
 		}
@@ -2063,8 +2283,8 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-#if HAVE_LIBAIO
-	if (register_aio_files(argc, argv) != 0) {
+#if defined(HAVE_LIBAIO) || defined(SPDK_CONFIG_URING)
+	if (register_files(argc, argv) != 0) {
 		rc = -1;
 		goto cleanup;
 	}
@@ -2080,7 +2300,7 @@ int main(int argc, char **argv)
 	}
 
 	if (g_num_namespaces == 0) {
-		fprintf(stderr, "No valid NVMe controllers or AIO devices found\n");
+		fprintf(stderr, "No valid NVMe controllers or AIO or URING devices found\n");
 		goto cleanup;
 	}
 

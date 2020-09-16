@@ -232,6 +232,8 @@ nvmf_valid_nqn(const char *nqn)
 	return true;
 }
 
+static void subsystem_state_change_on_pg(struct spdk_io_channel_iter *i);
+
 struct spdk_nvmf_subsystem *
 spdk_nvmf_subsystem_create(struct spdk_nvmf_tgt *tgt,
 			   const char *nqn,
@@ -370,6 +372,31 @@ spdk_nvmf_subsystem_destroy(struct spdk_nvmf_subsystem *subsystem)
 	free(subsystem);
 }
 
+
+/* we have to use the typedef in the function declaration to appease astyle. */
+typedef enum spdk_nvmf_subsystem_state spdk_nvmf_subsystem_state_t;
+
+static spdk_nvmf_subsystem_state_t
+nvmf_subsystem_get_intermediate_state(enum spdk_nvmf_subsystem_state current_state,
+				      enum spdk_nvmf_subsystem_state requested_state)
+{
+	switch (requested_state) {
+	case SPDK_NVMF_SUBSYSTEM_INACTIVE:
+		return SPDK_NVMF_SUBSYSTEM_DEACTIVATING;
+	case SPDK_NVMF_SUBSYSTEM_ACTIVE:
+		if (current_state == SPDK_NVMF_SUBSYSTEM_PAUSED) {
+			return SPDK_NVMF_SUBSYSTEM_RESUMING;
+		} else {
+			return SPDK_NVMF_SUBSYSTEM_ACTIVATING;
+		}
+	case SPDK_NVMF_SUBSYSTEM_PAUSED:
+		return SPDK_NVMF_SUBSYSTEM_PAUSING;
+	default:
+		assert(false);
+		return SPDK_NVMF_SUBSYSTEM_NUM_STATES;
+	}
+}
+
 static int
 nvmf_subsystem_set_state(struct spdk_nvmf_subsystem *subsystem,
 			 enum spdk_nvmf_subsystem_state state)
@@ -417,6 +444,11 @@ nvmf_subsystem_set_state(struct spdk_nvmf_subsystem *subsystem,
 		    state == SPDK_NVMF_SUBSYSTEM_DEACTIVATING) {
 			expected_old_state = SPDK_NVMF_SUBSYSTEM_ACTIVATING;
 		}
+		/* This is for the case when resuming the subsystem fails. */
+		if (actual_old_state == SPDK_NVMF_SUBSYSTEM_RESUMING &&
+		    state == SPDK_NVMF_SUBSYSTEM_PAUSING) {
+			expected_old_state = SPDK_NVMF_SUBSYSTEM_RESUMING;
+		}
 		actual_old_state = expected_old_state;
 		__atomic_compare_exchange_n(&subsystem->state, &actual_old_state, state, false,
 					    __ATOMIC_RELAXED, __ATOMIC_RELAXED);
@@ -428,6 +460,8 @@ nvmf_subsystem_set_state(struct spdk_nvmf_subsystem *subsystem,
 struct subsystem_state_change_ctx {
 	struct spdk_nvmf_subsystem *subsystem;
 
+	enum spdk_nvmf_subsystem_state original_state;
+
 	enum spdk_nvmf_subsystem_state requested_state;
 
 	spdk_nvmf_subsystem_state_change_done cb_fn;
@@ -435,9 +469,28 @@ struct subsystem_state_change_ctx {
 };
 
 static void
+subsystem_state_change_revert_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct subsystem_state_change_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	/* Nothing to be done here if the state setting fails, we are just screwed. */
+	if (nvmf_subsystem_set_state(ctx->subsystem, ctx->requested_state)) {
+		SPDK_ERRLOG("Unable to revert the subsystem state after operation failure.\n");
+	}
+
+	ctx->subsystem->changing_state = false;
+	if (ctx->cb_fn) {
+		/* return a failure here. This function only exists in an error path. */
+		ctx->cb_fn(ctx->subsystem, ctx->cb_arg, -1);
+	}
+	free(ctx);
+}
+
+static void
 subsystem_state_change_done(struct spdk_io_channel_iter *i, int status)
 {
 	struct subsystem_state_change_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	enum spdk_nvmf_subsystem_state intermediate_state;
 
 	if (status == 0) {
 		status = nvmf_subsystem_set_state(ctx->subsystem, ctx->requested_state);
@@ -446,6 +499,24 @@ subsystem_state_change_done(struct spdk_io_channel_iter *i, int status)
 		}
 	}
 
+	if (status) {
+		intermediate_state = nvmf_subsystem_get_intermediate_state(ctx->requested_state,
+				     ctx->original_state);
+		assert(intermediate_state != SPDK_NVMF_SUBSYSTEM_NUM_STATES);
+
+		if (nvmf_subsystem_set_state(ctx->subsystem, intermediate_state)) {
+			goto out;
+		}
+		ctx->requested_state = ctx->original_state;
+		spdk_for_each_channel(ctx->subsystem->tgt,
+				      subsystem_state_change_on_pg,
+				      ctx,
+				      subsystem_state_change_revert_done);
+		return;
+	}
+
+out:
+	ctx->subsystem->changing_state = false;
 	if (ctx->cb_fn) {
 		ctx->cb_fn(ctx->subsystem, ctx->cb_arg, status);
 	}
@@ -500,33 +571,33 @@ nvmf_subsystem_state_change(struct spdk_nvmf_subsystem *subsystem,
 	enum spdk_nvmf_subsystem_state intermediate_state;
 	int rc;
 
-	switch (requested_state) {
-	case SPDK_NVMF_SUBSYSTEM_INACTIVE:
-		intermediate_state = SPDK_NVMF_SUBSYSTEM_DEACTIVATING;
-		break;
-	case SPDK_NVMF_SUBSYSTEM_ACTIVE:
-		if (subsystem->state == SPDK_NVMF_SUBSYSTEM_PAUSED) {
-			intermediate_state = SPDK_NVMF_SUBSYSTEM_RESUMING;
-		} else {
-			intermediate_state = SPDK_NVMF_SUBSYSTEM_ACTIVATING;
-		}
-		break;
-	case SPDK_NVMF_SUBSYSTEM_PAUSED:
-		intermediate_state = SPDK_NVMF_SUBSYSTEM_PAUSING;
-		break;
-	default:
-		assert(false);
-		return -EINVAL;
+	if (__sync_val_compare_and_swap(&subsystem->changing_state, false, true)) {
+		return -EBUSY;
 	}
+
+	/* If we are already in the requested state, just call the callback immediately. */
+	if (subsystem->state == requested_state) {
+		subsystem->changing_state = false;
+		if (cb_fn) {
+			cb_fn(subsystem, cb_arg, 0);
+		}
+		return 0;
+	}
+
+	intermediate_state = nvmf_subsystem_get_intermediate_state(subsystem->state, requested_state);
+	assert(intermediate_state != SPDK_NVMF_SUBSYSTEM_NUM_STATES);
 
 	ctx = calloc(1, sizeof(*ctx));
 	if (!ctx) {
+		subsystem->changing_state = false;
 		return -ENOMEM;
 	}
 
+	ctx->original_state = subsystem->state;
 	rc = nvmf_subsystem_set_state(subsystem, intermediate_state);
 	if (rc) {
 		free(ctx);
+		subsystem->changing_state = false;
 		return rc;
 	}
 
@@ -777,6 +848,7 @@ spdk_nvmf_subsystem_add_listener(struct spdk_nvmf_subsystem *subsystem,
 	struct spdk_nvmf_transport *transport;
 	struct spdk_nvmf_subsystem_listener *listener;
 	struct spdk_nvmf_listener *tr_listener;
+	int rc = 0;
 
 	assert(cb_fn != NULL);
 
@@ -817,14 +889,13 @@ spdk_nvmf_subsystem_add_listener(struct spdk_nvmf_subsystem *subsystem,
 	listener->cb_fn = cb_fn;
 	listener->cb_arg = cb_arg;
 	listener->subsystem = subsystem;
+	listener->ana_state = SPDK_NVME_ANA_OPTIMIZED_STATE;
 
 	if (transport->ops->listen_associate != NULL) {
-		transport->ops->listen_associate(transport, subsystem, trid,
-						 _nvmf_subsystem_add_listener_done,
-						 listener);
-	} else {
-		_nvmf_subsystem_add_listener_done(listener, 0);
+		rc = transport->ops->listen_associate(transport, subsystem, trid);
 	}
+
+	_nvmf_subsystem_add_listener_done(listener, rc);
 }
 
 int
@@ -1006,51 +1077,118 @@ spdk_nvmf_subsystem_remove_ns(struct spdk_nvmf_subsystem *subsystem, uint32_t ns
 	return 0;
 }
 
+struct subsystem_ns_change_ctx {
+	struct spdk_nvmf_subsystem		*subsystem;
+	spdk_nvmf_subsystem_state_change_done	cb_fn;
+	uint32_t				nsid;
+};
+
 static void
 _nvmf_ns_hot_remove(struct spdk_nvmf_subsystem *subsystem,
 		    void *cb_arg, int status)
 {
-	struct spdk_nvmf_ns *ns = cb_arg;
+	struct subsystem_ns_change_ctx *ctx = cb_arg;
 	int rc;
 
-	rc = spdk_nvmf_subsystem_remove_ns(subsystem, ns->opts.nsid);
+	rc = spdk_nvmf_subsystem_remove_ns(subsystem, ctx->nsid);
 	if (rc != 0) {
 		SPDK_ERRLOG("Failed to make changes to NVME-oF subsystem with id: %u\n", subsystem->id);
 	}
 
 	spdk_nvmf_subsystem_resume(subsystem, NULL, NULL);
+
+	free(ctx);
+}
+
+static void
+nvmf_ns_change_msg(void *ns_ctx)
+{
+	struct subsystem_ns_change_ctx *ctx = ns_ctx;
+	int rc;
+
+	rc = spdk_nvmf_subsystem_pause(ctx->subsystem, ctx->cb_fn, ctx);
+	if (rc) {
+		if (rc == -EBUSY) {
+			/* Try again, this is not a permanent situation. */
+			spdk_thread_send_msg(spdk_get_thread(), nvmf_ns_change_msg, ctx);
+		} else {
+			free(ctx);
+			SPDK_ERRLOG("Unable to pause subsystem to process namespace removal!\n");
+		}
+	}
 }
 
 static void
 nvmf_ns_hot_remove(void *remove_ctx)
 {
 	struct spdk_nvmf_ns *ns = remove_ctx;
+	struct subsystem_ns_change_ctx *ns_ctx;
 	int rc;
 
-	rc = spdk_nvmf_subsystem_pause(ns->subsystem, _nvmf_ns_hot_remove, ns);
+	/* We have to allocate a new context because this op
+	 * is asynchronous and we could lose the ns in the middle.
+	 */
+	ns_ctx = calloc(1, sizeof(struct subsystem_ns_change_ctx));
+	if (!ns_ctx) {
+		SPDK_ERRLOG("Unable to allocate context to process namespace removal!\n");
+		return;
+	}
+
+	ns_ctx->subsystem = ns->subsystem;
+	ns_ctx->nsid = ns->opts.nsid;
+	ns_ctx->cb_fn = _nvmf_ns_hot_remove;
+
+	rc = spdk_nvmf_subsystem_pause(ns->subsystem, _nvmf_ns_hot_remove, ns_ctx);
 	if (rc) {
-		SPDK_ERRLOG("Unable to pause subsystem to process namespace removal!\n");
+		if (rc == -EBUSY) {
+			/* Try again, this is not a permanent situation. */
+			spdk_thread_send_msg(spdk_get_thread(), nvmf_ns_change_msg, ns_ctx);
+		} else {
+			SPDK_ERRLOG("Unable to pause subsystem to process namespace removal!\n");
+			free(ns_ctx);
+		}
 	}
 }
 
 static void
 _nvmf_ns_resize(struct spdk_nvmf_subsystem *subsystem, void *cb_arg, int status)
 {
-	struct spdk_nvmf_ns *ns = cb_arg;
+	struct subsystem_ns_change_ctx *ctx = cb_arg;
 
-	nvmf_subsystem_ns_changed(subsystem, ns->opts.nsid);
+	nvmf_subsystem_ns_changed(subsystem, ctx->nsid);
 	spdk_nvmf_subsystem_resume(subsystem, NULL, NULL);
+
+	free(ctx);
 }
 
 static void
 nvmf_ns_resize(void *event_ctx)
 {
 	struct spdk_nvmf_ns *ns = event_ctx;
+	struct subsystem_ns_change_ctx *ns_ctx;
 	int rc;
 
-	rc = spdk_nvmf_subsystem_pause(ns->subsystem, _nvmf_ns_resize, ns);
+	/* We have to allocate a new context because this op
+	 * is asynchronous and we could lose the ns in the middle.
+	 */
+	ns_ctx = calloc(1, sizeof(struct subsystem_ns_change_ctx));
+	if (!ns_ctx) {
+		SPDK_ERRLOG("Unable to allocate context to process namespace removal!\n");
+		return;
+	}
+
+	ns_ctx->subsystem = ns->subsystem;
+	ns_ctx->nsid = ns->opts.nsid;
+	ns_ctx->cb_fn = _nvmf_ns_resize;
+
+	rc = spdk_nvmf_subsystem_pause(ns->subsystem, _nvmf_ns_resize, ns_ctx);
 	if (rc) {
+		if (rc == -EBUSY) {
+			/* Try again, this is not a permanent situation. */
+			spdk_thread_send_msg(spdk_get_thread(), nvmf_ns_change_msg, ns_ctx);
+		}
 		SPDK_ERRLOG("Unable to pause subsystem to process namespace resize!\n");
+		free(ns_ctx);
 	}
 }
 
@@ -2512,4 +2650,117 @@ nvmf_ns_reservation_request(void *ctx)
 
 update_done:
 	_nvmf_ns_reservation_update_done(ctrlr->subsys, (void *)req, 0);
+}
+
+int
+spdk_nvmf_subsystem_set_ana_reporting(struct spdk_nvmf_subsystem *subsystem,
+				      bool ana_reporting)
+{
+	if (subsystem->state != SPDK_NVMF_SUBSYSTEM_INACTIVE) {
+		return -EAGAIN;
+	}
+
+	subsystem->ana_reporting = ana_reporting;
+
+	return 0;
+}
+
+struct subsystem_listener_update_ctx {
+	struct spdk_nvmf_subsystem_listener *listener;
+
+	spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn;
+	void *cb_arg;
+};
+
+static void
+subsystem_listener_update_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct subsystem_listener_update_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+
+	if (ctx->cb_fn) {
+		ctx->cb_fn(ctx->cb_arg, status);
+	}
+	free(ctx);
+}
+
+static void
+subsystem_listener_update_on_pg(struct spdk_io_channel_iter *i)
+{
+	struct subsystem_listener_update_ctx *ctx = spdk_io_channel_iter_get_ctx(i);
+	struct spdk_nvmf_subsystem_listener *listener;
+	struct spdk_nvmf_poll_group *group;
+	struct spdk_nvmf_ctrlr *ctrlr;
+
+	listener = ctx->listener;
+	group = spdk_io_channel_get_ctx(spdk_io_channel_iter_get_channel(i));
+
+	TAILQ_FOREACH(ctrlr, &listener->subsystem->ctrlrs, link) {
+		if (ctrlr->admin_qpair->group == group && ctrlr->listener == listener) {
+			nvmf_ctrlr_async_event_ana_change_notice(ctrlr);
+		}
+	}
+
+	spdk_for_each_channel_continue(i, 0);
+}
+
+void
+nvmf_subsystem_set_ana_state(struct spdk_nvmf_subsystem *subsystem,
+			     const struct spdk_nvme_transport_id *trid,
+			     enum spdk_nvme_ana_state ana_state,
+			     spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn, void *cb_arg)
+{
+	struct spdk_nvmf_subsystem_listener *listener;
+	struct subsystem_listener_update_ctx *ctx;
+
+	assert(cb_fn != NULL);
+	assert(subsystem->state == SPDK_NVMF_SUBSYSTEM_INACTIVE ||
+	       subsystem->state == SPDK_NVMF_SUBSYSTEM_PAUSED);
+
+	if (!subsystem->ana_reporting) {
+		SPDK_ERRLOG("ANA reporting is disabled\n");
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	/* ANA Change state is not used, ANA Persistent Loss state
+	 * is not supported yet.
+	 */
+	if (!(ana_state == SPDK_NVME_ANA_OPTIMIZED_STATE ||
+	      ana_state == SPDK_NVME_ANA_NON_OPTIMIZED_STATE ||
+	      ana_state == SPDK_NVME_ANA_INACCESSIBLE_STATE)) {
+		SPDK_ERRLOG("ANA state %d is not supported\n", ana_state);
+		cb_fn(cb_arg, -ENOTSUP);
+		return;
+	}
+
+	listener = nvmf_subsystem_find_listener(subsystem, trid);
+	if (!listener) {
+		SPDK_ERRLOG("Unable to find listener.\n");
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	if (listener->ana_state == ana_state) {
+		cb_fn(cb_arg, 0);
+		return;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		SPDK_ERRLOG("Unable to allocate context\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	listener->ana_state = ana_state;
+	listener->ana_state_change_count++;
+
+	ctx->listener = listener;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	spdk_for_each_channel(subsystem->tgt,
+			      subsystem_listener_update_on_pg,
+			      ctx,
+			      subsystem_listener_update_done);
 }

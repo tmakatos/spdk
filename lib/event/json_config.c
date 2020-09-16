@@ -158,6 +158,25 @@ rpc_client_check_timeout(struct load_json_config_ctx *ctx)
 	return 0;
 }
 
+struct json_write_buf {
+	char data[1024];
+	unsigned cur_off;
+};
+
+static int
+json_write_stdout(void *cb_ctx, const void *data, size_t size)
+{
+	struct json_write_buf *buf = cb_ctx;
+	size_t rc;
+
+	rc = snprintf(buf->data + buf->cur_off, sizeof(buf->data) - buf->cur_off,
+		      "%s", (const char *)data);
+	if (rc > 0) {
+		buf->cur_off += rc;
+	}
+	return rc == size ? 0 : -1;
+}
+
 static int
 rpc_client_poller(void *arg)
 {
@@ -179,17 +198,27 @@ rpc_client_poller(void *arg)
 
 	if (rc == 0) {
 		/* No response yet */
-		return -1;
+		return SPDK_POLLER_BUSY;
 	} else if (rc < 0) {
 		app_json_config_load_done(ctx, rc);
-		return -1;
+		return SPDK_POLLER_BUSY;
 	}
 
 	resp = spdk_jsonrpc_client_get_response(ctx->client_conn);
 	assert(resp);
 
 	if (resp->error) {
-		SPDK_ERRLOG("error response: %.*s", (int)resp->error->len, (char *)resp->error->start);
+		struct json_write_buf buf = {};
+		struct spdk_json_write_ctx *w = spdk_json_write_begin(json_write_stdout,
+						&buf, SPDK_JSON_PARSE_FLAG_DECODE_IN_PLACE);
+
+		if (w == NULL) {
+			SPDK_ERRLOG("error response: (?)\n");
+		} else {
+			spdk_json_write_val(w, resp->error);
+			spdk_json_write_end(w);
+			SPDK_ERRLOG("error response: \n%s\n", buf.data);
+		}
 	}
 
 	if (resp->error && ctx->stop_on_error) {
@@ -206,7 +235,7 @@ rpc_client_poller(void *arg)
 	}
 
 
-	return -1;
+	return SPDK_POLLER_BUSY;
 }
 
 static int
@@ -226,9 +255,11 @@ rpc_client_connect_poller(void *_ctx)
 		if (rc) {
 			app_json_config_load_done(ctx, rc);
 		}
+
+		return SPDK_POLLER_IDLE;
 	}
 
-	return -1;
+	return SPDK_POLLER_BUSY;
 }
 
 static int
@@ -322,7 +353,7 @@ app_json_config_load_subsystem_config_entry(void *_ctx)
 	struct spdk_json_write_ctx *w;
 	struct config_entry cfg = {};
 	struct spdk_json_val *params_end;
-	size_t params_len;
+	size_t params_len = 0;
 	int rc;
 
 	if (ctx->config_it == NULL) {
@@ -336,10 +367,7 @@ app_json_config_load_subsystem_config_entry(void *_ctx)
 
 	if (spdk_json_decode_object(ctx->config_it, jsonrpc_cmd_decoders,
 				    SPDK_COUNTOF(jsonrpc_cmd_decoders), &cfg)) {
-		params_end = spdk_json_next(ctx->config_it);
-		assert(params_end != NULL);
-		params_len = params_end->start - ctx->config->start + 1;
-		SPDK_ERRLOG("Failed to decode config entry: %.*s!\n", (int)params_len, (char *)ctx->config_it);
+		SPDK_ERRLOG("Failed to decode config entry\n");
 		app_json_config_load_done(ctx, -EINVAL);
 		goto out;
 	}
@@ -353,14 +381,17 @@ app_json_config_load_subsystem_config_entry(void *_ctx)
 		goto out;
 	}
 
-	/* Get _END by skipping params and going back by one element. */
-	params_end = cfg.params + spdk_json_val_len(cfg.params) - 1;
-
-	/* Need to add one character to include '}' */
-	params_len = params_end->start - cfg.params->start + 1;
-
 	SPDK_DEBUG_APP_CFG("\tmethod: %s\n", cfg.method);
-	SPDK_DEBUG_APP_CFG("\tparams: %.*s\n", (int)params_len, (char *)cfg.params->start);
+
+	if (cfg.params) {
+		/* Get _END by skipping params and going back by one element. */
+		params_end = cfg.params + spdk_json_val_len(cfg.params) - 1;
+
+		/* Need to add one character to include '}' */
+		params_len = params_end->start - cfg.params->start + 1;
+
+		SPDK_DEBUG_APP_CFG("\tparams: %.*s\n", (int)params_len, (char *)cfg.params->start);
+	}
 
 	rpc_request = spdk_jsonrpc_client_create_request();
 	if (!rpc_request) {
@@ -377,10 +408,13 @@ app_json_config_load_subsystem_config_entry(void *_ctx)
 
 	spdk_json_write_named_string(w, "method", cfg.method);
 
-	/* No need to parse "params". Just dump the whole content of "params"
-	 * directly into the request and let the remote side verify it. */
-	spdk_json_write_name(w, "params");
-	spdk_json_write_val_raw(w, cfg.params->start, params_len);
+	if (cfg.params) {
+		/* No need to parse "params". Just dump the whole content of "params"
+		 * directly into the request and let the remote side verify it. */
+		spdk_json_write_name(w, "params");
+		spdk_json_write_val_raw(w, cfg.params->start, params_len);
+	}
+
 	spdk_jsonrpc_end_request(rpc_request, w);
 
 	rc = client_send_request(ctx, rpc_request, app_json_config_load_subsystem_config_entry_next);

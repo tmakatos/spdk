@@ -46,7 +46,7 @@ DEPDIRS-rte_vhost :=
 
 DEPDIRS-ioat := log
 DEPDIRS-idxd := log util
-DEPDIRS-sock := log
+DEPDIRS-sock := log $(JSON_LIBS)
 DEPDIRS-util := log
 DEPDIRS-vmd := log
 
@@ -108,9 +108,12 @@ DEPDIRS-blob_bdev := log thread bdev
 
 # module/blobfs
 DEPDIRS-blobfs_bdev := $(BDEV_DEPS_THREAD) blob_bdev blobfs
+ifeq ($(CONFIG_FUSE),y)
+DEPDIRS-blobfs_bdev += event
+endif
 
 # module/accel
-DEPDIRS-accel_ioat := log ioat conf thread $(JSON_LIBS) accel
+DEPDIRS-accel_ioat := log ioat conf thread $(JSON_LIBS) accel util
 DEPDIRS-accel_idxd := log idxd thread $(JSON_LIBS) accel
 
 # module/env_dpdk
@@ -119,7 +122,6 @@ DEPDIRS-env_dpdk_rpc := log $(JSON_LIBS)
 # module/sock
 DEPDIRS-sock_posix := log sock util
 DEPDIRS-sock_uring := log sock util
-DEPDIRS-sock_vpp := log sock util thread
 
 # module/bdev
 DEPDIRS-bdev_gpt := bdev conf json log thread util
@@ -148,6 +150,7 @@ DEPDIRS-bdev_passthru := $(BDEV_DEPS_CONF_THREAD)
 DEPDIRS-bdev_pmem := $(BDEV_DEPS_CONF_THREAD)
 DEPDIRS-bdev_raid := $(BDEV_DEPS_CONF_THREAD)
 DEPDIRS-bdev_rbd := $(BDEV_DEPS_CONF_THREAD)
+DEPDIRS-bdev_uring := $(BDEV_DEPS_CONF_THREAD)
 DEPDIRS-bdev_virtio := $(BDEV_DEPS_CONF_THREAD) virtio
 
 # module/event
@@ -162,11 +165,12 @@ DEPDIRS-event_accel := accel event
 DEPDIRS-event_net := sock net event
 DEPDIRS-event_vmd := vmd conf $(JSON_LIBS) event log thread
 
-DEPDIRS-event_bdev := bdev event event_accel event_vmd
+DEPDIRS-event_bdev := bdev event event_accel event_vmd event_sock
 
 DEPDIRS-event_nbd := event nbd event_bdev
-DEPDIRS-event_nvmf := $(BDEV_DEPS_CONF_THREAD) event nvme nvmf event_bdev
+DEPDIRS-event_nvmf := $(BDEV_DEPS_CONF_THREAD) event nvme nvmf event_bdev event_sock
 DEPDIRS-event_scsi := event scsi event_bdev
 
-DEPDIRS-event_iscsi := event iscsi event_scsi
+DEPDIRS-event_iscsi := event iscsi event_scsi event_sock
 DEPDIRS-event_vhost := event vhost event_scsi
+DEPDIRS-event_sock := event sock

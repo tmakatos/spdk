@@ -47,6 +47,7 @@
 #include "spdk/util.h"
 #include "spdk/memory.h"
 #include "spdk/env_dpdk.h"
+#include "spdk/log.h"
 
 #ifdef __FreeBSD__
 #define VFIO_ENABLED 0
@@ -87,7 +88,7 @@ static struct vfio_cfg g_vfio = {
 #endif
 
 #if DEBUG
-#define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
+#define DEBUG_PRINT(...) SPDK_ERRLOG(__VA_ARGS__)
 #else
 #define DEBUG_PRINT(...)
 #endif
@@ -703,7 +704,6 @@ spdk_mem_map_translate(const struct spdk_mem_map *map, uint64_t vaddr, uint64_t 
 	return orig_translation;
 }
 
-#if RTE_VERSION >= RTE_VERSION_NUM(18, 05, 0, 0)
 static void
 memory_hotplug_cb(enum rte_mem_event event_type,
 		  const void *addr, size_t len, void *arg)
@@ -751,7 +751,6 @@ memory_iter_cb(const struct rte_memseg_list *msl,
 {
 	return spdk_mem_register(ms->addr, len);
 }
-#endif
 
 int
 mem_map_init(bool legacy_mem)
@@ -768,24 +767,8 @@ mem_map_init(bool legacy_mem)
 	 * Walk all DPDK memory segments and register them
 	 * with the master memory map
 	 */
-#if RTE_VERSION >= RTE_VERSION_NUM(18, 05, 0, 0)
 	rte_mem_event_callback_register("spdk", memory_hotplug_cb, NULL);
 	rte_memseg_contig_walk(memory_iter_cb, NULL);
-#else
-	struct rte_mem_config *mcfg;
-	size_t seg_idx;
-
-	mcfg = rte_eal_get_configuration()->mem_config;
-	for (seg_idx = 0; seg_idx < RTE_MAX_MEMSEG; seg_idx++) {
-		struct rte_memseg *seg = &mcfg->memseg[seg_idx];
-
-		if (seg->addr == NULL) {
-			break;
-		}
-
-		spdk_mem_register(seg->addr, seg->len);
-	}
-#endif
 	return 0;
 }
 
@@ -938,7 +921,6 @@ vtophys_get_paddr_memseg(uint64_t vaddr)
 	uintptr_t paddr;
 	struct rte_memseg *seg;
 
-#if RTE_VERSION >= RTE_VERSION_NUM(18, 05, 0, 0)
 	seg = rte_mem_virt2memseg((void *)(uintptr_t)vaddr, NULL);
 	if (seg != NULL) {
 		paddr = seg->phys_addr;
@@ -948,28 +930,6 @@ vtophys_get_paddr_memseg(uint64_t vaddr)
 		paddr += (vaddr - (uintptr_t)seg->addr);
 		return paddr;
 	}
-#else
-	struct rte_mem_config *mcfg;
-	uint32_t seg_idx;
-
-	mcfg = rte_eal_get_configuration()->mem_config;
-	for (seg_idx = 0; seg_idx < RTE_MAX_MEMSEG; seg_idx++) {
-		seg = &mcfg->memseg[seg_idx];
-		if (seg->addr == NULL) {
-			break;
-		}
-
-		if (vaddr >= (uintptr_t)seg->addr &&
-		    vaddr < ((uintptr_t)seg->addr + seg->len)) {
-			paddr = seg->phys_addr;
-			if (paddr == RTE_BAD_IOVA) {
-				return SPDK_VTOPHYS_ERROR;
-			}
-			paddr += (vaddr - (uintptr_t)seg->addr);
-			return paddr;
-		}
-	}
-#endif
 
 	return SPDK_VTOPHYS_ERROR;
 }

@@ -10,13 +10,12 @@ import json
 import random
 from subprocess import check_call, call, check_output, Popen, PIPE, CalledProcessError
 
-if (len(sys.argv) == 8):
+if (len(sys.argv) == 7):
     target_ip = sys.argv[2]
     initiator_ip = sys.argv[3]
     port = sys.argv[4]
     netmask = sys.argv[5]
     namespace = sys.argv[6]
-    test_type = sys.argv[7]
 
 ns_cmd = 'ip netns exec ' + namespace
 other_ip = '127.0.0.6'
@@ -116,8 +115,6 @@ def verify_iscsi_connection_rpc_methods(rpc_py):
     jsonvalues = json.loads(output)
     verify(jsonvalues[0]['target_node_name'] == rpc_param['target_name'], 1,
            "target node name vaule is {}, expected {}".format(jsonvalues[0]['target_node_name'], rpc_param['target_name']))
-    verify(jsonvalues[0]['id'] == 0, 1,
-           "device id value is {}, expected 0".format(jsonvalues[0]['id']))
     verify(jsonvalues[0]['initiator_addr'] == rpc_param['initiator_ip'], 1,
            "initiator address values is {}, expected {}".format(jsonvalues[0]['initiator_addr'], rpc_param['initiator_ip']))
     verify(jsonvalues[0]['target_addr'] == rpc_param['target_ip'], 1,
@@ -457,28 +454,6 @@ def verify_net_interface_add_delete_ip_address(rpc_py):
     print("verify_net_interface_add_delete_ip_address passed.")
 
 
-def verify_add_nvme_bdev_rpc_methods(rpc_py):
-    rpc = spdk_rpc(rpc_py)
-    test_pass = 0
-    output = check_output(["lspci", "-mm", "-nn"])
-    addrs = re.findall(r'^([0-9]{2}:[0-9]{2}.[0-9]) "Non-Volatile memory controller \[0108\]".*-p02', output.decode(), re.MULTILINE)
-    for addr in addrs:
-        ctrlr_address = "-b Nvme{} -t pcie -a 0000:{}".format(addrs.index(addr), addr)
-        rpc.bdev_nvme_attach_controller(ctrlr_address)
-        print("add nvme device passed first time")
-        test_pass = 0
-        try:
-            rpc.bdev_nvme_attach_controller(ctrlr_address)
-        except Exception as e:
-            print("add nvme device passed second time")
-            test_pass = 1
-            pass
-        else:
-            pass
-        verify(test_pass == 1, 1, "add nvme device passed second time")
-    print("verify_add_nvme_bdev_rpc_methods passed.")
-
-
 if __name__ == "__main__":
 
     rpc_py = sys.argv[1]
@@ -486,17 +461,13 @@ if __name__ == "__main__":
     try:
         verify_log_flag_rpc_methods(rpc_py, rpc_param)
         verify_net_get_interfaces(rpc_py)
-        # Add/delete IP will not be supported in VPP.
-        # It has separate vppctl utility for that.
-        if test_type == 'posix':
-            verify_net_interface_add_delete_ip_address(rpc_py)
+        verify_net_interface_add_delete_ip_address(rpc_py)
         create_malloc_bdevs_rpc_methods(rpc_py, rpc_param)
         verify_portal_groups_rpc_methods(rpc_py, rpc_param)
         verify_initiator_groups_rpc_methods(rpc_py, rpc_param)
         verify_target_nodes_rpc_methods(rpc_py, rpc_param)
         verify_scsi_devices_rpc_methods(rpc_py)
         verify_iscsi_connection_rpc_methods(rpc_py)
-        verify_add_nvme_bdev_rpc_methods(rpc_py)
     except RpcException as e:
         print("{}. Exiting with status {}".format(e.message, e.retval))
         raise e

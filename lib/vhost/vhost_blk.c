@@ -44,6 +44,7 @@
 #include "spdk/vhost.h"
 
 #include "vhost_internal.h"
+#include <rte_version.h>
 
 /* Minimal set of features supported by every SPDK VHOST-BLK device */
 #define SPDK_VHOST_BLK_FEATURES_BASE (SPDK_VHOST_FEATURES | \
@@ -688,7 +689,7 @@ vdev_worker(void *arg)
 
 	vhost_session_used_signal(vsession);
 
-	return -1;
+	return SPDK_POLLER_BUSY;
 }
 
 static void
@@ -776,7 +777,7 @@ no_bdev_vdev_worker(void *arg)
 		bvsession->io_channel = NULL;
 	}
 
-	return -1;
+	return SPDK_POLLER_BUSY;
 }
 
 static struct spdk_vhost_blk_session *
@@ -799,6 +800,32 @@ to_blk_dev(struct spdk_vhost_dev *vdev)
 	}
 
 	return SPDK_CONTAINEROF(vdev, struct spdk_vhost_blk_dev, vdev);
+}
+
+static int
+vhost_session_bdev_resize_cb(struct spdk_vhost_dev *vdev,
+			     struct spdk_vhost_session *vsession,
+			     void *ctx)
+{
+#if RTE_VERSION >= RTE_VERSION_NUM(20, 02, 0, 0)
+	SPDK_NOTICELOG("bdev send slave msg to vid(%d)\n", vsession->vid);
+	rte_vhost_slave_config_change(vsession->vid, false);
+#else
+	SPDK_NOTICELOG("bdev does not support resize until DPDK submodule version >= 20.02\n");
+#endif
+
+	return 0;
+}
+
+static void
+blk_resize_cb(void *resize_ctx)
+{
+	struct spdk_vhost_blk_dev *bvdev = resize_ctx;
+
+	spdk_vhost_lock();
+	vhost_dev_foreach_session(&bvdev->vdev, vhost_session_bdev_resize_cb,
+				  NULL, NULL);
+	spdk_vhost_unlock();
 }
 
 static void
@@ -843,6 +870,29 @@ bdev_remove_cb(void *remove_ctx)
 	vhost_dev_foreach_session(&bvdev->vdev, vhost_session_bdev_remove_cb,
 				  vhost_dev_bdev_remove_cpl_cb, NULL);
 	spdk_vhost_unlock();
+}
+
+static void
+bdev_event_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev,
+	      void *event_ctx)
+{
+	SPDK_DEBUGLOG(SPDK_LOG_VHOST_BLK, "Bdev event: type %d, name %s\n",
+		      type,
+		      bdev->name);
+
+	switch (type) {
+	case SPDK_BDEV_EVENT_REMOVE:
+		SPDK_NOTICELOG("bdev name (%s) received event(SPDK_BDEV_EVENT_REMOVE)\n", bdev->name);
+		bdev_remove_cb(event_ctx);
+		break;
+	case SPDK_BDEV_EVENT_RESIZE:
+		SPDK_NOTICELOG("bdev name (%s) received event(SPDK_BDEV_EVENT_RESIZE)\n", bdev->name);
+		blk_resize_cb(event_ctx);
+		break;
+	default:
+		SPDK_NOTICELOG("Unsupported bdev event: type %d\n", type);
+		break;
+	}
 }
 
 static void
@@ -972,11 +1022,11 @@ destroy_session_poller_cb(void *arg)
 	int i;
 
 	if (vsession->task_cnt > 0) {
-		return -1;
+		return SPDK_POLLER_BUSY;
 	}
 
 	if (spdk_vhost_trylock() != 0) {
-		return -1;
+		return SPDK_POLLER_BUSY;
 	}
 
 	for (i = 0; i < vsession->max_queues; i++) {
@@ -997,7 +1047,7 @@ destroy_session_poller_cb(void *arg)
 	vhost_session_stop_done(vsession, 0);
 
 	spdk_vhost_unlock();
-	return -1;
+	return SPDK_POLLER_BUSY;
 }
 
 static int
@@ -1234,7 +1284,7 @@ spdk_vhost_blk_construct(const char *name, const char *cpumask, const char *dev_
 		vdev->virtio_features |= (1ULL << VIRTIO_BLK_F_FLUSH);
 	}
 
-	ret = spdk_bdev_open(bdev, true, bdev_remove_cb, bvdev, &bvdev->bdev_desc);
+	ret = spdk_bdev_open_ext(dev_name, true, bdev_event_cb, bvdev, &bvdev->bdev_desc);
 	if (ret != 0) {
 		SPDK_ERRLOG("%s: could not open bdev '%s', error=%d\n",
 			    name, dev_name, ret);
@@ -1280,14 +1330,14 @@ vhost_blk_destroy(struct spdk_vhost_dev *vdev)
 
 	assert(bvdev != NULL);
 
-	/* if the bdev is removed, don't need call spdk_put_io_channel. */
-	if (bvdev->bdev) {
-		spdk_put_io_channel(bvdev->dummy_io_channel);
-	}
-
 	rc = vhost_dev_unregister(&bvdev->vdev);
 	if (rc != 0) {
 		return rc;
+	}
+
+	/* if the bdev is removed, don't need call spdk_put_io_channel. */
+	if (bvdev->bdev) {
+		spdk_put_io_channel(bvdev->dummy_io_channel);
 	}
 
 	if (bvdev->bdev_desc) {

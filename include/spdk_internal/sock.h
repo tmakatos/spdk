@@ -49,6 +49,8 @@ extern "C" {
 #define MAX_EVENTS_PER_POLL 32
 #define DEFAULT_SOCK_PRIORITY 0
 #define MIN_SOCK_PIPE_SIZE 1024
+#define MIN_SO_RCVBUF_SIZE (2 * 1024 * 1024)
+#define MIN_SO_SNDBUF_SIZE (2 * 1024 * 1024)
 
 struct spdk_sock {
 	struct spdk_net_impl		*net_impl;
@@ -63,6 +65,7 @@ struct spdk_sock {
 	TAILQ_HEAD(, spdk_sock_request)	queued_reqs;
 	TAILQ_HEAD(, spdk_sock_request)	pending_reqs;
 	int				queued_iovcnt;
+	int				placement_id;
 
 	struct {
 		uint8_t		closed		: 1;

@@ -41,7 +41,7 @@ CXXFLAGS +=  -I$(SPDK_DIR)/include -Iinclude/
 
 # The SPDK makefiles turn this on, but RocksDB won't compile with it.  So
 #  turn it off after including the SPDK makefiles.
-CXXFLAGS += -Wno-missing-declarations
+CXXFLAGS += -Wno-missing-declarations -Wno-maybe-uninitialized
 
 # The SPDK Makefiles may turn these options on but we do not want to enable
 #  them for the RocksDB source files.
@@ -54,8 +54,9 @@ CXXFLAGS += -fno-sanitize=address
 endif
 
 SPDK_LIB_LIST = $(ALL_MODULES_LIST)
-SPDK_LIB_LIST += event_bdev event_accel event_vmd
+SPDK_LIB_LIST += $(EVENT_BDEV_SUBSYSTEM)
 SPDK_LIB_LIST += bdev accel event util conf trace log jsonrpc json rpc sock thread notify
+SPDK_LIB_LIST += bdev_rpc blobfs_bdev
 
 AM_LINK += $(SPDK_LIB_LINKER_ARGS) $(ENV_LINKER_ARGS)
 AM_LINK += $(SYS_LIBS)

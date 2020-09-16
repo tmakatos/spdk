@@ -4,7 +4,7 @@
 pacman -Sy --needed --noconfirm gcc make cunit libaio openssl \
 	libutil-linux libiscsi python ncurses ninja meson
 # Additional dependencies for SPDK CLI
-pacman -Sy --needed --noconfirm python-pexpect python-pip
+pacman -Sy --needed --noconfirm python-pexpect python-pip libffi
 pip install configshell_fb
 # Additional dependencies for DPDK
 pacman -Sy --needed --noconfirm numactl nasm
@@ -32,7 +32,6 @@ if [[ $INSTALL_DEV_TOOLS == "true" ]]; then
 		makepkg -si --needed --noconfirm;
 		cd .. && rm -rf lcov-git;
 		popd"
-	install_shfmt
 fi
 if [[ $INSTALL_PMEM == "true" ]]; then
 	# Additional dependencies for building pmem based backends

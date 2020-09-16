@@ -47,7 +47,7 @@
 #include "iscsi/init_grp.h"
 #include "iscsi/task.h"
 
-#define MAX_TMPBUF 1024
+#define MAX_TMPBUF 4096
 #define MAX_MASKBUF 128
 
 static bool
@@ -296,17 +296,66 @@ iscsi_tgt_node_allow_iscsi_name(struct spdk_iscsi_tgt_node *target, const char *
 	return false;
 }
 
-int
-iscsi_send_tgts(struct spdk_iscsi_conn *conn, const char *iiqn,
-		const char *iaddr, const char *tiqn, uint8_t *data, int alloc_len,
-		int data_len)
+static int
+iscsi_send_tgt_portals(struct spdk_iscsi_conn *conn,
+		       struct spdk_iscsi_tgt_node *target,
+		       uint8_t *data, int alloc_len, int total)
 {
 	char buf[MAX_TMPBUF];
-	struct spdk_iscsi_portal_grp	*pg;
-	struct spdk_iscsi_pg_map	*pg_map;
-	struct spdk_iscsi_portal	*p;
-	struct spdk_iscsi_tgt_node	*target;
+	struct spdk_iscsi_portal_grp *pg;
+	struct spdk_iscsi_pg_map *pg_map;
+	struct spdk_iscsi_portal *p;
 	char *host;
+	int len;
+
+	TAILQ_FOREACH(pg_map, &target->pg_map_head, tailq) {
+		pg = pg_map->pg;
+
+		if (pg->is_private) {
+			/* Skip the private portal group. Portals in the private portal group
+			 * will be returned only by temporary login redirection responses.
+			 */
+			continue;
+		}
+
+		TAILQ_FOREACH(p, &pg->head, per_pg_tailq) {
+			if (alloc_len - total < 1) {
+				/* TODO: long text responses support */
+				SPDK_ERRLOG("SPDK doesn't support long text responses now, "
+					    "you can use larger MaxRecvDataSegmentLength"
+					    "value in initiator\n");
+				return alloc_len;
+			}
+			host = p->host;
+			/* wildcard? */
+			if (strcasecmp(host, "[::]") == 0 || strcasecmp(host, "0.0.0.0") == 0) {
+				if (spdk_sock_is_ipv6(conn->sock)) {
+					snprintf(buf, sizeof buf, "[%s]", conn->target_addr);
+					host = buf;
+				} else if (spdk_sock_is_ipv4(conn->sock)) {
+					snprintf(buf, sizeof buf, "%s", conn->target_addr);
+					host = buf;
+				} else {
+					/* skip portal for the family */
+					continue;
+				}
+			}
+			SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "TargetAddress=%s:%s,%d\n",
+				      host, p->port, pg->tag);
+			len = snprintf((char *)data + total, alloc_len - total,
+				       "TargetAddress=%s:%s,%d", host, p->port, pg->tag);
+			total += len + 1;
+		}
+	}
+
+	return total;
+}
+
+int
+iscsi_send_tgts(struct spdk_iscsi_conn *conn, const char *iiqn,
+		const char *tiqn, uint8_t *data, int alloc_len, int data_len)
+{
+	struct spdk_iscsi_tgt_node *target;
 	int total;
 	int len;
 	int rc;
@@ -319,14 +368,9 @@ iscsi_send_tgts(struct spdk_iscsi_conn *conn, const char *iiqn,
 	if (alloc_len < 1) {
 		return 0;
 	}
-	if (total > alloc_len) {
+	if (total >= alloc_len) {
 		total = alloc_len;
 		data[total - 1] = '\0';
-		return total;
-	}
-
-	if (alloc_len - total < 1) {
-		SPDK_ERRLOG("data space small %d\n", alloc_len);
 		return total;
 	}
 
@@ -341,46 +385,13 @@ iscsi_send_tgts(struct spdk_iscsi_conn *conn, const char *iiqn,
 			continue;
 		}
 
-		/* DO SENDTARGETS */
-		len = snprintf((char *) data + total, alloc_len - total,
-			       "TargetName=%s", target->name);
+		len = snprintf((char *)data + total, alloc_len - total, "TargetName=%s",
+			       target->name);
 		total += len + 1;
 
-		/* write to data */
-		TAILQ_FOREACH(pg_map, &target->pg_map_head, tailq) {
-			pg = pg_map->pg;
-			TAILQ_FOREACH(p, &pg->head, per_pg_tailq) {
-				if (alloc_len - total < 1) {
-					pthread_mutex_unlock(&g_iscsi.mutex);
-					SPDK_ERRLOG("data space small %d\n", alloc_len);
-					return total;
-				}
-				host = p->host;
-				/* wildcard? */
-				if (strcasecmp(host, "[::]") == 0
-				    || strcasecmp(host, "0.0.0.0") == 0) {
-					if (spdk_sock_is_ipv6(conn->sock)) {
-						snprintf(buf, sizeof buf, "[%s]",
-							 conn->target_addr);
-						host = buf;
-					} else if (spdk_sock_is_ipv4(conn->sock)) {
-						snprintf(buf, sizeof buf, "%s",
-							 conn->target_addr);
-						host = buf;
-					} else {
-						/* skip portal for the family */
-						continue;
-					}
-				}
-				SPDK_DEBUGLOG(SPDK_LOG_ISCSI,
-					      "TargetAddress=%s:%s,%d\n",
-					      host, p->port, pg->tag);
-				len = snprintf((char *) data + total,
-					       alloc_len - total,
-					       "TargetAddress=%s:%s,%d",
-					       host, p->port, pg->tag);
-				total += len + 1;
-			}
+		total = iscsi_send_tgt_portals(conn, target, data, alloc_len, total);
+		if (alloc_len - total < 1) {
+			break;
 		}
 	}
 	pthread_mutex_unlock(&g_iscsi.mutex);
@@ -401,7 +412,6 @@ iscsi_find_tgt_node(const char *target_name)
 			return target;
 		}
 	}
-	SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "can't find target %s\n", target_name);
 	return NULL;
 }
 
@@ -542,7 +552,7 @@ iscsi_tgt_node_add_pg_map(struct spdk_iscsi_tgt_node *target,
 		return NULL;
 	}
 
-	pg_map = malloc(sizeof(*pg_map));
+	pg_map = calloc(1, sizeof(*pg_map));
 	if (pg_map == NULL) {
 		return NULL;
 	}
@@ -656,14 +666,14 @@ iscsi_tgt_node_check_active_conns(void *arg)
 	struct spdk_iscsi_tgt_node *target = arg;
 
 	if (iscsi_get_active_conns(target) != 0) {
-		return 1;
+		return SPDK_POLLER_BUSY;
 	}
 
 	spdk_poller_unregister(&target->destruct_poller);
 
 	spdk_scsi_dev_destruct(target->dev, _iscsi_tgt_node_destruct, target);
 
-	return 1;
+	return SPDK_POLLER_BUSY;
 }
 
 static void
@@ -689,7 +699,7 @@ iscsi_tgt_node_destruct(struct spdk_iscsi_tgt_node *target,
 	target->destruct_cb_fn = cb_fn;
 	target->destruct_cb_arg = cb_arg;
 
-	iscsi_conns_request_logout(target);
+	iscsi_conns_request_logout(target, -1);
 
 	if (iscsi_get_active_conns(target) != 0) {
 		target->destruct_poller = SPDK_POLLER_REGISTER(iscsi_tgt_node_check_active_conns,
@@ -844,6 +854,83 @@ invalid:
 	}
 	pthread_mutex_unlock(&g_iscsi.mutex);
 	return -1;
+}
+
+int
+iscsi_tgt_node_redirect(struct spdk_iscsi_tgt_node *target, int pg_tag,
+			const char *host, const char *port)
+{
+	struct spdk_iscsi_portal_grp *pg;
+	struct spdk_iscsi_pg_map *pg_map;
+	struct sockaddr_storage sa;
+
+	if (target == NULL) {
+		return -EINVAL;
+	}
+
+	pg = iscsi_portal_grp_find_by_tag(pg_tag);
+	if (pg == NULL) {
+		SPDK_ERRLOG("Portal group %d is not found.\n", pg_tag);
+		return -EINVAL;
+	}
+
+	if (pg->is_private) {
+		SPDK_ERRLOG("Portal group %d is not public portal group.\n", pg_tag);
+		return -EINVAL;
+	}
+
+	pg_map = iscsi_tgt_node_find_pg_map(target, pg);
+	if (pg_map == NULL) {
+		SPDK_ERRLOG("Portal group %d is not mapped.\n", pg_tag);
+		return -EINVAL;
+	}
+
+	if (host == NULL && port == NULL) {
+		/* Clear redirect setting. */
+		memset(pg_map->redirect_host, 0, MAX_PORTAL_ADDR + 1);
+		memset(pg_map->redirect_port, 0, MAX_PORTAL_PORT + 1);
+	} else {
+		if (iscsi_parse_redirect_addr(&sa, host, port) != 0) {
+			SPDK_ERRLOG("IP address-port pair is not valid.\n");
+			return -EINVAL;
+		}
+
+		if (iscsi_portal_grp_find_portal_by_addr(pg, port, host) != NULL) {
+			SPDK_ERRLOG("IP address-port pair must be chosen from a "
+				    "different private portal group\n");
+			return -EINVAL;
+		}
+
+		snprintf(pg_map->redirect_host, MAX_PORTAL_ADDR + 1, "%s", host);
+		snprintf(pg_map->redirect_port, MAX_PORTAL_PORT + 1, "%s", port);
+	}
+
+	return 0;
+}
+
+bool
+iscsi_tgt_node_is_redirected(struct spdk_iscsi_conn *conn,
+			     struct spdk_iscsi_tgt_node *target,
+			     char *buf, int buf_len)
+{
+	struct spdk_iscsi_pg_map *pg_map;
+
+	if (conn == NULL || target == NULL || buf == NULL || buf_len == 0) {
+		return false;
+	}
+
+	pg_map = iscsi_tgt_node_find_pg_map(target, conn->portal->group);
+	if (pg_map == NULL) {
+		return false;
+	}
+
+	if (pg_map->redirect_host[0] == '\0' || pg_map->redirect_port[0] == '\0') {
+		return false;
+	}
+
+	snprintf(buf, buf_len, "%s:%s", pg_map->redirect_host, pg_map->redirect_port);
+
+	return true;
 }
 
 static int

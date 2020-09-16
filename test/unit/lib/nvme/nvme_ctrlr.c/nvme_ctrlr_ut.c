@@ -318,7 +318,7 @@ nvme_wait_for_completion(struct spdk_nvme_qpair *qpair,
 int
 nvme_wait_for_completion_timeout(struct spdk_nvme_qpair *qpair,
 				 struct nvme_completion_poll_status *status,
-				 uint64_t timeout_in_secs)
+				 uint64_t timeout_in_usecs)
 {
 	return nvme_wait_for_completion_robust_lock(qpair, status, NULL);
 }
@@ -1516,6 +1516,7 @@ test_nvme_ctrlr_construct_intel_support_log_page_list(void)
 	CU_ASSERT(res == false);
 
 	/* Set the vendor to Intel, but provide no device id */
+	pci_id.class_id = SPDK_PCI_CLASS_NVME;
 	ctrlr.cdata.vid = pci_id.vendor_id = SPDK_PCI_VID_INTEL;
 	payload.temperature_statistics_log_len = 1;
 	ctrlr.quirks = nvme_get_quirks(&pci_id);

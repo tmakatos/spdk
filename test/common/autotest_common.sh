@@ -100,14 +100,12 @@ export SPDK_TEST_LVOL
 export SPDK_TEST_JSON
 : ${SPDK_TEST_REDUCE=0}
 export SPDK_TEST_REDUCE
-: ${SPDK_TEST_VPP=0}
-export SPDK_TEST_VPP
 : ${SPDK_RUN_ASAN=0}
 export SPDK_RUN_ASAN
 : ${SPDK_RUN_UBSAN=0}
 export SPDK_RUN_UBSAN
-: ${SPDK_RUN_INSTALLED_DPDK=0}
-export SPDK_RUN_INSTALLED_DPDK
+: ${SPDK_RUN_EXTERNAL_DPDK=""}
+export SPDK_RUN_EXTERNAL_DPDK
 : ${SPDK_RUN_NON_ROOT=0}
 export SPDK_RUN_NON_ROOT
 : ${SPDK_TEST_CRYPTO=0}
@@ -126,6 +124,11 @@ export SPDK_TEST_OPAL
 export SPDK_AUTOTEST_X
 : ${SPDK_TEST_RAID5=0}
 export SPDK_TEST_RAID5
+: ${SPDK_TEST_URING=0}
+export SPDK_TEST_URING
+
+# Tell setup.sh to wait for block devices upon each reset
+export PCI_BLOCK_SYNC_ON_RESET=yes
 
 # Export PYTHONPATH with addition of RPC framework. New scripts can be created
 # specific use cases for tests.
@@ -188,19 +191,11 @@ fi
 if [ "$(uname -s)" = "Linux" ]; then
 	MAKE="make"
 	MAKEFLAGS=${MAKEFLAGS:--j$(nproc)}
-	DPDK_LINUX_DIR=/usr/share/dpdk/x86_64-default-linuxapp-gcc
-	if [ -d $DPDK_LINUX_DIR ] && [ $SPDK_RUN_INSTALLED_DPDK -eq 1 ]; then
-		WITH_DPDK_DIR=$DPDK_LINUX_DIR
-	fi
 	# Override the default HUGEMEM in scripts/setup.sh to allocate 8GB in hugepages.
 	export HUGEMEM=8192
 elif [ "$(uname -s)" = "FreeBSD" ]; then
 	MAKE="gmake"
 	MAKEFLAGS=${MAKEFLAGS:--j$(sysctl -a | grep -E -i 'hw.ncpu' | awk '{print $2}')}
-	DPDK_FREEBSD_DIR=/usr/local/share/dpdk/x86_64-native-bsdapp-clang
-	if [ -d $DPDK_FREEBSD_DIR ] && [ $SPDK_RUN_INSTALLED_DPDK -eq 1 ]; then
-		WITH_DPDK_DIR=$DPDK_FREEBSD_DIR
-	fi
 	# FreeBSD runs a much more limited set of tests, so keep the default 2GB.
 	export HUGEMEM=2048
 else
@@ -209,12 +204,8 @@ else
 fi
 
 if [ -z "$output_dir" ]; then
-	if [ -z "$rootdir" ] || [ ! -d "$rootdir/../output" ]; then
-		output_dir=.
-	else
-		output_dir=$rootdir/../output
-	fi
-	export output_dir
+	mkdir -p "$rootdir/../output"
+	export output_dir="$rootdir/../output"
 fi
 
 TEST_MODE=
@@ -240,12 +231,6 @@ if [[ -z $RPC_PIPE_PID ]] || ! kill -0 "$RPC_PIPE_PID" &> /dev/null; then
 	# process, this will make rpc.py stop reading and exit gracefully
 fi
 
-if [ $SPDK_TEST_VPP -eq 1 ]; then
-	VPP_PATH="/usr/local/src/vpp-19.04/build-root/install-vpp_debug-native/vpp/"
-	export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${VPP_PATH}/lib/
-	export PATH=${PATH}:${VPP_PATH}/bin/
-fi
-
 function set_test_storage() {
 	[[ -v testdir ]] || return 0
 
@@ -256,8 +241,19 @@ function set_test_storage() {
 	local source fs size avail mount use
 
 	local storage_fallback storage_candidates
+	local storage_fallback_purge
 
-	storage_fallback=/tmp/spdk
+	shopt -s nullglob
+	storage_fallback_purge=("${TMPDIR:-/tmp}/spdk."??????)
+	shopt -u nullglob
+
+	if ((${#storage_fallback_purge[@]} > 0)); then
+		printf '* Purging old temporary test storage (%s)\n' \
+			"${storage_fallback_purge[*]}" >&2
+		sudo rm -rf "${storage_fallback_purge[@]}"
+	fi
+
+	storage_fallback=$(mktemp -udt spdk.XXXXXX)
 	storage_candidates=(
 		"$testdir"
 		"$storage_fallback/tests/${testdir##*/}"
@@ -374,10 +370,6 @@ function get_config_params() {
 		config_params+=' --with-rbd'
 	fi
 
-	if [ $SPDK_TEST_VPP -eq 1 ]; then
-		config_params+=" --with-vpp=${VPP_PATH}"
-	fi
-
 	# for options with no required dependencies, just test flags, set them here
 	if [ $SPDK_TEST_CRYPTO -eq 1 ]; then
 		config_params+=' --with-crypto'
@@ -413,11 +405,13 @@ function get_config_params() {
 		config_params+=' --with-raid5'
 	fi
 
-	# By default, --with-dpdk is not set meaning the SPDK build will use the DPDK submodule.
-	# If a DPDK installation is found in a well-known location though, WITH_DPDK_DIR will be
-	# set which will override the default and use that DPDK installation instead.
-	if [ -n "$WITH_DPDK_DIR" ]; then
-		config_params+=" --with-dpdk=$WITH_DPDK_DIR"
+	# Check whether liburing library header exists
+	if [ -f /usr/include/liburing/io_uring.h ] && [ $SPDK_TEST_URING -eq 1 ]; then
+		config_params+=' --with-uring'
+	fi
+
+	if [ -n "$SPDK_RUN_EXTERNAL_DPDK" ]; then
+		config_params+=" --with-dpdk=$SPDK_RUN_EXTERNAL_DPDK"
 	fi
 
 	echo "$config_params"
@@ -480,11 +474,34 @@ function rpc_cmd_simple_data_json() {
 	((${#jq_out[@]} > 0)) || return 1
 }
 
-# invert error code of any command and also trigger ERR on 0 (unlike bash ! prefix)
 function NOT() {
-	if "$@"; then
-		return 1
+	local es=0
+
+	"$@" || es=$?
+
+	# Logic looks like so:
+	#  - return false if command exit successfully
+	#  - return false if command exit after receiving a core signal (FIXME: or any signal?)
+	#  - return true if command exit with an error
+
+	# This naively assumes that the process doesn't exit with > 128 on its own.
+	if ((es > 128)); then
+		es=$((es & ~128))
+		case "$es" in
+			3) ;&       # SIGQUIT
+			4) ;&       # SIGILL
+			6) ;&       # SIGABRT
+			8) ;&       # SIGFPE
+			9) ;&       # SIGKILL
+			11) es=0 ;; # SIGSEGV
+			*) es=1 ;;
+		esac
+	elif [[ -n $EXIT_STATUS ]] && ((es != EXIT_STATUS)); then
+		es=0
 	fi
+
+	# invert error code of any command and also trigger ERR on 0 (unlike bash ! prefix)
+	((!es == 0))
 }
 
 function timing() {
@@ -581,7 +598,7 @@ function process_core() {
 		mv $core $output_dir
 		chmod a+r $output_dir/$core
 		ret=1
-	done < <(find . -type f \( -name 'core\.?[0-9]*' -o -name '*.core' \) -print0)
+	done < <(find . -type f \( -name 'core.[0-9]*' -o -name 'core' -o -name '*.core' \) -print0)
 	return $ret
 }
 
@@ -809,6 +826,41 @@ function rbd_cleanup() {
 		$rootdir/scripts/ceph/stop.sh || true
 		rm -f /var/tmp/ceph_raw.img
 	fi
+}
+
+function nvme_cli_build() {
+	if [[ -z "${DEPENDENCY_DIR}" ]]; then
+		echo DEPENDENCY_DIR not defined!
+		exit 1
+	fi
+
+	spdk_nvme_cli="${DEPENDENCY_DIR}/nvme-cli"
+
+	if [[ ! -d $spdk_nvme_cli ]]; then
+		echo "nvme-cli repository not found at $spdk_nvme_cli; skipping tests."
+		exit 1
+	fi
+
+	if ! grep -q "DEF_VER=v1.6" $spdk_nvme_cli/NVME-VERSION-GEN; then
+		echo "SPDK supports only \"spdk/nvme-cli\" project on \"spdk-1.6\" branch."
+		exit 1
+	fi
+
+	# Build against the version of SPDK under test
+	pushd $spdk_nvme_cli
+
+	# Remove and recreate git index in case it became corrupted
+	if ! git clean -dfx; then
+		rm -f .git/index
+		git clean -dfx
+		git reset --hard
+	fi
+
+	rm -f "$spdk_nvme_cli/spdk"
+	ln -sf "$rootdir" "$spdk_nvme_cli/spdk"
+
+	make -j$(nproc) LDFLAGS="$(make -s -C $spdk_nvme_cli/spdk ldflags)"
+	popd
 }
 
 function _start_stub() {
@@ -1134,17 +1186,24 @@ function autotest_cleanup() {
 		fi
 	fi
 	rm -rf "$asan_suppression_file"
+	if [[ -n $old_core_pattern ]]; then
+		echo "$old_core_pattern" > /proc/sys/kernel/core_pattern
+	fi
+	if [[ -e /proc/$udevadm_pid/status ]]; then
+		kill "$udevadm_pid" || :
+	fi
+	revert_soft_roce
 }
 
 function freebsd_update_contigmem_mod() {
 	if [ $(uname) = FreeBSD ]; then
 		kldunload contigmem.ko || true
-		if [ -n "$WITH_DPDK_DIR" ]; then
+		if [ -n "$SPDK_RUN_EXTERNAL_DPDK" ]; then
 			echo "Warning: SPDK only works on FreeBSD with patches that only exist in SPDK's dpdk submodule"
-			cp -f "$WITH_DPDK_DIR/kmod/contigmem.ko" /boot/modules/
-			cp -f "$WITH_DPDK_DIR/kmod/contigmem.ko" /boot/kernel/
-			cp -f "$WITH_DPDK_DIR/kmod/nic_uio.ko" /boot/modules/
-			cp -f "$WITH_DPDK_DIR/kmod/nic_uio.ko" /boot/kernel/
+			cp -f "$SPDK_RUN_EXTERNAL_DPDK/kmod/contigmem.ko" /boot/modules/
+			cp -f "$SPDK_RUN_EXTERNAL_DPDK/kmod/contigmem.ko" /boot/kernel/
+			cp -f "$SPDK_RUN_EXTERNAL_DPDK/kmod/nic_uio.ko" /boot/modules/
+			cp -f "$SPDK_RUN_EXTERNAL_DPDK/kmod/nic_uio.ko" /boot/kernel/
 		else
 			cp -f "$rootdir/dpdk/build/kmod/contigmem.ko" /boot/modules/
 			cp -f "$rootdir/dpdk/build/kmod/contigmem.ko" /boot/kernel/
@@ -1184,26 +1243,16 @@ function get_nvme_ctrlr_from_bdf() {
 	printf '%s\n' "$(basename $bdf_sysfs_path)"
 }
 
-function opal_revert_cleanup() {
-	$SPDK_BIN_DIR/spdk_tgt &
-	spdk_tgt_pid=$!
-	waitforlisten $spdk_tgt_pid
-
-	# OPAL test only runs on the first NVMe device
-	# So we just revert the first one here
-	bdf=$($rootdir/scripts/gen_nvme.sh --json | jq -r '.config[].params | select(.name=="Nvme0").traddr')
-	$rootdir/scripts/rpc.py bdev_nvme_attach_controller -b "nvme0" -t "pcie" -a $bdf
-	# Ignore if this fails.
-	$rootdir/scripts/rpc.py bdev_nvme_opal_revert -b nvme0 -p test || true
-
-	killprocess $spdk_tgt_pid
-}
-
 # Get BDF addresses of all NVMe drives currently attached to
 # uio-pci-generic or vfio-pci
 function get_nvme_bdfs() {
 	xtrace_disable
-	jq -r .config[].params.traddr <<< $(scripts/gen_nvme.sh --json)
+	bdfs=$(jq -r .config[].params.traddr <<< $($rootdir/scripts/gen_nvme.sh --json))
+	if [[ -z $bdfs ]]; then
+		echo "No devices to test on!"
+		exit 1
+	fi
+	echo "$bdfs"
 	xtrace_restore
 }
 
@@ -1218,7 +1267,6 @@ function nvme_namespace_revert() {
 	bdfs=$(get_nvme_bdfs)
 
 	$rootdir/scripts/setup.sh reset
-	sleep 1
 
 	for bdf in $bdfs; do
 		nvme_ctrlr=/dev/$(get_nvme_ctrlr_from_bdf ${bdf})
@@ -1232,7 +1280,9 @@ function nvme_namespace_revert() {
 
 		if [[ "$oacs_ns_manage" -ne 0 ]]; then
 			# This assumes every NVMe controller contains single namespace,
-			# encompassing Total NVM Capacity and formatted as 4k block size.
+			# encompassing Total NVM Capacity and formatted as 512 block size.
+			# 512 block size is needed for test/vhost/vhost_boot.sh to
+			# succesfully run.
 
 			unvmcap=$(nvme id-ctrl ${nvme_ctrlr} | grep unvmcap | cut -d: -f2)
 			if [[ "$unvmcap" -eq 0 ]]; then
@@ -1240,7 +1290,7 @@ function nvme_namespace_revert() {
 				continue
 			fi
 			tnvmcap=$(nvme id-ctrl ${nvme_ctrlr} | grep tnvmcap | cut -d: -f2)
-			blksize=4096
+			blksize=512
 
 			size=$((tnvmcap / blksize))
 
@@ -1249,9 +1299,54 @@ function nvme_namespace_revert() {
 			nvme create-ns ${nvme_ctrlr} -s ${size} -c ${size} -b ${blksize}
 			nvme attach-ns ${nvme_ctrlr} -n 1 -c 0
 			nvme reset ${nvme_ctrlr}
-			waitforblk "${nvme_ctrlr}n1"
+			waitforfile "${nvme_ctrlr}n1"
 		fi
 	done
+}
+
+# Get BDFs based on device ID, such as 0x0a54
+function get_nvme_bdfs_by_id() {
+	local bdfs=()
+
+	for bdf in $(get_nvme_bdfs); do
+		device=$(cat /sys/bus/pci/devices/$bdf/device) || true
+		if [[ "$device" == "$1" ]]; then
+			bdfs+=($bdf)
+		fi
+	done
+
+	printf '%s\n' "${bdfs[@]}"
+}
+
+function opal_revert_cleanup() {
+	# The OPAL CI tests is only used for P4510 devices.
+	mapfile -t bdfs < <(get_nvme_bdfs_by_id 0x0a54)
+	if [[ -z ${bdfs[0]} ]]; then
+		return 0
+	fi
+
+	$SPDK_BIN_DIR/spdk_tgt &
+	spdk_tgt_pid=$!
+	waitforlisten $spdk_tgt_pid
+
+	for bdf in "${bdfs[@]}"; do
+		$rootdir/scripts/rpc.py bdev_nvme_attach_controller -b "nvme0" -t "pcie" -a ${bdf}
+		# Ignore if this fails.
+		$rootdir/scripts/rpc.py bdev_nvme_opal_revert -b nvme0 -p test || true
+	done
+
+	killprocess $spdk_tgt_pid
+}
+
+function pap() {
+	while read -r file; do
+		cat <<- FILE
+			--- $file ---
+			$(<"$file")
+			--- $file ---
+		FILE
+		rm -f "$file"
+	done < <(find "$@" -type f | sort -u)
 }
 
 # Define temp storage for all the tests. Look for 2GB at minimum

@@ -17,7 +17,7 @@ source "$rootdir/test/common/autotest_common.sh"
 
 libdir="$rootdir/build/lib"
 libdeps_file="$rootdir/mk/spdk.lib_deps.mk"
-source_abi_dir="$HOME/spdk_20_04/build/lib"
+source_abi_dir="$HOME/spdk_abi_latest/build/lib"
 suppression_file="$HOME/abigail_suppressions.ini"
 
 function confirm_abi_deps() {
@@ -34,250 +34,14 @@ function confirm_abi_deps() {
 	fi
 
 	cat << EOF > ${suppression_file}
-[suppress_variable]
-	name = SPDK_LOG_IDXD
-[suppress_variable]
-	name = SPDK_LOG_IOAT
-[suppress_variable]
-	name = SPDK_LOG_JSON_UTIL
-[suppress_variable]
-	name = SPDK_LOG_RPC
-[suppress_variable]
-	name = SPDK_LOG_RPC_CLIENT
-[suppress_function]
-	name = spdk_jsonrpc_server_handle_request
-[suppress_function]
-	name = spdk_jsonrpc_server_handle_error
-[suppress_function]
-	name = spdk_jsonrpc_server_send_response
-[suppress_function]
-	name = spdk_jsonrpc_parse_request
-[suppress_function]
-	name = spdk_jsonrpc_free_request
-[suppress_function]
-	name = spdk_jsonrpc_parse_response
-[suppress_variable]
-	name = SPDK_LOG_LOG_RPC
-[suppress_variable]
-	name = SPDK_LOG_LOG
-[suppress_variable]
-	name = SPDK_LOG_LVOL
-[suppress_variable]
-	name = SPDK_LOG_NBD
-[suppress_function]
-	name = spdk_nbd_disk_find_by_nbd_path
-[suppress_function]
-	name = spdk_nbd_disk_first
-[suppress_function]
-	name = spdk_nbd_disk_next
-[suppress_function]
-	name = spdk_nbd_disk_get_nbd_path
-[suppress_function]
-	name = spdk_nbd_disk_get_bdev_name
-[suppress_variable]
-	name = SPDK_LOG_NET
-[suppress_function]
-	name = spdk_interface_net_interface_add_ip_address
-[suppress_function]
-	name = spdk_interface_net_interface_delete_ip_address
-[suppress_function]
-	name = spdk_interface_get_list
-[suppress_function]
-	name = spdk_get_uevent
-[suppress_function]
-	name = spdk_uevent_connect
-[suppress_function]
-	name = spdk_nvme_ctrlr_get_current_process
-[suppress_function]
-	name = spdk_nvme_ctrlr_get_process
-[suppress_function]
-	name = spdk_nvme_get_ctrlr_by_trid_unsafe
-[suppress_function]
-	name = spdk_nvme_io_msg_process
-[suppress_function]
-	name = spdk_nvme_wait_for_completion
-[suppress_function]
-	name = spdk_nvme_wait_for_completion_robust_lock
-[suppress_function]
-	name = spdk_nvme_wait_for_completion_timeout
-[suppress_variable]
-	name = SPDK_LOG_NVME
-[suppress_variable]
-	name = SPDK_LOG_OPAL
-[suppress_variable]
-	name = spdk_opal_method
-[suppress_variable]
-	name = spdk_opal_uid
-[suppress_variable]
-	name = SPDK_LOG_REDUCE
-[suppress_variable]
-	name = SPDK_LOG_THREAD
-[suppress_variable]
-	name = SPDK_LOG_TRACE
-[suppress_function]
-	name = spdk_crc32_table_init
-[suppress_function]
-	name = spdk_crc32_update
-[suppress_variable]
-	name = SPDK_LOG_VIRTIO_DEV
-[suppress_variable]
-	name = SPDK_LOG_VIRTIO_PCI
-[suppress_variable]
-	name = SPDK_LOG_VIRTIO_USER
-[suppress_variable]
-	name = SPDK_LOG_VMD
-[suppress_variable]
-	name = SPDK_LOG_ACCEL_IDXD
-[suppress_variable]
-	name = SPDK_LOG_ACCEL_IOAT
-[suppress_variable]
-	name = SPDK_LOG_AIO
-[suppress_variable]
-	name = SPDK_LOG_VBDEV_COMPRESS
-[suppress_variable]
-	name = SPDK_LOG_CRYPTO
-[suppress_variable]
-	name = SPDK_LOG_VBDEV_DELAY
-[suppress_function]
-	name = spdk_vbdev_error_create
-[suppress_function]
-	name = spdk_vbdev_error_delete
-[suppress_function]
-	name = spdk_vbdev_error_inject_error
-[suppress_variable]
-	name = SPDK_LOG_BDEV_FTL
-[suppress_variable]
-	name = SPDK_LOG_GPT_PARSE
-[suppress_variable]
-	name = SPDK_LOG_VBDEV_GPT
-[suppress_function]
-	name = spdk_gpt_parse_mbr
-[suppress_function]
-	name = spdk_gpt_parse_partition_table
-[suppress_variable]
-	name = SPDK_LOG_ISCSI_INIT
-[suppress_variable]
-	name = SPDK_LOG_LVOL_RPC
-[suppress_variable]
-	name = SPDK_LOG_VBDEV_LVOL
-[suppress_variable]
-	name = SPDK_LOG_BDEV_MALLOC
-[suppress_variable]
-	name = SPDK_LOG_BDEV_NULL
-[suppress_variable]
-	name = SPDK_LOG_BDEV_NVME
-[suppress_function]
-	name = spdk_bdev_nvme_create
-[suppress_function]
-	name = spdk_bdev_nvme_delete
-[suppress_function]
-	name = spdk_bdev_nvme_get_ctrlr
-[suppress_function]
-	name = spdk_bdev_nvme_get_io_qpair
-[suppress_function]
-	name = spdk_bdev_nvme_get_opts
-[suppress_function]
-	name = spdk_bdev_nvme_set_hotplug
-[suppress_function]
-	name = spdk_bdev_nvme_set_opts
-[suppress_function]
-	name = spdk_vbdev_opal_create
-[suppress_function]
-	name = spdk_vbdev_opal_destruct
-[suppress_function]
-	name = spdk_vbdev_opal_enable_new_user
-[suppress_function]
-	name = spdk_vbdev_opal_get_info_from_bdev
-[suppress_function]
-	name = spdk_vbdev_opal_set_lock_state
-[suppress_variable]
-	name = SPDK_LOG_BDEV_OCSSD
-[suppress_variable]
-	name = SPDK_LOG_VBDEV_OPAL
-[suppress_variable]
-	name = SPDK_LOG_OCFCTX
-[suppress_variable]
-	name = SPDK_LOG_VBDEV_PASSTHRU
-[suppress_variable]
-	name = SPDK_LOG_BDEV_PMEM
-[suppress_function]
-	name = spdk_create_pmem_disk
-[suppress_function]
-	name = spdk_delete_pmem_disk
-[suppress_variable]
-	name = SPDK_LOG_BDEV_RAID
-[suppress_variable]
-	name = SPDK_LOG_BDEV_RAID0
-[suppress_variable]
-	name = SPDK_LOG_BDEV_RAID5
-[suppress_variable]
-	name = SPDK_LOG_RAID_RPC
-[suppress_variable]
-	name = SPDK_LOG_BDEV_RBD
-[suppress_function]
-	name = spdk_bdev_rbd_create
-[suppress_function]
-	name = spdk_bdev_rbd_delete
-[suppress_function]
-	name = spdk_bdev_rbd_dup_config
-[suppress_function]
-	name = spdk_bdev_rbd_free_config
-[suppress_function]
-	name = spdk_bdev_rbd_resize
-[suppress_variable]
-	name = SPDK_LOG_VBDEV_SPLIT
-[suppress_function]
-	name = spdk_vbdev_split_destruct
-[suppress_function]
-	name = spdk_vbdev_split_get_part_base
-[suppress_variable]
-	name = SPDK_LOG_URING
-[suppress_variable]
-	name = SPDK_LOG_VIRTIO
-[suppress_variable]
-	name = SPDK_LOG_VIRTIO_BLK
-[suppress_variable]
-	name = SPDK_LOG_VBDEV_ZONE_BLOCK
-[suppress_function]
-	name = spdk_vbdev_zone_block_create
-[suppress_function]
-	name = spdk_vbdev_zone_block_delete
-[suppress_variable]
-	name = SPDK_LOG_BLOBFS_BDEV
-[suppress_variable]
-	name = SPDK_LOG_BLOBFS_BDEV_RPC
-[suppress_function]
-	name = spdk_blobfs_fuse_send_request
-[suppress_function]
-	name = spdk_blobfs_fuse_start
-[suppress_function]
-	name = spdk_blobfs_fuse_stop
-[suppress_variable]
-	name = SPDK_LOG_APP_RPC
-[suppress_function]
-	name = spdk_nvmf_parse_conf
-[suppress_variable]
-	name = SPDK_LOG_VHOST
-[suppress_variable]
-	name = SPDK_LOG_VHOST_BLK
-[suppress_variable]
-	name = SPDK_LOG_VHOST_BLK_DATA
-[suppress_variable]
-	name = SPDK_LOG_VHOST_RING
-[suppress_variable]
-	name = SPDK_LOG_VHOST_RPC
-[suppress_variable]
-	name = SPDK_LOG_VHOST_SCSI
-[suppress_variable]
-	name = SPDK_LOG_VHOST_SCSI_DATA
-[suppress_variable]
-	name = SPDK_LOG_VHOST_SCSI_QUEUE
-[suppress_variable]
-	name = spdk_vhost_scsi_device_backend
 [suppress_type]
-	name = spdk_net_impl
+	name = spdk_nvme_ctrlr_data
 [suppress_type]
-	name = spdk_lvol
+	name = spdk_nvme_ns_data
+[suppress_type]
+	name = spdk_nvme_log_page
+[suppress_type]
+	name = spdk_nvme_ctrlr_opts
 EOF
 
 	for object in "$libdir"/libspdk_*.so; do
@@ -286,10 +50,16 @@ EOF
 			echo "No corresponding object for $so_file in canonical directory. Skipping."
 			continue
 		fi
+		if [ "$so_file" == "libspdk_blobfs_bdev.so" ]; then
+			# FIXME: Disable checking for blobfs_bdev.so. Allows updating ABI reference repo
+			# without affecting outstanding patches and requiring immediate rebase.
+			echo "Checking objects for $so_file temporarily disabled. Skipping."
+			continue
+		fi
 
-		if ! output=$(abidiff "$source_abi_dir/$so_file" "$libdir/$so_file" --leaf-changes-only --suppressions $suppression_file --stat); then
+		if ! output=$(abidiff "$source_abi_dir/$so_file" "$libdir/$so_file" --headers-dir1 "$source_abi_dir/../../include/" --headers-dir2 "$rootdir/include" --leaf-changes-only --suppressions $suppression_file --stat); then
 			# remove any filtered out variables.
-			output=${output// [()][^)]*[)]/}
+			output=$(sed "s/ [()][^)]*[)]//g" <<< "$output")
 
 			IFS="." read -r _ _ new_so_maj new_so_min < <(readlink "$libdir/$so_file")
 			IFS="." read -r _ _ old_so_maj old_so_min < <(readlink "$source_abi_dir/$so_file")
@@ -481,12 +251,17 @@ echo "---------------------------------------------------------------------"
 # users can define their own environment abstraction. However we do want to still check it
 # for dependencies to avoid printing out a bunch of confusing symbols under the missing
 # symbols section.
-SPDK_LIBS=$(ls -1 $libdir/libspdk_*.so | grep -v libspdk_env_dpdk.so)
+# FIXME: Disable checking for blobfs_bdev.so. Allows updating ABI reference repo
+# without affecting outstanding patches and requiring immediate rebase.
+SPDK_LIBS=$(ls -1 $libdir/libspdk_*.so | grep -v libspdk_env_dpdk.so | grep -v blobfs_bdev.so)
 DEP_LIBS=$(ls -1 $libdir/libspdk_*.so)
 
 IGNORED_LIBS=()
 if grep -q 'CONFIG_VHOST_INTERNAL_LIB?=n' $rootdir/mk/config.mk; then
 	IGNORED_LIBS+=("rte_vhost")
+fi
+if grep -q 'CONFIG_RDMA?=n' $rootdir/mk/config.mk; then
+	IGNORED_LIBS+=("rdma")
 fi
 
 (

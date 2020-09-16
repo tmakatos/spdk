@@ -56,7 +56,10 @@ struct spdk_scsi_lun {
 	uint8_t reserved;
 };
 
-struct spdk_iscsi_globals g_iscsi;
+struct spdk_iscsi_globals g_iscsi = {
+	.MaxLargeDataInPerConnection = DEFAULT_MAX_LARGE_DATAIN_PER_CONNECTION,
+};
+
 static TAILQ_HEAD(read_tasks_head, spdk_iscsi_task) g_ut_read_tasks =
 	TAILQ_HEAD_INITIALIZER(g_ut_read_tasks);
 static struct spdk_iscsi_task *g_new_task = NULL;
@@ -209,8 +212,22 @@ DEFINE_STUB_V(iscsi_task_mgmt_response,
 
 DEFINE_STUB_V(iscsi_send_nopin, (struct spdk_iscsi_conn *conn));
 
-DEFINE_STUB(iscsi_del_transfer_task, bool,
-	    (struct spdk_iscsi_conn *conn, uint32_t task_tag), true);
+bool
+iscsi_del_transfer_task(struct spdk_iscsi_conn *conn, uint32_t task_tag)
+{
+	struct spdk_iscsi_task *task;
+
+	task = TAILQ_FIRST(&conn->active_r2t_tasks);
+	if (task == NULL || task->tag != task_tag) {
+		return false;
+	}
+
+	TAILQ_REMOVE(&conn->active_r2t_tasks, task, link);
+	task->is_r2t_active = false;
+	iscsi_task_put(task);
+
+	return true;
+}
 
 DEFINE_STUB(iscsi_handle_incoming_pdus, int, (struct spdk_iscsi_conn *conn), 0);
 
@@ -424,6 +441,7 @@ process_non_read_task_completion_test(void)
 	primary.scsi.ref = 1;
 	TAILQ_INSERT_TAIL(&conn.active_r2t_tasks, &primary, link);
 	primary.is_r2t_active = true;
+	primary.tag = 1;
 
 	/* First subtask which failed. */
 	task.scsi.length = 4096;
@@ -555,7 +573,7 @@ free_tasks_on_connection(void)
 	TAILQ_INIT(&conn.write_pdu_list);
 	TAILQ_INIT(&conn.snack_pdu_list);
 	TAILQ_INIT(&conn.queued_datain_tasks);
-	conn.data_in_cnt = MAX_LARGE_DATAIN_PER_CONNECTION;
+	conn.data_in_cnt = g_iscsi.MaxLargeDataInPerConnection;
 
 	pdu1.task = &task1;
 	pdu2.task = &task2;
@@ -709,7 +727,7 @@ abort_queued_datain_task_test(void)
 	TAILQ_INSERT_TAIL(&conn.queued_datain_tasks, &task, link);
 
 	/* No slots for sub read tasks */
-	conn.data_in_cnt = MAX_LARGE_DATAIN_PER_CONNECTION;
+	conn.data_in_cnt = g_iscsi.MaxLargeDataInPerConnection;
 	rc = _iscsi_conn_abort_queued_datain_task(&conn, &task);
 	CU_ASSERT(rc != 0);
 	CU_ASSERT(!TAILQ_EMPTY(&conn.queued_datain_tasks));
@@ -732,7 +750,7 @@ abort_queued_datain_task_test(void)
 	TAILQ_INSERT_TAIL(&conn.queued_datain_tasks, &task, link);
 
 	/* No slots for sub read tasks */
-	conn.data_in_cnt = MAX_LARGE_DATAIN_PER_CONNECTION;
+	conn.data_in_cnt = g_iscsi.MaxLargeDataInPerConnection;
 	rc = _iscsi_conn_abort_queued_datain_task(&conn, &task);
 	CU_ASSERT(rc != 0);
 	CU_ASSERT(!TAILQ_EMPTY(&conn.queued_datain_tasks));

@@ -216,13 +216,14 @@ iscsi_portal_close(struct spdk_iscsi_portal *p)
 static int
 iscsi_parse_portal(const char *portalstring, struct spdk_iscsi_portal **ip)
 {
-	char *host = NULL, *port = NULL;
-	int len, rc = -1;
+	char host[MAX_PORTAL_ADDR + 1] = {};
+	char port[MAX_PORTAL_PORT + 1] = {};
+	int len;
 	const char *p;
 
 	if (portalstring == NULL) {
 		SPDK_ERRLOG("portal error\n");
-		goto error_out;
+		return -EINVAL;
 	}
 
 	/* IP address */
@@ -231,7 +232,7 @@ iscsi_parse_portal(const char *portalstring, struct spdk_iscsi_portal **ip)
 		p = strchr(portalstring + 1, ']');
 		if (p == NULL) {
 			SPDK_ERRLOG("portal error\n");
-			goto error_out;
+			return -EINVAL;
 		}
 		p++;
 	} else {
@@ -243,29 +244,20 @@ iscsi_parse_portal(const char *portalstring, struct spdk_iscsi_portal **ip)
 	}
 
 	len = p - portalstring;
-	host = malloc(len + 1);
-	if (host == NULL) {
-		SPDK_ERRLOG("malloc() failed for host\n");
-		goto error_out;
+	if (len > MAX_PORTAL_ADDR) {
+		return -EINVAL;
 	}
 	memcpy(host, portalstring, len);
 	host[len] = '\0';
 
 	/* Port number (IPv4 and IPv6 are the same) */
 	if (p[0] == '\0') {
-		port = malloc(PORTNUMSTRLEN);
-		if (!port) {
-			SPDK_ERRLOG("malloc() failed for port\n");
-			goto error_out;
-		}
-		snprintf(port, PORTNUMSTRLEN, "%d", DEFAULT_PORT);
+		snprintf(port, MAX_PORTAL_PORT, "%d", DEFAULT_PORT);
 	} else {
 		p++;
 		len = strlen(p);
-		port = malloc(len + 1);
-		if (port == NULL) {
-			SPDK_ERRLOG("malloc() failed for port\n");
-			goto error_out;
+		if (len > MAX_PORTAL_PORT) {
+			return -EINVAL;
 		}
 		memcpy(port, p, len);
 		port[len] = '\0';
@@ -273,19 +265,48 @@ iscsi_parse_portal(const char *portalstring, struct spdk_iscsi_portal **ip)
 
 	*ip = iscsi_portal_create(host, port);
 	if (!*ip) {
-		goto error_out;
+		return -EINVAL;
 	}
 
-	rc = 0;
-error_out:
-	free(host);
-	free(port);
+	return 0;
+}
 
+int
+iscsi_parse_redirect_addr(struct sockaddr_storage *sa,
+			  const char *host, const char *port)
+{
+	struct addrinfo hints, *res;
+	int rc;
+
+	if (host == NULL || port == NULL) {
+		return -EINVAL;
+	}
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = PF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_NUMERICSERV;
+	hints.ai_flags |= AI_NUMERICHOST;
+	rc = getaddrinfo(host, port, &hints, &res);
+	if (rc != 0) {
+		SPDK_ERRLOG("getaddinrfo failed: %s (%d)\n", gai_strerror(rc), rc);
+		return -EINVAL;
+	}
+
+	if (res->ai_addrlen > sizeof(*sa)) {
+		SPDK_ERRLOG("getaddrinfo() ai_addrlen %zu too large\n",
+			    (size_t)res->ai_addrlen);
+		rc = -EINVAL;
+	} else {
+		memcpy(sa, res->ai_addr, res->ai_addrlen);
+	}
+
+	freeaddrinfo(res);
 	return rc;
 }
 
 struct spdk_iscsi_portal_grp *
-iscsi_portal_grp_create(int tag)
+iscsi_portal_grp_create(int tag, bool is_private)
 {
 	struct spdk_iscsi_portal_grp *pg = malloc(sizeof(*pg));
 
@@ -296,6 +317,7 @@ iscsi_portal_grp_create(int tag)
 
 	pg->ref = 0;
 	pg->tag = tag;
+	pg->is_private = is_private;
 
 	pthread_mutex_lock(&g_iscsi.mutex);
 	pg->disable_chap = g_iscsi.disable_chap;
@@ -354,6 +376,21 @@ iscsi_portal_grp_add_portal(struct spdk_iscsi_portal_grp *pg,
 	TAILQ_INSERT_TAIL(&pg->head, p, per_pg_tailq);
 }
 
+struct spdk_iscsi_portal *
+iscsi_portal_grp_find_portal_by_addr(struct spdk_iscsi_portal_grp *pg,
+				     const char *host, const char *port)
+{
+	struct spdk_iscsi_portal *p;
+
+	TAILQ_FOREACH(p, &pg->head, per_pg_tailq) {
+		if (!strcmp(p->host, host) && !strcmp(p->port, port)) {
+			return p;
+		}
+	}
+
+	return NULL;
+}
+
 int
 iscsi_portal_grp_set_chap_params(struct spdk_iscsi_portal_grp *pg,
 				 bool disable_chap, bool require_chap,
@@ -389,7 +426,7 @@ iscsi_parse_portal_grp(struct spdk_conf_section *sp)
 		SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "Comment %s\n", val);
 	}
 
-	pg = iscsi_portal_grp_create(spdk_conf_section_get_num(sp));
+	pg = iscsi_portal_grp_create(spdk_conf_section_get_num(sp), false);
 	if (!pg) {
 		SPDK_ERRLOG("portal group malloc error (%s)\n", spdk_conf_section_get_name(sp));
 		return -1;
@@ -616,6 +653,8 @@ iscsi_portal_grp_info_json(struct spdk_iscsi_portal_grp *pg,
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
+
+	spdk_json_write_named_bool(w, "private", pg->is_private);
 
 	spdk_json_write_object_end(w);
 }

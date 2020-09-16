@@ -70,6 +70,11 @@ void spdk_log_open(logfunc *logf);
  */
 void spdk_log_close(void);
 
+/**
+ * Enable or disable timestamps
+ */
+void spdk_log_enable_timestamps(bool value);
+
 enum spdk_log_level {
 	/** All messages will be suppressed. */
 	SPDK_LOG_DISABLED = -1,
@@ -96,26 +101,6 @@ void spdk_log_set_level(enum spdk_log_level level);
 enum spdk_log_level spdk_log_get_level(void);
 
 /**
- * Set the log level threshold to include stack trace in log messages.
- * Messages with a higher level than this will not contain stack trace. You
- * can use \c SPDK_LOG_DISABLED to completely disable stack trace printing
- * even if it is supported.
- *
- * \note This function has no effect if SPDK is built without stack trace
- *  printing support.
- *
- * \param level Log level threshold for stacktrace.
- */
-void spdk_log_set_backtrace_level(enum spdk_log_level level);
-
-/**
- * Get the current log level threshold for showing stack trace in log message.
- *
- * \return the current log level threshold for stack trace.
- */
-enum spdk_log_level spdk_log_get_backtrace_level(void);
-
-/**
  * Set the current log level threshold for printing to stderr.
  * Messages with a level less than or equal to this level
  * are also printed to stderr. You can use \c SPDK_LOG_DISABLED to completely
@@ -131,6 +116,12 @@ void spdk_log_set_print_level(enum spdk_log_level level);
  * \return the current log level print threshold.
  */
 enum spdk_log_level spdk_log_get_print_level(void);
+
+#ifdef DEBUG
+#define SPDK_DEBUGLOG_FLAG_ENABLED(name) spdk_log_get_flag(name)
+#else
+#define SPDK_DEBUGLOG_FLAG_ENABLED(name) false
+#endif
 
 #define SPDK_NOTICELOG(...) \
 	spdk_log(SPDK_LOG_NOTICE, __FILE__, __LINE__, __func__, __VA_ARGS__)

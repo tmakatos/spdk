@@ -33,10 +33,15 @@ So for example providing 2 IP's with 16 NVMe drives present will result in each 
 
 "spdk" or "kernel" values allowed.
 
-### use_null_block
+### null_block_devices
 
-Use null block device instead of present NVMe drives. Used for latency measurements as described
-in Test Case 3 of performance report.
+Integer. Use null block devices instead of present NVMe drives.
+If set to 1, can be used for latency measurements as described in Test Case 3 of performance report.
+
+### null_block_dif_type
+
+Integer. Enable data protection on created null block device. Defaults to 0 if option
+not present in JSON configuration file. See doc/jsonrpc.md "bdev_null_create" for details.
 
 ### num_cores
 
@@ -51,6 +56,10 @@ by default. Not used if "mode" is set to "spdk".
 ### num_shared_buffers
 
 Number of shared buffers to use when creating transport layer.
+
+### dif_insert_strip
+
+Boolean. If set to true - enable "dif_insert_or_strip" option for TCP transport layer.
 
 ## Initiator
 
@@ -104,7 +113,7 @@ other than -t, -s, -n and -a.
 Fio job parameters.
 
 - bs: block size
-- qd: io depth
+- qd: io depth - Per connected fio filename target
 - rw: workload mode
 - rwmixread: percentage of reads in readwrite workloads
 - run_time: time (in seconds) to run workload
@@ -131,7 +140,7 @@ as a runtime environment parameter.
 When the test completes, you will find a csv file (nvmf_results.csv) containing the results in the target node
 directory /tmp/results.
 
-#Processor Counter Monitor (PCM)
+# Processor Counter Monitor (PCM)
 PCM Tools provides a number of command-line utilities for real-time monitoring.
 Before using PCM Tools in nvmf perf scripts it needs to be installed on Target machine.
 PCM source and instructions are available on https://github.com/opcm/pcm.
@@ -145,3 +154,15 @@ example:
 ```
 Example above will run PCM measure for cpu and memory, with start delay 10s, sample every 1 second,
 and 30 samples for cpu measure. PCM memory do not support sample count.
+
+# Bandwidth monitor (bwm-ng)
+PCM Tools provides a number of command-line utilities for real-time monitoring.
+Before using bwm-ng in nvmf perf scripts it needs to be installed on Target machine.
+To enable bandwidth monitor in perf test you need to add Target setting in config.json file:
+```
+"bandwidth_settings": [bool, sample_count]
+```
+example:
+```
+"bandwidth_settings": [true, 30]
+```

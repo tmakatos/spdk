@@ -113,6 +113,7 @@ struct spdk_app_opts {
 	size_t			num_pci_addr;
 	struct spdk_pci_addr	*pci_blacklist;
 	struct spdk_pci_addr	*pci_whitelist;
+	const char		*iova_mode;
 
 	/* DEPRECATED. No longer has any effect.
 	 *
@@ -139,6 +140,7 @@ struct spdk_app_opts {
 	 */
 	logfunc         *log;
 
+	uint64_t		base_virtaddr;
 };
 
 /**

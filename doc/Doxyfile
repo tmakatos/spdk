@@ -800,8 +800,10 @@ INPUT                  += \
 # All remaining pages are listed here in alphabetical order by filename.
 INPUT                  += \
                          about.md \
+                         accel_fw.md \
                          applications.md \
                          bdev.md \
+                         bdevperf.md \
                          bdev_module.md \
                          bdev_pg.md \
                          blob.md \
@@ -833,6 +835,7 @@ INPUT                  += \
                          peer_2_peer.md \
                          porting.md \
                          spdkcli.md \
+                         spdk_top.md \
                          ssd_internals.md \
                          system_configuration.md \
                          userspace.md \
@@ -840,8 +843,7 @@ INPUT                  += \
                          vhost.md \
                          vhost_processing.md \
                          virtio.md \
-                         vmd.md \
-                         vpp_integration.md
+                         vmd.md
 
 # This tag can be used to specify the character encoding of the source files
 # that doxygen parses. Internally doxygen uses the UTF-8 encoding. Doxygen uses

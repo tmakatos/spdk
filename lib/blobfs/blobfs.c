@@ -554,6 +554,7 @@ static void
 fs_conf_parse(void)
 {
 	struct spdk_conf_section *sp;
+	int cache_buffer_shift;
 
 	sp = spdk_conf_find_section(NULL, "Blobfs");
 	if (sp == NULL) {
@@ -561,9 +562,11 @@ fs_conf_parse(void)
 		return;
 	}
 
-	g_fs_cache_buffer_shift = spdk_conf_section_get_intval(sp, "CacheBufferShift");
-	if (g_fs_cache_buffer_shift <= 0) {
+	cache_buffer_shift = spdk_conf_section_get_intval(sp, "CacheBufferShift");
+	if (cache_buffer_shift <= 0) {
 		g_fs_cache_buffer_shift = CACHE_BUFFER_SHIFT_DEFAULT;
+	} else {
+		g_fs_cache_buffer_shift = cache_buffer_shift;
 	}
 }
 
@@ -664,10 +667,15 @@ file_alloc(struct spdk_filesystem *fs)
 		return NULL;
 	}
 
+	if (pthread_spin_init(&file->lock, 0)) {
+		free(file->tree);
+		free(file);
+		return NULL;
+	}
+
 	file->fs = fs;
 	TAILQ_INIT(&file->open_requests);
 	TAILQ_INIT(&file->sync_requests);
-	pthread_spin_init(&file->lock, 0);
 	TAILQ_INSERT_TAIL(&fs->files, file, tailq);
 	file->priority = SPDK_FILE_PRIORITY_LOW;
 	return file;
@@ -1993,11 +2001,15 @@ spdk_fs_alloc_thread_ctx(struct spdk_filesystem *fs)
 		return NULL;
 	}
 
+	if (pthread_spin_init(&ctx->ch.lock, 0)) {
+		free(ctx);
+		return NULL;
+	}
+
 	fs_channel_create(fs, &ctx->ch, 512);
 
 	ctx->ch.send_request = fs->send_request;
 	ctx->ch.sync = 1;
-	pthread_spin_init(&ctx->ch.lock, 0);
 
 	return ctx;
 }
@@ -2088,7 +2100,7 @@ _blobfs_cache_pool_reclaim(void *arg)
 	int rc;
 
 	if (!blobfs_cache_pool_need_reclaim()) {
-		return 0;
+		return SPDK_POLLER_IDLE;
 	}
 
 	TAILQ_FOREACH_SAFE(file, &g_caches, cache_tailq, tmp) {
@@ -2099,7 +2111,7 @@ _blobfs_cache_pool_reclaim(void *arg)
 				continue;
 			}
 			if (!blobfs_cache_pool_need_reclaim()) {
-				return 1;
+				return SPDK_POLLER_BUSY;
 			}
 			break;
 		}
@@ -2112,7 +2124,7 @@ _blobfs_cache_pool_reclaim(void *arg)
 				continue;
 			}
 			if (!blobfs_cache_pool_need_reclaim()) {
-				return 1;
+				return SPDK_POLLER_BUSY;
 			}
 			break;
 		}
@@ -2126,7 +2138,7 @@ _blobfs_cache_pool_reclaim(void *arg)
 		break;
 	}
 
-	return 1;
+	return SPDK_POLLER_BUSY;
 }
 
 static void

@@ -403,12 +403,52 @@ spdk_bdev_set_opts(struct spdk_bdev_opts *opts)
 	return 0;
 }
 
-/*
- * Will implement the whitelist in the furture
- */
+struct spdk_bdev_examine_item {
+	char *name;
+	TAILQ_ENTRY(spdk_bdev_examine_item) link;
+};
+
+TAILQ_HEAD(spdk_bdev_examine_allowlist, spdk_bdev_examine_item);
+
+struct spdk_bdev_examine_allowlist g_bdev_examine_allowlist = TAILQ_HEAD_INITIALIZER(
+			g_bdev_examine_allowlist);
+
 static inline bool
-bdev_in_examine_whitelist(struct spdk_bdev *bdev)
+bdev_examine_allowlist_check(const char *name)
 {
+	struct spdk_bdev_examine_item *item;
+	TAILQ_FOREACH(item, &g_bdev_examine_allowlist, link) {
+		if (strcmp(name, item->name) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static inline void
+bdev_examine_allowlist_free(void)
+{
+	struct spdk_bdev_examine_item *item;
+	while (!TAILQ_EMPTY(&g_bdev_examine_allowlist)) {
+		item = TAILQ_FIRST(&g_bdev_examine_allowlist);
+		TAILQ_REMOVE(&g_bdev_examine_allowlist, item, link);
+		free(item->name);
+		free(item);
+	}
+}
+
+static inline bool
+bdev_in_examine_allowlist(struct spdk_bdev *bdev)
+{
+	struct spdk_bdev_alias *tmp;
+	if (bdev_examine_allowlist_check(bdev->name)) {
+		return true;
+	}
+	TAILQ_FOREACH(tmp, &bdev->aliases, tailq) {
+		if (bdev_examine_allowlist_check(tmp->alias)) {
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -418,7 +458,89 @@ bdev_ok_to_examine(struct spdk_bdev *bdev)
 	if (g_bdev_opts.bdev_auto_examine) {
 		return true;
 	} else {
-		return bdev_in_examine_whitelist(bdev);
+		return bdev_in_examine_allowlist(bdev);
+	}
+}
+
+static void
+bdev_examine(struct spdk_bdev *bdev)
+{
+	struct spdk_bdev_module *module;
+	uint32_t action;
+
+	TAILQ_FOREACH(module, &g_bdev_mgr.bdev_modules, internal.tailq) {
+		if (module->examine_config && bdev_ok_to_examine(bdev)) {
+			action = module->internal.action_in_progress;
+			module->internal.action_in_progress++;
+			module->examine_config(bdev);
+			if (action != module->internal.action_in_progress) {
+				SPDK_ERRLOG("examine_config for module %s did not call spdk_bdev_module_examine_done()\n",
+					    module->name);
+			}
+		}
+	}
+
+	if (bdev->internal.claim_module && bdev_ok_to_examine(bdev)) {
+		if (bdev->internal.claim_module->examine_disk) {
+			bdev->internal.claim_module->internal.action_in_progress++;
+			bdev->internal.claim_module->examine_disk(bdev);
+		}
+		return;
+	}
+
+	TAILQ_FOREACH(module, &g_bdev_mgr.bdev_modules, internal.tailq) {
+		if (module->examine_disk && bdev_ok_to_examine(bdev)) {
+			module->internal.action_in_progress++;
+			module->examine_disk(bdev);
+		}
+	}
+}
+
+int
+spdk_bdev_examine(const char *name)
+{
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_examine_item *item;
+
+	if (g_bdev_opts.bdev_auto_examine) {
+		SPDK_ERRLOG("Manual examine is not allowed if auto examine is enabled");
+		return -EINVAL;
+	}
+
+	if (bdev_examine_allowlist_check(name)) {
+		SPDK_ERRLOG("Duplicate bdev name for manual examine: %s\n", name);
+		return -EEXIST;
+	}
+
+	item = calloc(1, sizeof(*item));
+	if (!item) {
+		return -ENOMEM;
+	}
+	item->name = strdup(name);
+	if (!item->name) {
+		free(item);
+		return -ENOMEM;
+	}
+	TAILQ_INSERT_TAIL(&g_bdev_examine_allowlist, item, link);
+
+	bdev = spdk_bdev_get_by_name(name);
+	if (bdev) {
+		bdev_examine(bdev);
+	}
+	return 0;
+}
+
+static inline void
+bdev_examine_allowlist_config_json(struct spdk_json_write_ctx *w)
+{
+	struct spdk_bdev_examine_item *item;
+	TAILQ_FOREACH(item, &g_bdev_examine_allowlist, link) {
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_string(w, "method", "bdev_examine");
+		spdk_json_write_named_object_begin(w, "params");
+		spdk_json_write_named_string(w, "name", item->name);
+		spdk_json_write_object_end(w);
+		spdk_json_write_object_end(w);
 	}
 }
 
@@ -922,6 +1044,8 @@ spdk_bdev_subsystem_config_json(struct spdk_json_write_ctx *w)
 	spdk_json_write_object_end(w);
 	spdk_json_write_object_end(w);
 
+	bdev_examine_allowlist_config_json(w);
+
 	TAILQ_FOREACH(bdev_module, &g_bdev_mgr.bdev_modules, internal.tailq) {
 		if (bdev_module->config_json) {
 			bdev_module->config_json(w);
@@ -1266,6 +1390,8 @@ bdev_mgr_unregister_cb(void *io_device)
 	}
 
 	spdk_free(g_bdev_mgr.zero_buffer);
+
+	bdev_examine_allowlist_free();
 
 	cb_fn(g_fini_cb_arg);
 	g_fini_cb_fn = NULL;
@@ -2265,7 +2391,7 @@ bdev_channel_poll_qos(void *arg)
 		 *  timeslice has actually expired.  This should never happen
 		 *  with a well-behaved timer implementation.
 		 */
-		return 0;
+		return SPDK_POLLER_IDLE;
 	}
 
 	/* Reset for next round of rate limiting */
@@ -2457,7 +2583,7 @@ bdev_poll_timeout_io(void *arg)
 	ctx = calloc(1, sizeof(struct poll_timeout_ctx));
 	if (!ctx) {
 		SPDK_ERRLOG("failed to allocate memory\n");
-		return 1;
+		return SPDK_POLLER_BUSY;
 	}
 	ctx->desc = desc;
 	ctx->cb_arg = desc->cb_arg;
@@ -2476,7 +2602,7 @@ bdev_poll_timeout_io(void *arg)
 			      ctx,
 			      bdev_channel_poll_timeout_io_done);
 
-	return 1;
+	return SPDK_POLLER_BUSY;
 }
 
 int
@@ -3114,7 +3240,7 @@ bdev_calculate_measured_queue_depth(void *ctx)
 	bdev->internal.temporary_queue_depth = 0;
 	spdk_for_each_channel(__bdev_to_io_dev(bdev), _calculate_measured_qd, bdev,
 			      _calculate_measured_qd_cpl);
-	return 0;
+	return SPDK_POLLER_BUSY;
 }
 
 void
@@ -3844,6 +3970,7 @@ bdev_comparev_and_writev_blocks_locked(void *ctx, int status)
 	if (status) {
 		bdev_io->internal.status = SPDK_BDEV_IO_STATUS_FIRST_FUSED_FAILED;
 		bdev_io->internal.cb(bdev_io, false, bdev_io->internal.caller_ctx);
+		return;
 	}
 
 	bdev_compare_and_write_do_compare(bdev_io);
@@ -5309,39 +5436,11 @@ bdev_fini(struct spdk_bdev *bdev)
 static void
 bdev_start(struct spdk_bdev *bdev)
 {
-	struct spdk_bdev_module *module;
-	uint32_t action;
-
 	SPDK_DEBUGLOG(SPDK_LOG_BDEV, "Inserting bdev %s into list\n", bdev->name);
 	TAILQ_INSERT_TAIL(&g_bdev_mgr.bdevs, bdev, internal.link);
 
 	/* Examine configuration before initializing I/O */
-	TAILQ_FOREACH(module, &g_bdev_mgr.bdev_modules, internal.tailq) {
-		if (module->examine_config && bdev_ok_to_examine(bdev)) {
-			action = module->internal.action_in_progress;
-			module->internal.action_in_progress++;
-			module->examine_config(bdev);
-			if (action != module->internal.action_in_progress) {
-				SPDK_ERRLOG("examine_config for module %s did not call spdk_bdev_module_examine_done()\n",
-					    module->name);
-			}
-		}
-	}
-
-	if (bdev->internal.claim_module && bdev_ok_to_examine(bdev)) {
-		if (bdev->internal.claim_module->examine_disk) {
-			bdev->internal.claim_module->internal.action_in_progress++;
-			bdev->internal.claim_module->examine_disk(bdev);
-		}
-		return;
-	}
-
-	TAILQ_FOREACH(module, &g_bdev_mgr.bdev_modules, internal.tailq) {
-		if (module->examine_disk && bdev_ok_to_examine(bdev)) {
-			module->internal.action_in_progress++;
-			module->examine_disk(bdev);
-		}
-	}
+	bdev_examine(bdev);
 }
 
 int
@@ -6458,12 +6557,12 @@ bdev_lock_lba_range_check_io(void *_i)
 	TAILQ_FOREACH(bdev_io, &ch->io_submitted, internal.ch_link) {
 		if (bdev_io_range_is_locked(bdev_io, range)) {
 			ctx->poller = SPDK_POLLER_REGISTER(bdev_lock_lba_range_check_io, i, 100);
-			return 1;
+			return SPDK_POLLER_BUSY;
 		}
 	}
 
 	spdk_for_each_channel_continue(i, 0);
-	return 1;
+	return SPDK_POLLER_BUSY;
 }
 
 static void

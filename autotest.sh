@@ -13,12 +13,18 @@ source "$1"
 source "$rootdir/test/common/autotest_common.sh"
 source "$rootdir/test/nvmf/common.sh"
 
+# always test with SPDK shared objects.
+export SPDK_LIB_DIR="$rootdir/build/lib"
+export DPDK_LIB_DIR="$rootdir/dpdk/build/lib"
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$SPDK_LIB_DIR:$DPDK_LIB_DIR
+
 if [ $EUID -ne 0 ]; then
 	echo "$0 must be run as root"
 	exit 1
 fi
 
 if [ $(uname -s) = Linux ]; then
+	old_core_pattern=$(< /proc/sys/kernel/core_pattern)
 	# set core_pattern to a known value to avoid ABRT, systemd-coredump, etc.
 	echo "core" > /proc/sys/kernel/core_pattern
 
@@ -30,6 +36,11 @@ if [ $(uname -s) = Linux ]; then
 	# make sure nbd (network block device) driver is loaded if it is available
 	# this ensures that when tests need to use nbd, it will be fully initialized
 	modprobe nbd || true
+
+	if udevadm=$(type -P udevadm); then
+		"$udevadm" monitor --property &> "$output_dir/udev.log" &
+		udevadm_pid=$!
+	fi
 fi
 
 trap "process_core; autotest_cleanup; exit 1" SIGINT SIGTERM EXIT
@@ -71,9 +82,6 @@ rm -f /var/tmp/spdk*.sock
 
 # Load the kernel driver
 ./scripts/setup.sh reset
-
-# Let the kernel discover any filesystems or partitions
-sleep 10
 
 if [ $(uname -s) = Linux ]; then
 	# OCSSD devices drivers don't support IO issues by kernel so
@@ -143,8 +151,7 @@ fi
 
 # Revert existing OPAL to factory settings that may have been left from earlier failed tests.
 # This ensures we won't hit any unexpected failures due to NVMe SSDs being locked.
-# Disable this for now as we don't have opal test running
-# opal_revert_cleanup
+opal_revert_cleanup
 
 #####################
 # Unit Tests
@@ -152,12 +159,12 @@ fi
 
 if [ $SPDK_TEST_UNITTEST -eq 1 ]; then
 	run_test "unittest" ./test/unit/unittest.sh
+	run_test "env" test/env/env.sh
 fi
 
 if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 	timing_enter lib
 
-	run_test "env" test/env/env.sh
 	run_test "rpc" test/rpc/rpc.sh
 	run_test "rpc_client" test/rpc_client/rpc_client.sh
 	run_test "json_config" ./test/json_config/json_config.sh
@@ -169,6 +176,10 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 	if [ $SPDK_TEST_BLOCKDEV -eq 1 ]; then
 		run_test "blockdev_general" test/bdev/blockdev.sh
 		run_test "bdev_raid" test/bdev/bdev_raid.sh
+		run_test "bdevperf_config" test/bdev/bdevperf/test_config.sh
+		if [[ $(uname -s) == Linux ]]; then
+			run_test "spdk_dd" test/dd/dd.sh
+		fi
 	fi
 
 	if [ $SPDK_TEST_JSON -eq 1 ]; then
@@ -201,15 +212,11 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 	timing_exit lib
 
 	if [ $SPDK_TEST_ISCSI -eq 1 ]; then
-		run_test "iscsi_tgt_posix" ./test/iscsi_tgt/iscsi_tgt.sh posix
+		run_test "iscsi_tgt" ./test/iscsi_tgt/iscsi_tgt.sh
 		run_test "spdkcli_iscsi" ./test/spdkcli/iscsi.sh
 
 		# Run raid spdkcli test under iSCSI since blockdev tests run on systems that can't run spdkcli yet
 		run_test "spdkcli_raid" test/spdkcli/raid.sh
-	fi
-
-	if [ $SPDK_TEST_VPP -eq 1 ]; then
-		run_test "iscsi_tgt_vpp" ./test/iscsi_tgt/iscsi_tgt.sh vpp
 	fi
 
 	if [ $SPDK_TEST_BLOBFS -eq 1 ]; then
@@ -217,7 +224,7 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 		run_test "blobstore" ./test/blobstore/blobstore.sh
 		run_test "blobfs" ./test/blobfs/blobfs.sh
 		run_test "hello_blob" $SPDK_EXAMPLE_DIR/hello_blob \
-			examples/blob/hello_world/hello_blob.conf
+			examples/blob/hello_world/hello_blob.json
 	fi
 
 	if [ $SPDK_TEST_NVMF -eq 1 ]; then

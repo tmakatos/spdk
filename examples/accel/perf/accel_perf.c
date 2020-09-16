@@ -39,6 +39,7 @@
 #include "spdk/string.h"
 #include "spdk/accel_engine.h"
 #include "spdk/crc32.h"
+#include "spdk/util.h"
 
 #define DATA_PATTERN 0x5a
 #define ALIGN_4K 0x1000
@@ -58,6 +59,8 @@ static enum accel_capability g_workload_selection;
 static struct worker_thread *g_workers = NULL;
 static int g_num_workers = 0;
 static pthread_mutex_t g_workers_lock = PTHREAD_MUTEX_INITIALIZER;
+uint64_t g_capabilites;
+struct ap_task;
 
 struct worker_thread {
 	struct spdk_io_channel		*ch;
@@ -65,7 +68,7 @@ struct worker_thread {
 	uint64_t			xfer_failed;
 	uint64_t			injected_miscompares;
 	uint64_t			current_queue_depth;
-	struct spdk_mempool		*task_pool;
+	TAILQ_HEAD(, ap_task)		tasks;
 	struct worker_thread		*next;
 	unsigned			core;
 	struct spdk_thread		*thread;
@@ -81,19 +84,8 @@ struct ap_task {
 	struct worker_thread	*worker;
 	int			status;
 	int			expected_status; /* used for compare */
+	TAILQ_ENTRY(ap_task)	link;
 };
-
-inline static struct ap_task *
-__ap_task_from_accel_task(struct spdk_accel_task *at)
-{
-	return (struct ap_task *)((uintptr_t)at - sizeof(struct ap_task));
-}
-
-inline static struct spdk_accel_task *
-__accel_task_from_ap_task(struct ap_task *ap)
-{
-	return (struct spdk_accel_task *)((uintptr_t)ap + sizeof(struct ap_task));
-}
 
 static void
 dump_user_config(struct spdk_app_opts *opts)
@@ -181,8 +173,13 @@ static void
 unregister_worker(void *arg1)
 {
 	struct worker_thread *worker = arg1;
+	struct ap_task *task;
 
-	spdk_mempool_free(worker->task_pool);
+	while (!TAILQ_EMPTY(&worker->tasks)) {
+		task = TAILQ_FIRST(&worker->tasks);
+		TAILQ_REMOVE(&worker->tasks, task, link);
+		free(task);
+	}
 	spdk_put_io_channel(worker->ch);
 	pthread_mutex_lock(&g_workers_lock);
 	assert(g_num_workers >= 1);
@@ -209,20 +206,18 @@ _submit_single(void *arg1, void *arg2)
 	task->worker->current_queue_depth++;
 	switch (g_workload_selection) {
 	case ACCEL_COPY:
-		rc = spdk_accel_submit_copy(__accel_task_from_ap_task(task),
-					    worker->ch, task->dst,
-					    task->src, g_xfer_size_bytes, accel_done);
+		rc = spdk_accel_submit_copy(worker->ch, task->dst, task->src,
+					    g_xfer_size_bytes, accel_done, task);
 		break;
 	case ACCEL_FILL:
 		/* For fill use the first byte of the task->dst buffer */
-		rc = spdk_accel_submit_fill(__accel_task_from_ap_task(task),
-					    worker->ch, task->dst, *(uint8_t *)task->src,
-					    g_xfer_size_bytes, accel_done);
+		rc = spdk_accel_submit_fill(worker->ch, task->dst, *(uint8_t *)task->src,
+					    g_xfer_size_bytes, accel_done, task);
 		break;
 	case ACCEL_CRC32C:
-		rc = spdk_accel_submit_crc32c(__accel_task_from_ap_task(task),
-					      worker->ch, (uint32_t *)task->dst, task->src, g_crc32c_seed,
-					      g_xfer_size_bytes, accel_done);
+		rc = spdk_accel_submit_crc32c(worker->ch, (uint32_t *)task->dst,
+					      task->src, g_crc32c_seed,
+					      g_xfer_size_bytes, accel_done, task);
 		break;
 	case ACCEL_COMPARE:
 		random_num = rand() % 100;
@@ -233,14 +228,12 @@ _submit_single(void *arg1, void *arg2)
 			task->expected_status = 0;
 			*(uint8_t *)task->dst = DATA_PATTERN;
 		}
-		rc = spdk_accel_submit_compare(__accel_task_from_ap_task(task),
-					       worker->ch, task->dst, task->src,
-					       g_xfer_size_bytes, accel_done);
+		rc = spdk_accel_submit_compare(worker->ch, task->dst, task->src,
+					       g_xfer_size_bytes, accel_done, task);
 		break;
 	case ACCEL_DUALCAST:
-		rc = spdk_accel_submit_dualcast(__accel_task_from_ap_task(task),
-						worker->ch, task->dst, task->dst2,
-						task->src, g_xfer_size_bytes, accel_done);
+		rc = spdk_accel_submit_dualcast(worker->ch, task->dst, task->dst2,
+						task->src, g_xfer_size_bytes, accel_done, task);
 		break;
 	default:
 		assert(false);
@@ -249,7 +242,7 @@ _submit_single(void *arg1, void *arg2)
 	}
 
 	if (rc) {
-		accel_done(__accel_task_from_ap_task(task), rc);
+		accel_done(task, rc);
 	}
 }
 
@@ -289,6 +282,14 @@ _accel_done(void *arg1)
 				worker->xfer_failed++;
 			}
 			break;
+		case ACCEL_FILL:
+			if (memcmp(task->dst, task->src, g_xfer_size_bytes)) {
+				SPDK_NOTICELOG("Data miscompare\n");
+				worker->xfer_failed++;
+			}
+			break;
+		case ACCEL_COMPARE:
+			break;
 		default:
 			assert(false);
 			break;
@@ -314,8 +315,18 @@ _accel_done(void *arg1)
 		if (g_workload_selection == ACCEL_DUALCAST) {
 			spdk_free(task->dst2);
 		}
-		spdk_mempool_put(worker->task_pool, task);
+		TAILQ_INSERT_TAIL(&worker->tasks, task, link);
 	}
+}
+
+static void
+batch_done(void *cb_arg, int status)
+{
+	struct ap_task *task = (struct ap_task *)cb_arg;
+	struct worker_thread *worker = task->worker;
+
+	worker->current_queue_depth--;
+	TAILQ_INSERT_TAIL(&worker->tasks, task, link);
 }
 
 static int
@@ -395,20 +406,10 @@ _init_thread_done(void *ctx)
 {
 }
 
-static void
-_init_thread(void *arg1)
+static int
+_get_task_data_bufs(struct ap_task *task)
 {
-	struct worker_thread *worker;
-	char task_pool_name[30];
-	struct ap_task *task;
-	int i;
 	uint32_t align = 0;
-
-	worker = calloc(1, sizeof(*worker));
-	if (worker == NULL) {
-		fprintf(stderr, "Unable to allocate worker\n");
-		return;
-	}
 
 	/* For dualcast, the DSA HW requires 4K alignment on destination addresses but
 	 * we do this for all engines to keep it simple.
@@ -417,21 +418,111 @@ _init_thread(void *arg1)
 		align = ALIGN_4K;
 	}
 
+	task->src = spdk_dma_zmalloc(g_xfer_size_bytes, 0, NULL);
+	if (task->src == NULL) {
+		fprintf(stderr, "Unable to alloc src buffer\n");
+		return -ENOMEM;
+	}
+	memset(task->src, DATA_PATTERN, g_xfer_size_bytes);
+
+	task->dst = spdk_dma_zmalloc(g_xfer_size_bytes, align, NULL);
+	if (task->dst == NULL) {
+		fprintf(stderr, "Unable to alloc dst buffer\n");
+		return -ENOMEM;
+	}
+
+	/* For compare we want the buffers to match, otherwise not. */
+	if (g_workload_selection == ACCEL_COMPARE) {
+		memset(task->dst, DATA_PATTERN, g_xfer_size_bytes);
+	} else {
+		memset(task->dst, ~DATA_PATTERN, g_xfer_size_bytes);
+	}
+
+	/* For fill, set the entire src buffer so we can check if verify is enabled. */
+	if (g_workload_selection == ACCEL_FILL) {
+		memset(task->src, g_fill_pattern, g_xfer_size_bytes);
+	}
+
+	if (g_workload_selection == ACCEL_DUALCAST) {
+		task->dst2 = spdk_dma_zmalloc(g_xfer_size_bytes, align, NULL);
+		if (task->dst2 == NULL) {
+			fprintf(stderr, "Unable to alloc dst buffer\n");
+			return -ENOMEM;
+		}
+		memset(task->dst2, ~DATA_PATTERN, g_xfer_size_bytes);
+	}
+
+	return 0;
+}
+
+static int
+_batch_prep_cmd(struct worker_thread *worker, struct ap_task *task, struct spdk_accel_batch *batch)
+{
+	int rc = 0;
+
+	switch (g_workload_selection) {
+	case ACCEL_COPY:
+		rc = spdk_accel_batch_prep_copy(worker->ch, batch, task->dst,
+						task->src, g_xfer_size_bytes, accel_done, task);
+		break;
+	case ACCEL_DUALCAST:
+		rc = spdk_accel_batch_prep_dualcast(worker->ch, batch, task->dst, task->dst2,
+						    task->src, g_xfer_size_bytes, accel_done, task);
+		break;
+	case ACCEL_COMPARE:
+		rc = spdk_accel_batch_prep_compare(worker->ch, batch, task->dst, task->src,
+						   g_xfer_size_bytes, accel_done, task);
+		break;
+	case ACCEL_FILL:
+		rc = spdk_accel_batch_prep_fill(worker->ch, batch, task->dst,
+						*(uint8_t *)task->src,
+						g_xfer_size_bytes, accel_done, task);
+		break;
+	case ACCEL_CRC32C:
+		rc = spdk_accel_batch_prep_crc32c(worker->ch, batch, (uint32_t *)task->dst,
+						  task->src, g_crc32c_seed, g_xfer_size_bytes, accel_done, task);
+		break;
+	default:
+		assert(false);
+		break;
+	}
+
+	return rc;
+}
+
+static void
+_init_thread(void *arg1)
+{
+	struct worker_thread *worker;
+	struct ap_task *task;
+	int i, rc, max_per_batch, batch_count, num_tasks;
+	int remaining = g_queue_depth;
+	struct spdk_accel_batch *batch, *new_batch;
+
+	worker = calloc(1, sizeof(*worker));
+	if (worker == NULL) {
+		fprintf(stderr, "Unable to allocate worker\n");
+		return;
+	}
+
 	worker->core = spdk_env_get_current_core();
 	worker->thread = spdk_get_thread();
 	worker->next = g_workers;
 	worker->ch = spdk_accel_engine_get_io_channel();
 
-	snprintf(task_pool_name, sizeof(task_pool_name), "task_pool_%d", g_num_workers);
-	worker->task_pool = spdk_mempool_create(task_pool_name,
-						g_queue_depth,
-						spdk_accel_task_size() + sizeof(struct ap_task),
-						SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
-						SPDK_ENV_SOCKET_ID_ANY);
-	if (!worker->task_pool) {
-		fprintf(stderr, "Could not allocate buffer pool.\n");
-		free(worker);
-		return;
+	max_per_batch = spdk_accel_batch_get_max(worker->ch);
+	assert(max_per_batch > 0);
+	num_tasks = g_queue_depth + spdk_divide_round_up(g_queue_depth, max_per_batch);
+
+	TAILQ_INIT(&worker->tasks);
+	for (i = 0; i < num_tasks; i++) {
+		task = calloc(1, sizeof(struct ap_task));
+		if (task == NULL) {
+			fprintf(stderr, "Could not allocate task.\n");
+			return;
+			/* TODO cleanup */
+		}
+		TAILQ_INSERT_TAIL(&worker->tasks, task, link);
 	}
 
 	/* Register a poller that will stop the worker at time elapsed */
@@ -443,50 +534,108 @@ _init_thread(void *arg1)
 	g_num_workers++;
 	pthread_mutex_unlock(&g_workers_lock);
 
-	for (i = 0; i < g_queue_depth; i++) {
-		task = spdk_mempool_get(worker->task_pool);
-		if (!task) {
-			fprintf(stderr, "Unable to get accel_task\n");
-			return;
-		}
+	/* Batching is only possible if there is at least 2 operations. */
+	if (g_queue_depth > 1) {
 
-		task->src = spdk_dma_zmalloc(g_xfer_size_bytes, 0, NULL);
-		if (task->src == NULL) {
-			fprintf(stderr, "Unable to alloc src buffer\n");
-			return;
-		}
-		memset(task->src, DATA_PATTERN, g_xfer_size_bytes);
-
-		task->dst = spdk_dma_zmalloc(g_xfer_size_bytes, align, NULL);
-		if (task->dst == NULL) {
-			fprintf(stderr, "Unable to alloc dst buffer\n");
-			return;
-		}
-
-		if (g_workload_selection == ACCEL_DUALCAST) {
-			task->dst2 = spdk_dma_zmalloc(g_xfer_size_bytes, align, NULL);
-			if (task->dst2 == NULL) {
-				fprintf(stderr, "Unable to alloc dst buffer\n");
-				return;
+		/* Outter loop sets up each batch command, inner loop populates the
+		 * batch descriptors.
+		 */
+		do {
+			new_batch = spdk_accel_batch_create(worker->ch);
+			if (new_batch == NULL) {
+				break;
 			}
-			memset(task->dst2, ~DATA_PATTERN, g_xfer_size_bytes);
+
+			batch = new_batch;
+			batch_count = 0;
+
+			do {
+				if (!TAILQ_EMPTY(&worker->tasks)) {
+					task = TAILQ_FIRST(&worker->tasks);
+					TAILQ_REMOVE(&worker->tasks, task, link);
+				} else {
+					fprintf(stderr, "Unable to get accel_task\n");
+					goto error;
+				}
+				task->worker = worker;
+				task->worker->current_queue_depth++;
+
+				if (_get_task_data_bufs(task)) {
+					fprintf(stderr, "Unable to get data bufs\n");
+					goto error;
+				}
+
+				rc = _batch_prep_cmd(worker, task, batch);
+				if (rc) {
+					fprintf(stderr, "error preping command\n");
+					goto error;
+				}
+				remaining--;
+				batch_count++;
+			} while (batch_count < max_per_batch && remaining > 0);
+
+			/* Now send the batch command. */
+			if (!TAILQ_EMPTY(&worker->tasks)) {
+				task = TAILQ_FIRST(&worker->tasks);
+				TAILQ_REMOVE(&worker->tasks, task, link);
+			} else {
+				fprintf(stderr, "Unable to get accel_task\n");
+				goto error;
+			}
+			task->worker = worker;
+			task->worker->current_queue_depth++;
+
+			rc = spdk_accel_batch_submit(worker->ch, batch, batch_done, task);
+			if (rc) {
+				fprintf(stderr, "error ending batch %d\n", rc);
+				goto error;
+			}
+			/* We can't build a batch unless it has 2 descriptors (per spec). */
+		} while (remaining > 1);
+
+		/* If there are no more left, we're done. */
+		if (remaining == 0) {
+			return;
+		}
+	}
+
+	/* For engines that don't support batch or for the odd event that
+	 * a batch ends with only one descriptor left.
+	 */
+	for (i = 0; i < remaining; i++) {
+
+		if (!TAILQ_EMPTY(&worker->tasks)) {
+			task = TAILQ_FIRST(&worker->tasks);
+			TAILQ_REMOVE(&worker->tasks, task, link);
+		} else {
+			fprintf(stderr, "Unable to get accel_task\n");
+			goto error;
 		}
 
-		/* For compare we want the buffers to match, otherwise not. */
-		if (g_workload_selection == ACCEL_COMPARE) {
-			memset(task->dst, DATA_PATTERN, g_xfer_size_bytes);
-		} else {
-			memset(task->dst, ~DATA_PATTERN, g_xfer_size_bytes);
+		if (_get_task_data_bufs(task)) {
+			fprintf(stderr, "Unable to get data bufs\n");
+			goto error;
 		}
 
 		_submit_single(worker, task);
 	}
+	return;
+error:
+	/* TODO clean exit */
+	raise(SIGINT);
+	while (!TAILQ_EMPTY(&worker->tasks)) {
+		task = TAILQ_FIRST(&worker->tasks);
+		TAILQ_REMOVE(&worker->tasks, task, link);
+		free(task);
+	}
+	free(worker);
+	spdk_app_stop(-1);
 }
 
 static void
-accel_done(void *ref, int status)
+accel_done(void *cb_arg, int status)
 {
-	struct ap_task *task = __ap_task_from_accel_task(ref);
+	struct ap_task *task = (struct ap_task *)cb_arg;
 	struct worker_thread *worker = task->worker;
 
 	assert(worker);
@@ -498,18 +647,15 @@ accel_done(void *ref, int status)
 static void
 accel_perf_start(void *arg1)
 {
-	uint64_t capabilites;
 	struct spdk_io_channel *accel_ch;
 
 	accel_ch = spdk_accel_engine_get_io_channel();
-	capabilites = spdk_accel_get_capabilities(accel_ch);
+	g_capabilites = spdk_accel_get_capabilities(accel_ch);
 	spdk_put_io_channel(accel_ch);
 
-	if ((capabilites & g_workload_selection) != g_workload_selection) {
-		SPDK_ERRLOG("Selected workload is not supported by the current engine\n");
-		SPDK_NOTICELOG("Software engine is selected by default, enable a HW engine via RPC\n\n");
-		spdk_app_stop(-1);
-		return;
+	if ((g_capabilites & g_workload_selection) != g_workload_selection) {
+		SPDK_WARNLOG("The selected workload is not natively supported by the current engine\n");
+		SPDK_WARNLOG("The software engine will be used instead.\n\n");
 	}
 
 	g_tsc_rate = spdk_get_ticks_hz();

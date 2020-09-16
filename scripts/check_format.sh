@@ -96,7 +96,7 @@ if hash astyle; then
 			| xargs -P$(nproc) -n10 astyle --options=.astylerc >> astyle.log
 		if grep -q "^Formatted" astyle.log; then
 			echo " errors detected"
-			git diff
+			git diff --ignore-submodules=all
 			sed -i -e 's/  / /g' astyle.log
 			grep --color=auto "^Formatted.*" astyle.log
 			echo "Incorrect code style detected in one or more files."
@@ -233,7 +233,7 @@ for c_file in "${changed_c_libs[@]}"; do
 	# Capture just the names of newly added (or modified) functions that start with "spdk_"
 	mapfile -t defined_symbols < <(git diff -U0 $commit_to_compare HEAD -- $c_file | sed -En 's/(^[+])(spdk[a-z,A-Z,0-9,_]*)(\(.*)/\2/p')
 	# Capture the names of removed symbols to catch edge cases where we just move definitions around.
-	mapfile -t removed_symbols < <(git diff -U0 HEAD $commit_to_compare -- $c_file | sed -En 's/(^[+])(spdk[a-z,A-Z,0-9,_]*)(\(.*)/\2/p')
+	mapfile -t removed_symbols < <(git diff -U0 $commit_to_compare HEAD -- $c_file | sed -En 's/(^[-])(spdk[a-z,A-Z,0-9,_]*)(\(.*)/\2/p')
 	for symbol in "${removed_symbols[@]}"; do
 		defined_symbols=("${defined_symbols[@]/$symbol/}")
 	done

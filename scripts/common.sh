@@ -49,8 +49,6 @@ cache_pci() {
 	fi
 	if [[ -n $vendor && -n $device ]]; then
 		vendor=0x${vendor/0x/} device=0x${device/0x/}
-		pci_bus_cache["$vendor"]="${pci_bus_cache["$vendor"]:+${pci_bus_cache["$vendor"]} }$pci"
-		pci_bus_cache["$device"]="${pci_bus_cache["$device"]:+${pci_bus_cache["$device"]} }$pci"
 		pci_bus_cache["$vendor:$device"]="${pci_bus_cache["$vendor:$device"]:+${pci_bus_cache["$vendor:$device"]} }$pci"
 
 		pci_ids_vendor["$pci"]=$vendor
@@ -211,4 +209,29 @@ function iter_pci_class_code() {
 			echo "$bdf"
 		fi
 	done
+}
+
+function nvme_in_userspace() {
+	# Check used drivers. If it's not vfio-pci or uio-pci-generic
+	# then most likely PCI_WHITELIST option was used for setup.sh
+	# and we do not want to use that disk.
+
+	local bdf bdfs
+	local nvmes
+
+	if [[ -n ${pci_bus_cache["0x010802"]} ]]; then
+		nvmes=(${pci_bus_cache["0x010802"]})
+	else
+		nvmes=($(iter_pci_class_code 01 08 02))
+	fi
+
+	for bdf in "${nvmes[@]}"; do
+		if [[ -e /sys/bus/pci/drivers/nvme/$bdf ]] \
+			|| [[ $(uname -s) == FreeBSD && $(pciconf -l "pci$bdf") == nvme* ]]; then
+			continue
+		fi
+		bdfs+=("$bdf")
+	done
+	((${#bdfs[@]})) || return 1
+	printf '%s\n' "${bdfs[@]}"
 }

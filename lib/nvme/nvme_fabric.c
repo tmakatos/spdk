@@ -454,7 +454,8 @@ nvme_fabric_qpair_connect(struct spdk_nvme_qpair *qpair, uint32_t num_entries)
 		return rc;
 	}
 
-	if (nvme_wait_for_completion(qpair, status)) {
+	/* If we time out, the qpair will abort the request upon destruction. */
+	if (nvme_wait_for_completion_timeout(qpair, status, ctrlr->opts.fabrics_connect_timeout_us)) {
 		SPDK_ERRLOG("Connect command failed\n");
 		spdk_free(nvmf_data);
 		if (!status->timed_out) {

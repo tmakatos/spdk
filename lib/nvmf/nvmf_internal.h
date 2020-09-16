@@ -57,6 +57,7 @@ enum spdk_nvmf_subsystem_state {
 	SPDK_NVMF_SUBSYSTEM_PAUSED,
 	SPDK_NVMF_SUBSYSTEM_RESUMING,
 	SPDK_NVMF_SUBSYSTEM_DEACTIVATING,
+	SPDK_NVMF_SUBSYSTEM_NUM_STATES,
 };
 
 struct spdk_nvmf_tgt {
@@ -96,6 +97,8 @@ struct spdk_nvmf_subsystem_listener {
 	void						*cb_arg;
 	struct spdk_nvme_transport_id			*trid;
 	struct spdk_nvmf_transport			*transport;
+	enum spdk_nvme_ana_state			ana_state;
+	uint64_t					ana_state_change_count;
 	TAILQ_ENTRY(spdk_nvmf_subsystem_listener)	link;
 };
 
@@ -217,6 +220,8 @@ struct spdk_nvmf_ctrlr {
 	struct spdk_thread	*thread;
 	struct spdk_bit_array	*qpair_mask;
 
+	const struct spdk_nvmf_subsystem_listener	*listener;
+
 	struct spdk_nvmf_request *aer_req[NVMF_MAX_ASYNC_EVENTS];
 	union spdk_nvme_async_event_completion notice_event;
 	union spdk_nvme_async_event_completion reservation_event;
@@ -233,7 +238,10 @@ struct spdk_nvmf_ctrlr {
 	uint64_t			last_keep_alive_tick;
 	struct spdk_poller		*keep_alive_poller;
 
+	struct spdk_poller		*association_timer;
+
 	bool				dif_insert_or_strip;
+	bool				in_destruct;
 
 	TAILQ_ENTRY(spdk_nvmf_ctrlr)	link;
 };
@@ -248,11 +256,15 @@ struct spdk_nvmf_subsystem {
 	uint16_t next_cntlid;
 	bool allow_any_host;
 	bool allow_any_listener;
+	bool ana_reporting;
 
 	struct spdk_nvmf_tgt			*tgt;
 
 	char sn[SPDK_NVME_CTRLR_SN_LEN + 1];
 	char mn[SPDK_NVME_CTRLR_MN_LEN + 1];
+
+	/* boolean for state change synchronization. */
+	bool changing_state;
 
 	/* Array of pointers to namespaces of size max_nsid indexed by nsid - 1 */
 	struct spdk_nvmf_ns			**ns;
@@ -328,8 +340,13 @@ struct spdk_nvmf_subsystem_listener *nvmf_subsystem_find_listener(
 struct spdk_nvmf_listener *nvmf_transport_find_listener(
 	struct spdk_nvmf_transport *transport,
 	const struct spdk_nvme_transport_id *trid);
+void nvmf_subsystem_set_ana_state(struct spdk_nvmf_subsystem *subsystem,
+				  const struct spdk_nvme_transport_id *trid,
+				  enum spdk_nvme_ana_state ana_state,
+				  spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn, void *cb_arg);
 
 int nvmf_ctrlr_async_event_ns_notice(struct spdk_nvmf_ctrlr *ctrlr);
+int nvmf_ctrlr_async_event_ana_change_notice(struct spdk_nvmf_ctrlr *ctrlr);
 void nvmf_ctrlr_async_event_reservation_notification(struct spdk_nvmf_ctrlr *ctrlr);
 void nvmf_ns_reservation_request(void *ctx);
 void nvmf_ctrlr_reservation_notice_log(struct spdk_nvmf_ctrlr *ctrlr,
@@ -350,6 +367,8 @@ void nvmf_ctrlr_abort_aer(struct spdk_nvmf_ctrlr *ctrlr);
  * AER without sending a completion is to prevent the host from sending another AER.
  */
 void nvmf_qpair_free_aer(struct spdk_nvmf_qpair *qpair);
+
+int nvmf_ctrlr_abort_request(struct spdk_nvmf_request *req);
 
 static inline struct spdk_nvmf_ns *
 _nvmf_subsystem_get_ns(struct spdk_nvmf_subsystem *subsystem, uint32_t nsid)

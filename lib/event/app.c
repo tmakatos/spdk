@@ -53,6 +53,7 @@
 #define SPDK_APP_DPDK_DEFAULT_MASTER_CORE	-1
 #define SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL	-1
 #define SPDK_APP_DPDK_DEFAULT_CORE_MASK		"0x1"
+#define SPDK_APP_DPDK_DEFAULT_BASE_VIRTADDR	0x200000000000
 #define SPDK_APP_DEFAULT_CORE_LIMIT		0x140000000 /* 5 GiB */
 
 struct spdk_app {
@@ -110,7 +111,7 @@ static const struct option g_cmdline_options[] = {
 	{"version",			no_argument,		NULL, VERSION_OPT_IDX},
 #define PCI_BLACKLIST_OPT_IDX	'B'
 	{"pci-blacklist",		required_argument,	NULL, PCI_BLACKLIST_OPT_IDX},
-#define LOGFLAG_OPT_IDX	'L'
+#define LOGFLAG_OPT_IDX		'L'
 	{"logflag",			required_argument,	NULL, LOGFLAG_OPT_IDX},
 #define HUGE_UNLINK_OPT_IDX	'R'
 	{"huge-unlink",			no_argument,		NULL, HUGE_UNLINK_OPT_IDX},
@@ -130,6 +131,10 @@ static const struct option g_cmdline_options[] = {
 	{"json",			required_argument,	NULL, JSON_CONFIG_OPT_IDX},
 #define JSON_CONFIG_IGNORE_INIT_ERRORS_IDX	263
 	{"json-ignore-init-errors",	no_argument,		NULL, JSON_CONFIG_IGNORE_INIT_ERRORS_IDX},
+#define IOVA_MODE_OPT_IDX	264
+	{"iova-mode",			required_argument,	NULL, IOVA_MODE_OPT_IDX},
+#define BASE_VIRTADDR_OPT_IDX	265
+	{"base-virtaddr",		required_argument,	NULL, BASE_VIRTADDR_OPT_IDX},
 };
 
 /* Global section */
@@ -284,6 +289,7 @@ spdk_app_opts_init(struct spdk_app_opts *opts)
 	opts->master_core = SPDK_APP_DPDK_DEFAULT_MASTER_CORE;
 	opts->mem_channel = SPDK_APP_DPDK_DEFAULT_MEM_CHANNEL;
 	opts->reactor_mask = NULL;
+	opts->base_virtaddr = SPDK_APP_DPDK_DEFAULT_BASE_VIRTADDR;
 	opts->print_level = SPDK_APP_DEFAULT_LOG_PRINT_LEVEL;
 	opts->rpc_addr = SPDK_DEFAULT_RPC_ADDR;
 	opts->num_entries = SPDK_APP_DEFAULT_NUM_TRACE_ENTRIES;
@@ -309,8 +315,8 @@ app_setup_signal_handlers(struct spdk_app_opts *opts)
 	}
 
 	/* Install the same handler for SIGINT and SIGTERM */
+	g_shutdown_sig_received = false;
 	sigact.sa_handler = __shutdown_signal;
-
 	rc = sigaction(SIGINT, &sigact, NULL);
 	if (rc < 0) {
 		SPDK_ERRLOG("sigaction(SIGINT) failed\n");
@@ -491,6 +497,15 @@ app_setup_env(struct spdk_app_opts *opts)
 	struct spdk_env_opts env_opts = {};
 	int rc;
 
+	if (opts == NULL) {
+		rc = spdk_env_init(NULL);
+		if (rc != 0) {
+			SPDK_ERRLOG("Unable to reinitialize SPDK env\n");
+		}
+
+		return rc;
+	}
+
 	spdk_env_opts_init(&env_opts);
 
 	env_opts.name = opts->name;
@@ -506,7 +521,9 @@ app_setup_env(struct spdk_app_opts *opts)
 	env_opts.num_pci_addr = opts->num_pci_addr;
 	env_opts.pci_blacklist = opts->pci_blacklist;
 	env_opts.pci_whitelist = opts->pci_whitelist;
+	env_opts.base_virtaddr = opts->base_virtaddr;
 	env_opts.env_context = opts->env_context;
+	env_opts.iova_mode = opts->iova_mode;
 
 	rc = spdk_env_init(&env_opts);
 	free(env_opts.pci_blacklist);
@@ -581,6 +598,7 @@ spdk_app_start(struct spdk_app_opts *opts, spdk_msg_fn start_fn,
 	int			rc;
 	char			*tty;
 	struct spdk_cpuset	tmp_cpumask = {};
+	static bool		g_env_was_setup = false;
 
 	if (!opts) {
 		SPDK_ERRLOG("opts should not be NULL\n");
@@ -636,7 +654,10 @@ spdk_app_start(struct spdk_app_opts *opts, spdk_msg_fn start_fn,
 
 	spdk_log_set_level(SPDK_APP_DEFAULT_LOG_LEVEL);
 
-	if (app_setup_env(opts) < 0) {
+	/* Pass NULL to app_setup_env if SPDK app has been set up, in order to
+	 * indicate that this is a reinitialization.
+	 */
+	if (app_setup_env(g_env_was_setup ? NULL : opts) < 0) {
 		return 1;
 	}
 
@@ -686,6 +707,8 @@ spdk_app_start(struct spdk_app_opts *opts, spdk_msg_fn start_fn,
 
 	/* This blocks until spdk_app_stop is called */
 	spdk_reactors_start();
+
+	g_env_was_setup = true;
 
 	return g_spdk_app.rc;
 }
@@ -761,6 +784,8 @@ usage(void (*app_usage)(void))
 	printf(" -W, --pci-whitelist <bdf>\n");
 	printf("                           pci addr to whitelist (-B and -W cannot be used at the same time)\n");
 	printf("      --huge-dir <path>    use a specific hugetlbfs mount to reserve memory from\n");
+	printf("      --iova-mode <pa/va>  set IOVA mode ('pa' for IOVA_PA and 'va' for IOVA_VA)\n");
+	printf("      --base-virtaddr <addr>      the base virtual address for DPDK (default: 0x200000000000)\n");
 	printf("      --num-trace-entries <num>   number of trace entries for each core, must be power of 2. (default %d)\n",
 	       SPDK_APP_DEFAULT_NUM_TRACE_ENTRIES);
 	spdk_log_usage(stdout, "-L");
@@ -971,8 +996,20 @@ spdk_app_parse_args(int argc, char **argv, struct spdk_app_opts *opts,
 				goto out;
 			}
 			break;
+		case BASE_VIRTADDR_OPT_IDX:
+			tmp = spdk_strtoll(optarg, 0);
+			if (tmp <= 0) {
+				SPDK_ERRLOG("Invalid base-virtaddr %s\n", optarg);
+				usage(app_usage);
+				goto out;
+			}
+			opts->base_virtaddr = (uint64_t)tmp;
+			break;
 		case HUGE_DIR_OPT_IDX:
 			opts->hugedir = optarg;
+			break;
+		case IOVA_MODE_OPT_IDX:
+			opts->iova_mode = optarg;
 			break;
 		case NUM_TRACE_ENTRIES_OPT_IDX:
 			tmp = spdk_strtoll(optarg, 0);
@@ -1109,7 +1146,7 @@ rpc_subsystem_init_poller_ctx(void *ctx)
 		free(poller_ctx);
 	}
 
-	return 1;
+	return SPDK_POLLER_BUSY;
 }
 
 static void

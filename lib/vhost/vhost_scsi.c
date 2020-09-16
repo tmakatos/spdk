@@ -769,7 +769,7 @@ vdev_mgmt_worker(void *arg)
 	process_vq(svsession, &vsession->virtqueue[VIRTIO_SCSI_CONTROLQ]);
 	vhost_vq_used_signal(vsession, &vsession->virtqueue[VIRTIO_SCSI_CONTROLQ]);
 
-	return -1;
+	return SPDK_POLLER_BUSY;
 }
 
 static int
@@ -785,7 +785,7 @@ vdev_worker(void *arg)
 
 	vhost_session_used_signal(vsession);
 
-	return -1;
+	return SPDK_POLLER_BUSY;
 }
 
 static struct spdk_vhost_scsi_dev *
@@ -993,7 +993,11 @@ spdk_vhost_scsi_dev_add_tgt(struct spdk_vhost_dev *vdev, int scsi_tgt_num,
 	const char *bdev_names_list[1];
 
 	svdev = to_scsi_dev(vdev);
-	assert(svdev != NULL);
+	if (!svdev) {
+		SPDK_ERRLOG("Before adding a SCSI target, there should be a SCSI device.");
+		return -EINVAL;
+	}
+
 	if (scsi_tgt_num < 0) {
 		for (scsi_tgt_num = 0; scsi_tgt_num < SPDK_VHOST_SCSI_CTRLR_MAX_DEVS; scsi_tgt_num++) {
 			if (svdev->scsi_dev_state[scsi_tgt_num].dev == NULL) {
@@ -1118,7 +1122,11 @@ spdk_vhost_scsi_dev_remove_tgt(struct spdk_vhost_dev *vdev, unsigned scsi_tgt_nu
 	}
 
 	svdev = to_scsi_dev(vdev);
-	assert(svdev != NULL);
+	if (!svdev) {
+		SPDK_ERRLOG("An invalid SCSI device that removing from a SCSI target.");
+		return -EINVAL;
+	}
+
 	scsi_dev_state = &svdev->scsi_dev_state[scsi_tgt_num];
 
 	if (scsi_dev_state->status != VHOST_SCSI_DEV_PRESENT) {
@@ -1364,11 +1372,11 @@ destroy_session_poller_cb(void *arg)
 	uint32_t i;
 
 	if (vsession->task_cnt > 0) {
-		return -1;
+		return SPDK_POLLER_BUSY;
 	}
 
 	if (spdk_vhost_trylock() != 0) {
-		return -1;
+		return SPDK_POLLER_BUSY;
 	}
 
 	for (i = 0; i < vsession->max_queues; i++) {
@@ -1408,7 +1416,7 @@ destroy_session_poller_cb(void *arg)
 	vhost_session_stop_done(vsession, 0);
 
 	spdk_vhost_unlock();
-	return -1;
+	return SPDK_POLLER_BUSY;
 }
 
 static int

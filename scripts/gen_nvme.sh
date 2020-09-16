@@ -13,41 +13,50 @@ function create_classic_config() {
 }
 
 function create_json_config() {
-	echo "{"
-	echo '"subsystem": "bdev",'
-	echo '"config": ['
-	for ((i = 0; i < ${#bdfs[@]}; i++)); do
-		echo '{'
-		echo '"params": {'
-		echo '"trtype": "PCIe",'
-		echo "\"name\": \"Nvme$i\","
-		echo "\"traddr\": \"${bdfs[i]}\""
-		echo '},'
-		echo '"method": "bdev_nvme_attach_controller"'
-		if [ -z ${bdfs[i + 1]} ]; then
-			echo '}'
-		else
-			echo '},'
-		fi
+	local bdev_json_cfg=()
+
+	for i in "${!bdfs[@]}"; do
+		bdev_json_cfg+=("$(
+			cat <<- JSON
+				{
+					"method": "bdev_nvme_attach_controller",
+					"params": {
+						"trtype": "PCIe",
+						"name":"Nvme${i}",
+						"traddr":"${bdfs[i]}"
+					}
+				}
+			JSON
+		)")
 	done
-	echo ']'
-	echo '}'
+
+	local IFS=","
+	cat <<- JSON
+		{
+			"subsystem": "bdev",
+			"config": [
+				${bdev_json_cfg[*]}
+			]
+		}
+	JSON
 }
 
-bdfs=()
-# Check used drivers. If it's not vfio-pci or uio-pci-generic
-# then most likely PCI_WHITELIST option was used for setup.sh
-# and we do not want to use that disk.
-for bdf in $(iter_pci_class_code 01 08 02); do
-	if [[ -e /sys/bus/pci/drivers/nvme/$bdf ]] \
-		|| [[ $(uname -s) == FreeBSD && $(pciconf -l "pci$bdf") == nvme* ]]; then
-		continue
-	fi
-	bdfs+=("$bdf")
-done
+function create_json_config_with_subsystems() {
+	cat <<- JSON
+		{
+			"subsystems": [
+				$(create_json_config)
+			]
+		}
+	JSON
+}
+
+bdfs=($(nvme_in_userspace))
 
 if [ "$1" = "--json" ]; then
 	create_json_config
+elif [ "$1" = "--json-with-subsystems" ]; then
+	create_json_config_with_subsystems
 else
 	create_classic_config
 fi

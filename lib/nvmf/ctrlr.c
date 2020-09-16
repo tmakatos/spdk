@@ -59,6 +59,8 @@
  */
 #define FW_VERSION SPDK_VERSION_MAJOR_STRING SPDK_VERSION_MINOR_STRING SPDK_VERSION_PATCH_STRING
 
+#define ANA_TRANSITION_TIME_IN_SEC 10
+
 /*
  * Support for custom admin command handlers
  */
@@ -100,6 +102,23 @@ nvmf_ctrlr_stop_keep_alive_timer(struct spdk_nvmf_ctrlr *ctrlr)
 
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Stop keep alive poller\n");
 	spdk_poller_unregister(&ctrlr->keep_alive_poller);
+}
+
+static void
+nvmf_ctrlr_stop_association_timer(struct spdk_nvmf_ctrlr *ctrlr)
+{
+	if (!ctrlr) {
+		SPDK_ERRLOG("Controller is NULL\n");
+		assert(false);
+		return;
+	}
+
+	if (ctrlr->association_timer == NULL) {
+		return;
+	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Stop association timer\n");
+	spdk_poller_unregister(&ctrlr->association_timer);
 }
 
 static void
@@ -181,7 +200,7 @@ nvmf_ctrlr_keep_alive_poll(void *ctx)
 		}
 	}
 
-	return 1;
+	return SPDK_POLLER_BUSY;
 }
 
 static void
@@ -330,6 +349,9 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 	}
 
 	ctrlr->feat.async_event_configuration.bits.ns_attr_notice = 1;
+	if (ctrlr->subsys->ana_reporting) {
+		ctrlr->feat.async_event_configuration.bits.ana_change_notice = 1;
+	}
 	ctrlr->feat.volatile_write_cache.bits.wce = 1;
 
 	if (ctrlr->subsys->subtype == SPDK_NVMF_SUBTYPE_DISCOVERY) {
@@ -390,6 +412,16 @@ nvmf_ctrlr_create(struct spdk_nvmf_subsystem *subsystem,
 
 	ctrlr->dif_insert_or_strip = transport->opts.dif_insert_or_strip;
 
+	if (ctrlr->subsys->subtype == SPDK_NVMF_SUBTYPE_NVME) {
+		ctrlr->listener = nvmf_subsystem_find_listener(ctrlr->subsys,
+				  req->qpair->trid);
+		if (!ctrlr->listener) {
+			SPDK_ERRLOG("Listener was not found\n");
+			free(ctrlr);
+			return NULL;
+		}
+	}
+
 	req->qpair->ctrlr = ctrlr;
 	spdk_thread_send_msg(subsystem->thread, _nvmf_subsystem_add_ctrlr, req);
 
@@ -403,6 +435,8 @@ _nvmf_ctrlr_destruct(void *ctx)
 	struct spdk_nvmf_reservation_log *log, *log_tmp;
 
 	nvmf_ctrlr_stop_keep_alive_timer(ctrlr);
+	nvmf_ctrlr_stop_association_timer(ctrlr);
+	spdk_bit_array_free(&ctrlr->qpair_mask);
 
 	TAILQ_FOREACH_SAFE(log, &ctrlr->log_head, link, log_tmp) {
 		TAILQ_REMOVE(&ctrlr->log_head, log, link);
@@ -431,6 +465,13 @@ nvmf_ctrlr_add_io_qpair(void *ctx)
 	  * For error case, the value should be NULL. So set it to NULL at first.
 	  */
 	qpair->ctrlr = NULL;
+
+	/* Make sure the controller is not being destroyed. */
+	if (ctrlr->in_destruct) {
+		SPDK_ERRLOG("Got I/O connect while ctrlr was being destroyed.\n");
+		SPDK_NVMF_INVALID_CONNECT_CMD(rsp, qid);
+		goto end;
+	}
 
 	if (ctrlr->subsys->subtype == SPDK_NVMF_SUBTYPE_DISCOVERY) {
 		SPDK_ERRLOG("I/O connect not allowed on discovery controller\n");
@@ -474,6 +515,7 @@ _nvmf_ctrlr_add_io_qpair(void *ctx)
 	struct spdk_nvmf_qpair *admin_qpair;
 	struct spdk_nvmf_tgt *tgt = qpair->transport->tgt;
 	struct spdk_nvmf_subsystem *subsystem;
+	const struct spdk_nvmf_subsystem_listener *listener;
 
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Connect I/O Queue for controller id 0x%x\n", data->cntlid);
 
@@ -487,6 +529,25 @@ _nvmf_ctrlr_add_io_qpair(void *ctx)
 		SPDK_NVMF_INVALID_CONNECT_DATA(rsp, cntlid);
 		spdk_nvmf_request_complete(req);
 		return;
+	}
+
+	/* fail before passing a message to the controller thread. */
+	if (ctrlr->in_destruct) {
+		SPDK_ERRLOG("Got I/O connect while ctrlr was being destroyed.\n");
+		SPDK_NVMF_INVALID_CONNECT_CMD(rsp, qid);
+		spdk_nvmf_request_complete(req);
+		return;
+	}
+
+	/* If ANA reporting is enabled, check if I/O connect is on the same listener. */
+	if (subsystem->ana_reporting) {
+		listener = nvmf_subsystem_find_listener(subsystem, qpair->trid);
+		if (listener != ctrlr->listener) {
+			SPDK_ERRLOG("I/O connect is on a listener different from admin connect\n");
+			SPDK_NVMF_INVALID_CONNECT_CMD(rsp, qid);
+			spdk_nvmf_request_complete(req);
+			return;
+		}
 	}
 
 	admin_qpair = ctrlr->admin_qpair;
@@ -720,6 +781,43 @@ nvmf_ctrlr_cmd_connect(struct spdk_nvmf_request *req)
 	return _nvmf_ctrlr_connect(req);
 }
 
+static int
+nvmf_ctrlr_association_remove(void *ctx)
+{
+	struct spdk_nvmf_ctrlr *ctrlr = ctx;
+	int rc;
+
+	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Disconnecting host from subsystem %s due to association timeout.\n",
+		      ctrlr->subsys->subnqn);
+
+	rc = spdk_nvmf_qpair_disconnect(ctrlr->admin_qpair, NULL, NULL);
+	if (rc < 0) {
+		SPDK_ERRLOG("Fail to disconnect admin ctrlr qpair\n");
+		assert(false);
+	}
+
+	nvmf_ctrlr_stop_association_timer(ctrlr);
+	return 1;
+}
+
+static void
+nvmf_ctrlr_cc_shn_done(struct spdk_io_channel_iter *i, int status)
+{
+	struct spdk_nvmf_ctrlr *ctrlr = spdk_io_channel_iter_get_ctx(i);
+
+	if (status < 0) {
+		SPDK_ERRLOG("Fail to disconnect io ctrlr qpairs\n");
+		assert(false);
+	}
+
+	ctrlr->vcprop.csts.bits.shst = SPDK_NVME_SHST_COMPLETE;
+
+	/* After CC.EN transitions to 0 (due to shutdown or reset), the association
+	 * between the host and controller shall be preserved for at least 2 minutes */
+	ctrlr->association_timer = SPDK_POLLER_REGISTER(nvmf_ctrlr_association_remove, ctrlr,
+				   ctrlr->admin_qpair->transport->opts.association_timeout * 1000);
+}
+
 static void
 nvmf_ctrlr_cc_reset_done(struct spdk_io_channel_iter *i, int status)
 {
@@ -734,6 +832,10 @@ nvmf_ctrlr_cc_reset_done(struct spdk_io_channel_iter *i, int status)
 	ctrlr->vcprop.cc.raw = 0;
 	ctrlr->vcprop.csts.raw = 0;
 
+	/* After CC.EN transitions to 0 (due to shutdown or reset), the association
+	 * between the host and controller shall be preserved for at least 2 minutes */
+	ctrlr->association_timer = SPDK_POLLER_REGISTER(nvmf_ctrlr_association_remove, ctrlr,
+				   ctrlr->admin_qpair->transport->opts.association_timeout * 1000);
 }
 
 const struct spdk_nvmf_registers *
@@ -779,8 +881,9 @@ nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 	if (diff.bits.en) {
 		if (cc.bits.en) {
 			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Property Set CC Enable!\n");
+			nvmf_ctrlr_stop_association_timer(ctrlr);
+
 			ctrlr->vcprop.cc.bits.en = 1;
-			ctrlr->vcprop.csts.raw = 0;
 			ctrlr->vcprop.csts.bits.rdy = 1;
 		} else {
 			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Property Set CC Disable!\n");
@@ -799,12 +902,14 @@ nvmf_prop_set_cc(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Property Set CC Shutdown %u%ub!\n",
 				      cc.bits.shn >> 1, cc.bits.shn & 1);
 			ctrlr->vcprop.cc.bits.shn = cc.bits.shn;
-			ctrlr->vcprop.cc.bits.en = 0;
-			ctrlr->vcprop.csts.bits.rdy = 0;
-			ctrlr->vcprop.csts.bits.shst = SPDK_NVME_SHST_COMPLETE;
 			spdk_for_each_channel(ctrlr->subsys->tgt,
 					      nvmf_ctrlr_disconnect_io_qpairs_on_pg,
-					      ctrlr, NULL);
+					      ctrlr,
+					      nvmf_ctrlr_cc_shn_done);
+
+			/* From the time a shutdown is initiated the controller shall disable
+			 * Keep Alive timer */
+			nvmf_ctrlr_stop_keep_alive_timer(ctrlr);
 		} else if (cc.bits.shn == 0) {
 			ctrlr->vcprop.cc.bits.shn = 0;
 		} else {
@@ -871,8 +976,9 @@ nvmf_prop_set_aqa(struct spdk_nvmf_ctrlr *ctrlr, uint32_t value)
 
 	aqa.raw = value;
 
-	if (aqa.bits.asqs > ctrlr->vcprop.cap.bits.mqes ||
-	    aqa.bits.acqs > ctrlr->vcprop.cap.bits.mqes) {
+	if (aqa.bits.asqs < SPDK_NVME_ADMIN_QUEUE_MIN_ENTRIES - 1 ||
+	    aqa.bits.acqs < SPDK_NVME_ADMIN_QUEUE_MIN_ENTRIES - 1 ||
+	    aqa.bits.reserved1 != 0 || aqa.bits.reserved2 != 0) {
 		return false;
 	}
 
@@ -1301,7 +1407,7 @@ nvmf_ctrlr_get_features_reservation_notification_mask(struct spdk_nvmf_request *
 
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "get Features - Reservation Notificaton Mask\n");
 
-	if (cmd->nsid == 0xffffffffu) {
+	if (cmd->nsid == SPDK_NVME_GLOBAL_NS_TAG) {
 		SPDK_ERRLOG("get Features - Invalid Namespace ID\n");
 		rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -1329,7 +1435,7 @@ nvmf_ctrlr_set_features_reservation_notification_mask(struct spdk_nvmf_request *
 
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Set Features - Reservation Notificaton Mask\n");
 
-	if (cmd->nsid == 0xffffffffu) {
+	if (cmd->nsid == SPDK_NVME_GLOBAL_NS_TAG) {
 		for (ns = spdk_nvmf_subsystem_get_first_ns(subsystem); ns != NULL;
 		     ns = spdk_nvmf_subsystem_get_next_ns(subsystem, ns)) {
 			ns->mask = cmd->cdw11;
@@ -1359,7 +1465,7 @@ nvmf_ctrlr_get_features_reservation_persistence(struct spdk_nvmf_request *req)
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Get Features - Reservation Persistence\n");
 
 	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, cmd->nsid);
-	/* NSID with 0xffffffffu also included */
+	/* NSID with SPDK_NVME_GLOBAL_NS_TAG (=0xffffffff) also included */
 	if (ns == NULL) {
 		SPDK_ERRLOG("Get Features - Invalid Namespace ID\n");
 		response->status.sct = SPDK_NVME_SCT_GENERIC;
@@ -1388,9 +1494,9 @@ nvmf_ctrlr_set_features_reservation_persistence(struct spdk_nvmf_request *req)
 	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, cmd->nsid);
 	ptpl = cmd->cdw11_bits.feat_rsv_persistence.bits.ptpl;
 
-	if (cmd->nsid != 0xffffffffu && ns && ns->ptpl_file) {
+	if (cmd->nsid != SPDK_NVME_GLOBAL_NS_TAG && ns && ns->ptpl_file) {
 		ns->ptpl_activated = ptpl;
-	} else if (cmd->nsid == 0xffffffffu) {
+	} else if (cmd->nsid == SPDK_NVME_GLOBAL_NS_TAG) {
 		for (ns = spdk_nvmf_subsystem_get_first_ns(ctrlr->subsys); ns && ns->ptpl_file;
 		     ns = spdk_nvmf_subsystem_get_next_ns(ctrlr->subsys, ns)) {
 			ns->ptpl_activated = ptpl;
@@ -1499,6 +1605,11 @@ nvmf_ctrlr_async_event_request(struct spdk_nvmf_request *req)
 
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Async Event Request\n");
 
+	/* AER cmd is an exception */
+	sgroup = &req->qpair->group->sgroups[ctrlr->subsys->id];
+	assert(sgroup != NULL);
+	sgroup->io_outstanding--;
+
 	/* Four asynchronous events are supported for now */
 	if (ctrlr->nr_aer_reqs >= NVMF_MAX_ASYNC_EVENTS) {
 		SPDK_DEBUGLOG(SPDK_LOG_NVMF, "AERL exceeded\n");
@@ -1521,10 +1632,6 @@ nvmf_ctrlr_async_event_request(struct spdk_nvmf_request *req)
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
 
-	/* AER cmd is an exception */
-	sgroup = &req->qpair->group->sgroups[ctrlr->subsys->id];
-	sgroup->io_outstanding--;
-
 	ctrlr->aer_req[ctrlr->nr_aer_reqs++] = req;
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
 }
@@ -1544,6 +1651,79 @@ nvmf_get_firmware_slot_log_page(void *buffer, uint64_t offset, uint32_t length)
 		copy_len = spdk_min(sizeof(fw_page) - offset, length);
 		if (copy_len > 0) {
 			memcpy(buffer, (const char *)&fw_page + offset, copy_len);
+		}
+	}
+}
+
+#define SPDK_NVMF_ANA_DESC_SIZE	(sizeof(struct spdk_nvme_ana_group_descriptor) +	\
+				 sizeof(uint32_t))
+static void
+nvmf_get_ana_log_page(struct spdk_nvmf_ctrlr *ctrlr, void *data,
+		      uint64_t offset, uint32_t length)
+{
+	char *buf = data;
+	struct spdk_nvme_ana_page ana_hdr;
+	char _ana_desc[SPDK_NVMF_ANA_DESC_SIZE];
+	struct spdk_nvme_ana_group_descriptor *ana_desc;
+	size_t copy_len;
+	uint32_t num_ns = 0;
+	struct spdk_nvmf_ns *ns;
+
+	if (length == 0) {
+		return;
+	}
+
+	if (offset >= sizeof(ana_hdr)) {
+		offset -= sizeof(ana_hdr);
+	} else {
+		for (ns = spdk_nvmf_subsystem_get_first_ns(ctrlr->subsys); ns != NULL;
+		     ns = spdk_nvmf_subsystem_get_next_ns(ctrlr->subsys, ns)) {
+			num_ns++;
+		}
+
+		memset(&ana_hdr, 0, sizeof(ana_hdr));
+
+		ana_hdr.num_ana_group_desc = num_ns;
+		/* TODO: Support Change Count. */
+		ana_hdr.change_count = 0;
+
+		copy_len = spdk_min(sizeof(ana_hdr) - offset, length);
+		memcpy(buf, (const char *)&ana_hdr + offset, copy_len);
+		length -= copy_len;
+		buf += copy_len;
+		offset = 0;
+	}
+
+	if (length == 0) {
+		return;
+	}
+
+	ana_desc = (void *)_ana_desc;
+
+	for (ns = spdk_nvmf_subsystem_get_first_ns(ctrlr->subsys); ns != NULL;
+	     ns = spdk_nvmf_subsystem_get_next_ns(ctrlr->subsys, ns)) {
+		if (offset >= SPDK_NVMF_ANA_DESC_SIZE) {
+			offset -= SPDK_NVMF_ANA_DESC_SIZE;
+			continue;
+		}
+
+		memset(ana_desc, 0, SPDK_NVMF_ANA_DESC_SIZE);
+
+		ana_desc->ana_group_id = ns->nsid;
+		ana_desc->num_of_nsid = 1;
+		ana_desc->ana_state = ctrlr->listener->ana_state;
+		ana_desc->nsid[0] = ns->nsid;
+		/* TODO: Support Change Count. */
+		ana_desc->change_count = 0;
+
+		copy_len = spdk_min(SPDK_NVMF_ANA_DESC_SIZE - offset, length);
+		memcpy(buf, (const char *)ana_desc + offset, copy_len);
+		length -= copy_len;
+		buf += copy_len;
+		offset = 0;
+
+		if (length == 0) {
+			return;
 		}
 	}
 }
@@ -1749,6 +1929,13 @@ nvmf_ctrlr_get_log_page(struct spdk_nvmf_request *req)
 		case SPDK_NVME_LOG_FIRMWARE_SLOT:
 			nvmf_get_firmware_slot_log_page(req->data, offset, len);
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		case SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS:
+			if (subsystem->ana_reporting) {
+				nvmf_get_ana_log_page(ctrlr, req->data, offset, len);
+				return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+			} else {
+				goto invalid_log_page;
+			}
 		case SPDK_NVME_LOG_COMMAND_EFFECTS_LOG:
 			nvmf_get_cmds_and_effects_log_page(req->data, offset, len);
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -1809,6 +1996,16 @@ spdk_nvmf_ctrlr_identify_ns(struct spdk_nvmf_ctrlr *ctrlr,
 		nsdata->noiob = max_num_blocks;
 	}
 
+	if (subsystem->ana_reporting) {
+		/* ANA group ID matches NSID. */
+		nsdata->anagrpid = ns->nsid;
+
+		if (ctrlr->listener->ana_state == SPDK_NVME_ANA_INACCESSIBLE_STATE ||
+		    ctrlr->listener->ana_state == SPDK_NVME_ANA_PERSISTENT_LOSS_STATE) {
+			nsdata->nuse = 0;
+		}
+	}
+
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
@@ -1858,6 +2055,9 @@ spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_c
 	cdata->sgls = ctrlr->cdata.sgls;
 	cdata->fuses.compare_and_write = 1;
 	cdata->acwu = 1;
+	if (subsystem->ana_reporting) {
+		cdata->mnan = subsystem->max_nsid;
+	}
 	spdk_strcpy_pad(cdata->subnqn, subsystem->subnqn, sizeof(cdata->subnqn), '\0');
 
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF, "ctrlr data: maxcmd 0x%x\n", cdata->maxcmd);
@@ -1874,8 +2074,17 @@ spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_c
 		cdata->rab = 6;
 		cdata->cmic.multi_port = 1;
 		cdata->cmic.multi_host = 1;
+		if (subsystem->ana_reporting) {
+			/* Asymmetric Namespace Access Reporting is supported. */
+			cdata->cmic.ana_reporting = 1;
+		}
 		cdata->oaes.ns_attribute_notices = 1;
+		if (subsystem->ana_reporting) {
+			cdata->oaes.ana_change_notices = 1;
+		}
 		cdata->ctratt.host_id_exhid_supported = 1;
+		/* TODO: Concurrent execution of multiple abort commands. */
+		cdata->acl = 0;
 		cdata->aerl = 0;
 		cdata->frmw.slot1_ro = 1;
 		cdata->frmw.num_slots = 1;
@@ -1895,6 +2104,19 @@ spdk_nvmf_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr, struct spdk_nvme_c
 		cdata->oncs.dsm = nvmf_ctrlr_dsm_supported(ctrlr);
 		cdata->oncs.write_zeroes = nvmf_ctrlr_write_zeroes_supported(ctrlr);
 		cdata->oncs.reservations = 1;
+		if (subsystem->ana_reporting) {
+			cdata->anatt = ANA_TRANSITION_TIME_IN_SEC;
+			/* ANA Change state is not used, and ANA Persistent Loss state
+			 * is not supported for now.
+			 */
+			cdata->anacap.ana_optimized_state = 1;
+			cdata->anacap.ana_non_optimized_state = 1;
+			cdata->anacap.ana_inaccessible_state = 1;
+			/* ANAGRPID does not change while namespace is attached to controller */
+			cdata->anacap.no_change_anagrpid = 1;
+			cdata->anagrpmax = subsystem->max_nsid;
+			cdata->nanagrpid = subsystem->max_nsid;
+		}
 
 		nvmf_ctrlr_populate_oacs(ctrlr, cdata);
 
@@ -2091,11 +2313,33 @@ nvmf_qpair_abort_aer(struct spdk_nvmf_qpair *qpair, uint16_t cid)
 }
 
 static void
+nvmf_qpair_abort_request(struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_request *req)
+{
+	uint16_t cid = req->cmd->nvme_cmd.cdw10_bits.abort.cid;
+
+	if (nvmf_qpair_abort_aer(qpair, cid)) {
+		SPDK_DEBUGLOG(SPDK_LOG_NVMF, "abort ctrlr=%p sqid=%u cid=%u successful\n",
+			      qpair->ctrlr, qpair->qid, cid);
+		req->rsp->nvme_cpl.cdw0 &= ~1U; /* Command successfully aborted */
+
+		spdk_nvmf_request_complete(req);
+		return;
+	}
+
+	nvmf_transport_qpair_abort_request(qpair, req);
+}
+
+static void
 nvmf_ctrlr_abort_done(struct spdk_io_channel_iter *i, int status)
 {
 	struct spdk_nvmf_request *req = spdk_io_channel_iter_get_ctx(i);
 
-	_nvmf_request_complete(req);
+	if (status == 0) {
+		/* There was no qpair whose ID matches SQID of the abort command.
+		 * Hence call _nvmf_request_complete() here.
+		 */
+		_nvmf_request_complete(req);
+	}
 }
 
 static void
@@ -2104,34 +2348,18 @@ nvmf_ctrlr_abort_on_pg(struct spdk_io_channel_iter *i)
 	struct spdk_nvmf_request *req = spdk_io_channel_iter_get_ctx(i);
 	struct spdk_io_channel *ch = spdk_io_channel_iter_get_channel(i);
 	struct spdk_nvmf_poll_group *group = spdk_io_channel_get_ctx(ch);
-	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
-	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
-	uint16_t sqid = cmd->cdw10_bits.abort.sqid;
+	uint16_t sqid = req->cmd->nvme_cmd.cdw10_bits.abort.sqid;
 	struct spdk_nvmf_qpair *qpair;
 
 	TAILQ_FOREACH(qpair, &group->qpairs, link) {
 		if (qpair->ctrlr == req->qpair->ctrlr && qpair->qid == sqid) {
-			uint16_t cid = cmd->cdw10_bits.abort.cid;
-
 			/* Found the qpair */
 
-			if (!nvmf_qpair_abort_aer(qpair, cid)) {
-				/* TODO: track list of outstanding requests in qpair? */
-				SPDK_DEBUGLOG(SPDK_LOG_NVMF, "cid %u not found\n", cid);
-				rsp->status.sct = SPDK_NVME_SCT_GENERIC;
-				rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
-				spdk_for_each_channel_continue(i, -EINVAL);
-				return;
-			}
+			nvmf_qpair_abort_request(qpair, req);
 
-			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "abort ctrlr=%p sqid=%u cid=%u successful\n",
-				      qpair->ctrlr, sqid, cid);
-			rsp->cdw0 = 0; /* Command successfully aborted */
-			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
-			rsp->status.sc = SPDK_NVME_SC_SUCCESS;
 			/* Return -1 for the status so the iteration across threads stops. */
 			spdk_for_each_channel_continue(i, -1);
-
+			return;
 		}
 	}
 
@@ -2143,9 +2371,9 @@ nvmf_ctrlr_abort(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
 
-	rsp->cdw0 = 1; /* Command not aborted */
-	rsp->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
-	rsp->status.sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
+	rsp->cdw0 = 1U; /* Command not aborted */
+	rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+	rsp->status.sc = SPDK_NVME_SC_SUCCESS;
 
 	/* Send a message to each poll group, searching for this ctrlr, sqid, and command. */
 	spdk_for_each_channel(req->qpair->ctrlr->subsys->tgt,
@@ -2157,6 +2385,31 @@ nvmf_ctrlr_abort(struct spdk_nvmf_request *req)
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS;
 }
 
+int
+nvmf_ctrlr_abort_request(struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_request *req_to_abort = req->req_to_abort;
+	struct spdk_bdev *bdev;
+	struct spdk_bdev_desc *desc;
+	struct spdk_io_channel *ch;
+	int rc;
+
+	assert(req_to_abort != NULL);
+
+	if (g_nvmf_custom_admin_cmd_hdlrs[SPDK_NVME_OPC_ABORT].hdlr &&
+	    nvmf_qpair_is_admin_queue(req_to_abort->qpair)) {
+		return g_nvmf_custom_admin_cmd_hdlrs[SPDK_NVME_OPC_ABORT].hdlr(req);
+	}
+
+	rc = spdk_nvmf_request_get_bdev(req_to_abort->cmd->nvme_cmd.nsid, req_to_abort,
+					&bdev, &desc, &ch);
+	if (rc != 0) {
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	return spdk_nvmf_bdev_ctrlr_abort_cmd(bdev, desc, ch, req, req_to_abort);
+}
+
 static int
 get_features_generic(struct spdk_nvmf_request *req, uint32_t cdw0)
 {
@@ -2166,6 +2419,24 @@ get_features_generic(struct spdk_nvmf_request *req, uint32_t cdw0)
 	return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 }
 
+/* we have to use the typedef in the function declaration to appease astyle. */
+typedef enum spdk_nvme_path_status_code spdk_nvme_path_status_code_t;
+
+static spdk_nvme_path_status_code_t
+_nvme_ana_state_to_path_status(enum spdk_nvme_ana_state ana_state)
+{
+	switch (ana_state) {
+	case SPDK_NVME_ANA_INACCESSIBLE_STATE:
+		return SPDK_NVME_SC_ASYMMETRIC_ACCESS_INACCESSIBLE;
+	case SPDK_NVME_ANA_PERSISTENT_LOSS_STATE:
+		return SPDK_NVME_SC_ASYMMETRIC_ACCESS_PERSISTENT_LOSS;
+	case SPDK_NVME_ANA_CHANGE_STATE:
+		return SPDK_NVME_SC_ASYMMETRIC_ACCESS_TRANSITION;
+	default:
+		return SPDK_NVME_SC_INTERNAL_PATH_ERROR;
+	}
+}
+
 static int
 nvmf_ctrlr_get_features(struct spdk_nvmf_request *req)
 {
@@ -2173,8 +2444,31 @@ nvmf_ctrlr_get_features(struct spdk_nvmf_request *req)
 	struct spdk_nvmf_ctrlr *ctrlr = req->qpair->ctrlr;
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
+	enum spdk_nvme_ana_state ana_state;
 
 	feature = cmd->cdw10_bits.get_features.fid;
+
+	ana_state = ctrlr->listener->ana_state;
+	switch (ana_state) {
+	case SPDK_NVME_ANA_INACCESSIBLE_STATE:
+	case SPDK_NVME_ANA_PERSISTENT_LOSS_STATE:
+	case SPDK_NVME_ANA_CHANGE_STATE:
+		switch (feature) {
+		case SPDK_NVME_FEAT_ERROR_RECOVERY:
+		case SPDK_NVME_FEAT_WRITE_ATOMICITY:
+		case SPDK_NVME_FEAT_HOST_RESERVE_MASK:
+		case SPDK_NVME_FEAT_HOST_RESERVE_PERSIST:
+			response->status.sct = SPDK_NVME_SCT_PATH;
+			response->status.sc = _nvme_ana_state_to_path_status(ana_state);
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		default:
+			break;
+		}
+		break;
+	default:
+		break;
+	}
+
 	switch (feature) {
 	case SPDK_NVME_FEAT_ARBITRATION:
 		return get_features_generic(req, ctrlr->feat.arbitration.raw);
@@ -2211,9 +2505,10 @@ static int
 nvmf_ctrlr_set_features(struct spdk_nvmf_request *req)
 {
 	uint8_t feature, save;
+	struct spdk_nvmf_ctrlr *ctrlr = req->qpair->ctrlr;
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
-
+	enum spdk_nvme_ana_state ana_state;
 	/*
 	 * Features are not saveable by the controller as indicated by
 	 * ONCS field of the Identify Controller data.
@@ -2226,6 +2521,37 @@ nvmf_ctrlr_set_features(struct spdk_nvmf_request *req)
 	}
 
 	feature = cmd->cdw10_bits.set_features.fid;
+
+	ana_state = ctrlr->listener->ana_state;
+	switch (ana_state) {
+	case SPDK_NVME_ANA_INACCESSIBLE_STATE:
+	case SPDK_NVME_ANA_CHANGE_STATE:
+		if (cmd->nsid == SPDK_NVME_GLOBAL_NS_TAG) {
+			response->status.sct = SPDK_NVME_SCT_PATH;
+			response->status.sc = _nvme_ana_state_to_path_status(ana_state);
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		} else {
+			switch (feature) {
+			case SPDK_NVME_FEAT_ERROR_RECOVERY:
+			case SPDK_NVME_FEAT_WRITE_ATOMICITY:
+			case SPDK_NVME_FEAT_HOST_RESERVE_MASK:
+			case SPDK_NVME_FEAT_HOST_RESERVE_PERSIST:
+				response->status.sct = SPDK_NVME_SCT_PATH;
+				response->status.sc = _nvme_ana_state_to_path_status(ana_state);
+				return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+			default:
+				break;
+			}
+		}
+		break;
+	case SPDK_NVME_ANA_PERSISTENT_LOSS_STATE:
+		response->status.sct = SPDK_NVME_SCT_PATH;
+		response->status.sc = SPDK_NVME_SC_ASYMMETRIC_ACCESS_PERSISTENT_LOSS;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	default:
+		break;
+	}
+
 	switch (feature) {
 	case SPDK_NVME_FEAT_ARBITRATION:
 		return nvmf_ctrlr_set_features_arbitration(req);
@@ -2315,7 +2641,8 @@ nvmf_ctrlr_process_admin_cmd(struct spdk_nvmf_request *req)
 		}
 	}
 
-	if (g_nvmf_custom_admin_cmd_hdlrs[cmd->opc].hdlr) {
+	/* Call a custom adm cmd handler if set. Aborts are handled in a different path (see nvmf_passthru_admin_cmd) */
+	if (g_nvmf_custom_admin_cmd_hdlrs[cmd->opc].hdlr && cmd->opc != SPDK_NVME_OPC_ABORT) {
 		rc = g_nvmf_custom_admin_cmd_hdlrs[cmd->opc].hdlr(req);
 		if (rc >= SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE) {
 			/* The handler took care of this commmand */
@@ -2439,6 +2766,37 @@ nvmf_ctrlr_async_event_ns_notice(struct spdk_nvmf_ctrlr *ctrlr)
 
 	/* If there is no outstanding AER request, queue the event.  Then
 	 * if an AER is later submitted, this event can be sent as a
+	 * response.
+	 */
+	if (ctrlr->nr_aer_reqs == 0) {
+		if (ctrlr->notice_event.bits.async_event_type ==
+		    SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE) {
+			return 0;
+		}
+
+		ctrlr->notice_event.raw = event.raw;
+		return 0;
+	}
+
+	return nvmf_ctrlr_async_event_notification(ctrlr, &event);
+}
+
+int
+nvmf_ctrlr_async_event_ana_change_notice(struct spdk_nvmf_ctrlr *ctrlr)
+{
+	union spdk_nvme_async_event_completion event = {0};
+
+	/* Users may disable the event notification */
+	if (!ctrlr->feat.async_event_configuration.bits.ana_change_notice) {
+		return 0;
+	}
+
+	event.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE;
+	event.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_ANA_CHANGE;
+	event.bits.log_page_identifier = SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS;
+
+	/* If there is no outstanding AER request, queue the event.  Then
+	 * if an AER is later submited, this event can be sent as a
 	 * response.
 	 */
 	if (ctrlr->nr_aer_reqs == 0) {
@@ -2778,6 +3136,7 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	struct spdk_nvme_cpl *response = &req->rsp->nvme_cpl;
 	struct spdk_nvmf_subsystem_pg_ns_info *ns_info;
+	enum spdk_nvme_ana_state ana_state;
 
 	/* pre-set response details for this command */
 	response->status.sc = SPDK_NVME_SC_SUCCESS;
@@ -2794,6 +3153,19 @@ nvmf_ctrlr_process_io_cmd(struct spdk_nvmf_request *req)
 		SPDK_ERRLOG("I/O command sent to disabled controller\n");
 		response->status.sct = SPDK_NVME_SCT_GENERIC;
 		response->status.sc = SPDK_NVME_SC_COMMAND_SEQUENCE_ERROR;
+		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	}
+
+	/* It will be lower overhead to check if ANA state is optimized or
+	 * non-optimized.
+	 */
+	ana_state = ctrlr->listener->ana_state;
+	if (spdk_unlikely(ana_state != SPDK_NVME_ANA_OPTIMIZED_STATE &&
+			  ana_state != SPDK_NVME_ANA_NON_OPTIMIZED_STATE)) {
+		SPDK_DEBUGLOG(SPDK_LOG_NVMF, "Fail I/O command due to ANA state %d\n",
+			      ana_state);
+		response->status.sct = SPDK_NVME_SCT_PATH;
+		response->status.sc = _nvme_ana_state_to_path_status(ana_state);
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
 
@@ -2899,14 +3271,15 @@ _nvmf_request_complete(void *ctx)
 	qpair = req->qpair;
 	if (qpair->ctrlr) {
 		sgroup = &qpair->group->sgroups[qpair->ctrlr->subsys->id];
+		assert(sgroup != NULL);
 		is_aer = req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_ASYNC_EVENT_REQUEST;
 	} else if (spdk_unlikely(nvmf_request_is_fabric_connect(req))) {
 		sgroup = nvmf_subsystem_pg_from_connect_cmd(req);
 	}
 
-	SPDK_DEBUGLOG(SPDK_LOG_NVMF,
-		      "cpl: cdw0=0x%08x sct=0x%01x sc=0x%02x cid=0x%04x\n",
-		      rsp->cdw0, rsp->status.sct, rsp->status.sc, rsp->cid);
+	if (SPDK_DEBUGLOG_FLAG_ENABLED("nvmf")) {
+		spdk_nvme_print_completion(qpair->qid, rsp);
+	}
 
 	TAILQ_REMOVE(&qpair->outstanding, req, link);
 	if (nvmf_transport_req_complete(req)) {
@@ -2943,57 +3316,15 @@ spdk_nvmf_request_complete(struct spdk_nvmf_request *req)
 }
 
 static void
-nvmf_trace_command(union nvmf_h2c_msg *h2c_msg, bool is_admin_queue)
-{
-	struct spdk_nvmf_capsule_cmd *cap_hdr = &h2c_msg->nvmf_cmd;
-	struct spdk_nvme_cmd *cmd = &h2c_msg->nvme_cmd;
-	struct spdk_nvme_sgl_descriptor *sgl = &cmd->dptr.sgl1;
-	uint8_t opc;
-
-	if (cmd->opc == SPDK_NVME_OPC_FABRIC) {
-		opc = cap_hdr->fctype;
-		SPDK_DEBUGLOG(SPDK_LOG_NVMF, "%s Fabrics cmd: fctype 0x%02x cid %u\n",
-			      is_admin_queue ? "Admin" : "I/O",
-			      cap_hdr->fctype, cap_hdr->cid);
-	} else {
-		opc = cmd->opc;
-		SPDK_DEBUGLOG(SPDK_LOG_NVMF, "%s cmd: opc 0x%02x fuse %u cid %u nsid %u cdw10 0x%08x\n",
-			      is_admin_queue ? "Admin" : "I/O",
-			      cmd->opc, cmd->fuse, cmd->cid, cmd->nsid, cmd->cdw10);
-		if (cmd->mptr) {
-			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "mptr 0x%" PRIx64 "\n", cmd->mptr);
-		}
-		if (cmd->psdt != SPDK_NVME_PSDT_SGL_MPTR_CONTIG &&
-		    cmd->psdt != SPDK_NVME_PSDT_SGL_MPTR_SGL) {
-			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "psdt %u\n", cmd->psdt);
-		}
-	}
-
-	if (spdk_nvme_opc_get_data_transfer(opc) != SPDK_NVME_DATA_NONE) {
-		if (sgl->generic.type == SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK) {
-			SPDK_DEBUGLOG(SPDK_LOG_NVMF,
-				      "SGL: Keyed%s: addr 0x%" PRIx64 " key 0x%x len 0x%x\n",
-				      sgl->generic.subtype == SPDK_NVME_SGL_SUBTYPE_INVALIDATE_KEY ? " (Inv)" : "",
-				      sgl->address, sgl->keyed.key, sgl->keyed.length);
-		} else if (sgl->generic.type == SPDK_NVME_SGL_TYPE_DATA_BLOCK) {
-			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "SGL: Data block: %s 0x%" PRIx64 " len 0x%x\n",
-				      sgl->unkeyed.subtype == SPDK_NVME_SGL_SUBTYPE_OFFSET ? "offs" : "addr",
-				      sgl->address, sgl->unkeyed.length);
-		} else {
-			SPDK_DEBUGLOG(SPDK_LOG_NVMF, "SGL type 0x%x subtype 0x%x\n",
-				      sgl->generic.type, sgl->generic.subtype);
-		}
-	}
-}
-
-static void
 _nvmf_request_exec(struct spdk_nvmf_request *req,
 		   struct spdk_nvmf_subsystem_poll_group *sgroup)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
 	enum spdk_nvmf_request_exec_status status;
 
-	nvmf_trace_command(req->cmd, nvmf_qpair_is_admin_queue(qpair));
+	if (SPDK_DEBUGLOG_FLAG_ENABLED("nvmf")) {
+		spdk_nvme_print_command(qpair->qid, &req->cmd->nvme_cmd);
+	}
 
 	if (sgroup) {
 		sgroup->io_outstanding++;
@@ -3016,23 +3347,6 @@ _nvmf_request_exec(struct spdk_nvmf_request *req,
 }
 
 void
-spdk_nvmf_request_exec_fabrics(struct spdk_nvmf_request *req)
-{
-	struct spdk_nvmf_qpair *qpair = req->qpair;
-	struct spdk_nvmf_subsystem_poll_group *sgroup = NULL;
-
-	assert(req->cmd->nvmf_cmd.opcode == SPDK_NVME_OPC_FABRIC);
-
-	if (qpair->ctrlr) {
-		sgroup = &qpair->group->sgroups[qpair->ctrlr->subsys->id];
-	} else {
-		sgroup = nvmf_subsystem_pg_from_connect_cmd(req);
-	}
-
-	_nvmf_request_exec(req, sgroup);
-}
-
-void
 spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 {
 	struct spdk_nvmf_qpair *qpair = req->qpair;
@@ -3040,6 +3354,7 @@ spdk_nvmf_request_exec(struct spdk_nvmf_request *req)
 
 	if (qpair->ctrlr) {
 		sgroup = &qpair->group->sgroups[qpair->ctrlr->subsys->id];
+		assert(sgroup != NULL);
 	} else if (spdk_unlikely(nvmf_request_is_fabric_connect(req))) {
 		sgroup = nvmf_subsystem_pg_from_connect_cmd(req);
 	}
@@ -3219,4 +3534,14 @@ void spdk_nvmf_request_get_data(struct spdk_nvmf_request *req, void **data, uint
 struct spdk_nvmf_subsystem *spdk_nvmf_ctrlr_get_subsystem(struct spdk_nvmf_ctrlr *ctrlr)
 {
 	return ctrlr->subsys;
+}
+
+uint16_t spdk_nvmf_ctrlr_get_id(struct spdk_nvmf_ctrlr *ctrlr)
+{
+	return ctrlr->cntlid;
+}
+
+struct spdk_nvmf_request *spdk_nvmf_request_get_req_to_abort(struct spdk_nvmf_request *req)
+{
+	return req->req_to_abort;
 }

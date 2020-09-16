@@ -34,7 +34,7 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y += bdev accel iscsi net nvmf scsi vmd
+DIRS-y += bdev accel iscsi net nvmf scsi vmd sock
 
 ifeq ($(OS),Linux)
 DIRS-y += nbd
@@ -46,7 +46,7 @@ DIRS-$(CONFIG_VHOST) += vhost
 # the subsystem dependency tree defined within the event subsystem C files
 # themselves. Should that tree change, these dependencies should change
 # accordingly.
-DEPDIRS-bdev := accel vmd
+DEPDIRS-bdev := accel vmd sock
 DEPDIRS-iscsi := scsi
 DEPDIRS-nbd := bdev
 DEPDIRS-nvmf := bdev

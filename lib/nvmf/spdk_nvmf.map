@@ -74,9 +74,11 @@
 	spdk_nvmf_tgt_add_transport;
 	spdk_nvmf_transport_listen;
 	spdk_nvmf_transport_stop_listen;
+	spdk_nvmf_transport_stop_listen_async;
 	spdk_nvmf_transport_poll_group_get_stat;
 	spdk_nvmf_transport_poll_group_free_stat;
 	spdk_nvmf_rdma_init_hooks;
+	spdk_nvmf_subsystem_set_ana_reporting;
 
 	# public functions in nvmf_cmd.h
 	spdk_nvmf_ctrlr_identify_ctrlr;
@@ -90,6 +92,8 @@
 	spdk_nvmf_request_get_data;
 	spdk_nvmf_request_get_cmd;
 	spdk_nvmf_request_get_response;
+	spdk_nvmf_request_get_req_to_abort;
+	spdk_nvmf_bdev_ctrlr_abort_cmd;
 
 	# public functions in nvmf_transport.h
 	spdk_nvmf_transport_register;
@@ -102,10 +106,10 @@
 	spdk_nvmf_request_get_buffers_multi;
 	spdk_nvmf_request_get_dif_ctx;
 	spdk_nvmf_request_exec;
-	spdk_nvmf_request_exec_fabrics;
 	spdk_nvmf_request_free;
 	spdk_nvmf_request_complete;
 	spdk_nvmf_ctrlr_get_subsystem;
+	spdk_nvmf_ctrlr_get_id;
 	spdk_nvmf_req_get_xfer;
 	spdk_nvmf_poll_group_remove;
 

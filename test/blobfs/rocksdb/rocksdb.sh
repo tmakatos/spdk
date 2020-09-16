@@ -4,6 +4,11 @@ testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
 source $rootdir/test/common/autotest_common.sh
 
+sanitize_results() {
+	process_core
+	[[ -d $RESULTS_DIR ]] && chmod 644 "$RESULTS_DIR/"*
+}
+
 dump_db_bench_on_err() {
 	# Fetch std dump of the last run_step that might have failed
 	[[ -e $db_bench ]] || return 0
@@ -74,7 +79,7 @@ $rootdir/scripts/gen_nvme.sh > $ROCKSDB_CONF
 echo "[Global]" >> $ROCKSDB_CONF
 echo "TpointGroupMask 0x80" >> $ROCKSDB_CONF
 
-trap 'dump_db_bench_on_err; run_bsdump || :; rm -f $ROCKSDB_CONF; exit 1' SIGINT SIGTERM EXIT
+trap 'dump_db_bench_on_err; run_bsdump || :; rm -f $ROCKSDB_CONF; sanitize_results; exit 1' SIGINT SIGTERM EXIT
 
 if [ -z "$SKIP_MKFS" ]; then
 	run_test "blobfs_mkfs" $rootdir/test/blobfs/mkfs/mkfs $ROCKSDB_CONF Nvme0n1
@@ -91,6 +96,15 @@ else
 	DURATION=20
 	NUM_KEYS=20000000
 fi
+# Make sure that there's enough memory available for the mempool. Unfortunately,
+# db_bench doesn't seem to allocate memory from all numa nodes since all of it
+# comes exclusively from node0. With that in mind, try to allocate CACHE_SIZE
+# + some_overhead (1G) of pages but only on node0 to make sure that we end up
+# with the right amount not allowing setup.sh to split it by using the global
+# nr_hugepages setting. Instead of bypassing it completely, we use it to also
+# get the right size of hugepages.
+HUGEMEM=$((CACHE_SIZE + 1024)) HUGENODE=0 \
+	"$rootdir/scripts/setup.sh"
 
 cd $RESULTS_DIR
 cp $testdir/common_flags.txt insert_flags.txt
@@ -153,3 +167,4 @@ trap - SIGINT SIGTERM EXIT
 
 run_bsdump
 rm -f $ROCKSDB_CONF
+sanitize_results

@@ -44,6 +44,7 @@
 #include "spdk/util.h"
 
 #define MAX_MEMPOOL_NAME_LENGTH 40
+#define NVMF_TRANSPORT_DEFAULT_ASSOCIATION_TIMEOUT_IN_MS 120000
 
 struct nvmf_transport_ops_list_element {
 	struct spdk_nvmf_transport_ops			ops;
@@ -254,6 +255,85 @@ spdk_nvmf_transport_stop_listen(struct spdk_nvmf_transport *transport,
 	return 0;
 }
 
+struct nvmf_stop_listen_ctx {
+	struct spdk_nvmf_transport *transport;
+	struct spdk_nvme_transport_id trid;
+	spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn;
+	void *cb_arg;
+};
+
+static void
+nvmf_stop_listen_fini(struct spdk_io_channel_iter *i, int status)
+{
+	struct nvmf_stop_listen_ctx *ctx;
+	struct spdk_nvmf_transport *transport;
+	int rc = status;
+
+	ctx = spdk_io_channel_iter_get_ctx(i);
+	transport = ctx->transport;
+	assert(transport != NULL);
+
+	rc = spdk_nvmf_transport_stop_listen(transport, &ctx->trid);
+	if (rc) {
+		SPDK_ERRLOG("Failed to stop listening on address '%s'\n", ctx->trid.traddr);
+	}
+
+	if (ctx->cb_fn) {
+		ctx->cb_fn(ctx->cb_arg, rc);
+	}
+	free(ctx);
+}
+
+static void
+nvmf_stop_listen_disconnect_qpairs(struct spdk_io_channel_iter *i)
+{
+	struct nvmf_stop_listen_ctx *ctx;
+	struct spdk_nvmf_poll_group *group;
+	struct spdk_io_channel *ch;
+	struct spdk_nvmf_qpair *qpair, *tmp_qpair;
+	struct spdk_nvme_transport_id tmp_trid;
+
+	ctx = spdk_io_channel_iter_get_ctx(i);
+	ch = spdk_io_channel_iter_get_channel(i);
+	group = spdk_io_channel_get_ctx(ch);
+
+	TAILQ_FOREACH_SAFE(qpair, &group->qpairs, link, tmp_qpair) {
+		/* skip qpairs that don't match the TRID. */
+		if (spdk_nvmf_qpair_get_listen_trid(qpair, &tmp_trid)) {
+			continue;
+		}
+
+		if (!spdk_nvme_transport_id_compare(&ctx->trid, &tmp_trid)) {
+			spdk_nvmf_qpair_disconnect(qpair, NULL, NULL);
+		}
+	}
+	spdk_for_each_channel_continue(i, 0);
+}
+
+int
+spdk_nvmf_transport_stop_listen_async(struct spdk_nvmf_transport *transport,
+				      const struct spdk_nvme_transport_id *trid,
+				      spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn,
+				      void *cb_arg)
+{
+	struct nvmf_stop_listen_ctx *ctx;
+
+	ctx = calloc(1, sizeof(struct nvmf_stop_listen_ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+
+	ctx->trid = *trid;
+	ctx->transport = transport;
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+
+	spdk_for_each_channel(transport->tgt, nvmf_stop_listen_disconnect_qpairs, ctx,
+			      nvmf_stop_listen_fini);
+
+	return 0;
+}
+
 uint32_t
 nvmf_transport_accept(struct spdk_nvmf_transport *transport)
 {
@@ -272,7 +352,8 @@ struct spdk_nvmf_transport_poll_group *
 nvmf_transport_poll_group_create(struct spdk_nvmf_transport *transport)
 {
 	struct spdk_nvmf_transport_poll_group *group;
-	struct spdk_nvmf_transport_pg_cache_buf *buf;
+	struct spdk_nvmf_transport_pg_cache_buf **bufs;
+	uint32_t i;
 
 	group = transport->ops->poll_group_create(transport);
 	if (!group) {
@@ -284,17 +365,34 @@ nvmf_transport_poll_group_create(struct spdk_nvmf_transport *transport)
 	STAILQ_INIT(&group->buf_cache);
 
 	if (transport->opts.buf_cache_size) {
-		group->buf_cache_count = 0;
 		group->buf_cache_size = transport->opts.buf_cache_size;
-		while (group->buf_cache_count < group->buf_cache_size) {
-			buf = (struct spdk_nvmf_transport_pg_cache_buf *)spdk_mempool_get(transport->data_buf_pool);
-			if (!buf) {
-				SPDK_NOTICELOG("Unable to reserve the full number of buffers for the pg buffer cache.\n");
-				break;
-			}
-			STAILQ_INSERT_HEAD(&group->buf_cache, buf, link);
-			group->buf_cache_count++;
+		bufs = calloc(group->buf_cache_size, sizeof(struct spdk_nvmf_transport_pg_cache_buf *));
+
+		if (!bufs) {
+			SPDK_ERRLOG("Memory allocation failed, can't reserve buffers for the pg buffer cache\n");
+			return group;
 		}
+
+		if (spdk_mempool_get_bulk(transport->data_buf_pool, (void **)bufs, group->buf_cache_size)) {
+			group->buf_cache_size = (uint32_t)spdk_mempool_count(transport->data_buf_pool);
+			SPDK_NOTICELOG("Unable to reserve the full number of buffers for the pg buffer cache. "
+				       "Decrease the number of cached buffers from %u to %u\n",
+				       transport->opts.buf_cache_size, group->buf_cache_size);
+			/* Sanity check */
+			assert(group->buf_cache_size <= transport->opts.buf_cache_size);
+			/* Try again with less number of buffers */
+			if (spdk_mempool_get_bulk(transport->data_buf_pool, (void **)bufs, group->buf_cache_size)) {
+				SPDK_NOTICELOG("Failed to reserve %u buffers\n", group->buf_cache_size);
+				group->buf_cache_size = 0;
+			}
+		}
+
+		for (i = 0; i < group->buf_cache_size; i++) {
+			STAILQ_INSERT_HEAD(&group->buf_cache, bufs[i], link);
+		}
+		group->buf_cache_count = group->buf_cache_size;
+
+		free(bufs);
 	}
 	return group;
 }
@@ -401,6 +499,13 @@ nvmf_transport_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 	return qpair->transport->ops->qpair_get_listen_trid(qpair, trid);
 }
 
+void
+nvmf_transport_qpair_abort_request(struct spdk_nvmf_qpair *qpair,
+				   struct spdk_nvmf_request *req)
+{
+	qpair->transport->ops->qpair_abort_request(qpair, req);
+}
+
 bool
 spdk_nvmf_transport_opts_init(const char *transport_name,
 			      struct spdk_nvmf_transport_opts *opts)
@@ -413,6 +518,7 @@ spdk_nvmf_transport_opts_init(const char *transport_name,
 		return false;
 	}
 
+	opts->association_timeout = NVMF_TRANSPORT_DEFAULT_ASSOCIATION_TIMEOUT_IN_MS;
 	ops->opts_init(opts);
 	return true;
 }

@@ -44,6 +44,11 @@
 #include "spdk/string.h"
 #include "spdk/rpc.h"
 #include "spdk/bit_array.h"
+#include "spdk/conf.h"
+
+#define BDEVPERF_CONFIG_MAX_FILENAME 1024
+#define BDEVPERF_CONFIG_UNDEFINED -1
+#define BDEVPERF_CONFIG_ERROR -2
 
 struct bdevperf_task {
 	struct iovec			iov;
@@ -62,13 +67,9 @@ static const char *g_workload_type = NULL;
 static int g_io_size = 0;
 /* initialize to invalid value so we can detect if user overrides it. */
 static int g_rw_percentage = -1;
-static int g_is_random;
 static bool g_verify = false;
 static bool g_reset = false;
 static bool g_continue_on_failure = false;
-static bool g_unmap = false;
-static bool g_write_zeroes = false;
-static bool g_flush = false;
 static bool g_abort = false;
 static int g_queue_depth = 0;
 static uint64_t g_time_in_usec;
@@ -88,7 +89,10 @@ static bool g_wait_for_tests = false;
 static struct spdk_jsonrpc_request *g_request = NULL;
 static bool g_multithread_mode = false;
 static int g_timeout_in_sec;
+static struct spdk_conf *g_bdevperf_conf = NULL;
+static const char *g_bdevperf_conf_file = NULL;
 
+static struct spdk_cpuset g_all_cpuset;
 static struct spdk_poller *g_perf_timer = NULL;
 
 static void bdevperf_submit_single(struct bdevperf_job *job, struct bdevperf_task *task);
@@ -101,6 +105,19 @@ struct bdevperf_job {
 	struct spdk_io_channel		*ch;
 	TAILQ_ENTRY(bdevperf_job)	link;
 	struct spdk_thread		*thread;
+
+	const char			*workload_type;
+	int				io_size;
+	int				rw_percentage;
+	bool				is_random;
+	bool				verify;
+	bool				reset;
+	bool				continue_on_failure;
+	bool				unmap;
+	bool				write_zeroes;
+	bool				flush;
+	bool				abort;
+	int				queue_depth;
 
 	uint64_t			io_completed;
 	uint64_t			io_failed;
@@ -130,6 +147,37 @@ static struct spdk_bdevperf g_bdevperf = {
 	.jobs = TAILQ_HEAD_INITIALIZER(g_bdevperf.jobs),
 	.running_jobs = 0,
 };
+
+enum job_config_rw {
+	JOB_CONFIG_RW_READ = 0,
+	JOB_CONFIG_RW_WRITE,
+	JOB_CONFIG_RW_RANDREAD,
+	JOB_CONFIG_RW_RANDWRITE,
+	JOB_CONFIG_RW_RW,
+	JOB_CONFIG_RW_RANDRW,
+	JOB_CONFIG_RW_VERIFY,
+	JOB_CONFIG_RW_RESET,
+	JOB_CONFIG_RW_UNMAP,
+	JOB_CONFIG_RW_FLUSH,
+	JOB_CONFIG_RW_WRITE_ZEROES,
+};
+
+/* Storing values from a section of job config file */
+struct job_config {
+	const char			*name;
+	const char			*filename;
+	struct spdk_cpuset		cpumask;
+	int				bs;
+	int				iodepth;
+	int				rwmixread;
+	int64_t				offset;
+	int				length;
+	enum job_config_rw		rw;
+	TAILQ_ENTRY(job_config)	link;
+};
+
+TAILQ_HEAD(, job_config) job_config_list
+	= TAILQ_HEAD_INITIALIZER(job_config_list);
 
 static bool g_performance_dump_active = false;
 
@@ -186,7 +234,7 @@ performance_dump_job(struct bdevperf_aggregate_stats *stats, struct bdevperf_job
 	} else {
 		io_per_second = get_ema_io_per_second(job, stats->ema_period);
 	}
-	mb_per_second = io_per_second * g_io_size / (1024 * 1024);
+	mb_per_second = io_per_second * job->io_size / (1024 * 1024);
 	failed_per_second = (double)job->io_failed * 1000000 / stats->io_time_in_usec;
 	timeout_per_second = (double)job->io_timeout * 1000000 / stats->io_time_in_usec;
 
@@ -295,6 +343,20 @@ verify_data(void *wr_buf, int wr_buf_len, void *rd_buf, int rd_buf_len, int bloc
 }
 
 static void
+free_job_config(void)
+{
+	struct job_config *config, *tmp;
+
+	spdk_conf_free(g_bdevperf_conf);
+	g_bdevperf_conf = NULL;
+
+	TAILQ_FOREACH_SAFE(config, &job_config_list, link, tmp) {
+		TAILQ_REMOVE(&job_config_list, config, link);
+		free(config);
+	}
+}
+
+static void
 bdevperf_test_done(void *ctx)
 {
 	struct bdevperf_job *job, *jtmp;
@@ -333,7 +395,7 @@ bdevperf_test_done(void *ctx)
 			free(task);
 		}
 
-		if (g_verify) {
+		if (job->verify) {
 			spdk_bit_array_free(&job->outstanding);
 		}
 
@@ -384,7 +446,7 @@ bdevperf_job_drain(void *ctx)
 	struct bdevperf_job *job = ctx;
 
 	spdk_poller_unregister(&job->run_timer);
-	if (g_reset) {
+	if (job->reset) {
 		spdk_poller_unregister(&job->reset_timer);
 	}
 
@@ -405,7 +467,7 @@ bdevperf_abort_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 		job->io_completed++;
 	} else {
 		job->io_failed++;
-		if (!g_continue_on_failure) {
+		if (!job->continue_on_failure) {
 			bdevperf_job_drain(job);
 			g_run_rc = -1;
 		}
@@ -439,13 +501,13 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	md_check = spdk_bdev_get_dif_type(job->bdev) == SPDK_DIF_DISABLE;
 
 	if (!success) {
-		if (!g_reset && !g_continue_on_failure) {
+		if (!job->reset && !job->continue_on_failure) {
 			bdevperf_job_drain(job);
 			g_run_rc = -1;
 			printf("task offset: %lu on job bdev=%s fails\n",
 			       task->offset_blocks, job->name);
 		}
-	} else if (g_verify || g_reset) {
+	} else if (job->verify || job->reset) {
 		spdk_bdev_io_get_iovec(bdev_io, &iovs, &iovcnt);
 		assert(iovcnt == 1);
 		assert(iovs != NULL);
@@ -469,7 +531,7 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		job->io_failed++;
 	}
 
-	if (g_verify) {
+	if (job->verify) {
 		assert(task->offset_blocks / job->io_size_blocks >= job->ios_base);
 		offset_in_ios = task->offset_blocks / job->io_size_blocks - job->ios_base;
 
@@ -608,7 +670,7 @@ bdevperf_submit_task(void *arg)
 			rc = bdevperf_generate_dif(task);
 		}
 		if (rc == 0) {
-			cb_fn = (g_verify || g_reset) ? bdevperf_verify_write_complete : bdevperf_complete;
+			cb_fn = (job->verify || job->reset) ? bdevperf_verify_write_complete : bdevperf_complete;
 
 			if (g_zcopy) {
 				spdk_bdev_zcopy_end(task->bdev_io, true, cb_fn, task);
@@ -671,7 +733,7 @@ bdevperf_submit_task(void *arg)
 		return;
 	} else if (rc != 0) {
 		printf("Failed to submit bdev_io: %d\n", rc);
-		if (g_verify) {
+		if (job->verify) {
 			assert(task->offset_blocks / job->io_size_blocks >= job->ios_base);
 			offset_in_ios = task->offset_blocks / job->io_size_blocks - job->ios_base;
 
@@ -703,8 +765,8 @@ bdevperf_zcopy_get_buf_complete(struct spdk_bdev_io *bdev_io, bool success, void
 	task->bdev_io = bdev_io;
 	task->io_type = SPDK_BDEV_IO_TYPE_WRITE;
 
-	if (g_verify || g_reset) {
-		/* When g_verify or g_reset is enabled, task->buf is used for
+	if (job->verify || job->reset) {
+		/* When job->verify or job->reset is enabled, task->buf is used for
 		 *  verification of read after write.  For write I/O, when zcopy APIs
 		 *  are used, task->buf cannot be used, and data must be written to
 		 *  the data buffer allocated underneath bdev layer instead.
@@ -764,7 +826,7 @@ bdevperf_submit_single(struct bdevperf_job *job, struct bdevperf_task *task)
 {
 	uint64_t offset_in_ios;
 
-	if (g_is_random) {
+	if (job->is_random) {
 		offset_in_ios = rand_r(&seed) % job->size_in_ios;
 	} else {
 		offset_in_ios = job->offset_in_ios++;
@@ -773,10 +835,10 @@ bdevperf_submit_single(struct bdevperf_job *job, struct bdevperf_task *task)
 		}
 
 		/* Increment of offset_in_ios if there's already an outstanding IO
-		 * to that location. We only need this with g_verify as random
-		 * offsets are not supported with g_verify at this time.
+		 * to that location. We only need this with job->verify as random
+		 * offsets are not supported with job->verify at this time.
 		 */
-		if (g_verify) {
+		if (job->verify) {
 			assert(spdk_bit_array_find_first_clear(job->outstanding, 0) != UINT32_MAX);
 
 			while (spdk_bit_array_get(job->outstanding, offset_in_ios)) {
@@ -795,7 +857,7 @@ bdevperf_submit_single(struct bdevperf_job *job, struct bdevperf_task *task)
 	 */
 	task->offset_blocks = (offset_in_ios + job->ios_base) * job->io_size_blocks;
 
-	if (g_verify || g_reset) {
+	if (job->verify || job->reset) {
 		generate_data(task->buf, job->buf_size,
 			      spdk_bdev_get_block_size(job->bdev),
 			      task->md_buf, spdk_bdev_get_md_size(job->bdev),
@@ -808,14 +870,14 @@ bdevperf_submit_single(struct bdevperf_job *job, struct bdevperf_task *task)
 			task->iov.iov_len = job->buf_size;
 			task->io_type = SPDK_BDEV_IO_TYPE_WRITE;
 		}
-	} else if (g_flush) {
+	} else if (job->flush) {
 		task->io_type = SPDK_BDEV_IO_TYPE_FLUSH;
-	} else if (g_unmap) {
+	} else if (job->unmap) {
 		task->io_type = SPDK_BDEV_IO_TYPE_UNMAP;
-	} else if (g_write_zeroes) {
+	} else if (job->write_zeroes) {
 		task->io_type = SPDK_BDEV_IO_TYPE_WRITE_ZEROES;
-	} else if ((g_rw_percentage == 100) ||
-		   (g_rw_percentage != 0 && ((rand_r(&seed) % 100) < g_rw_percentage))) {
+	} else if ((job->rw_percentage == 100) ||
+		   (job->rw_percentage != 0 && ((rand_r(&seed) % 100) < job->rw_percentage))) {
 		task->io_type = SPDK_BDEV_IO_TYPE_READ;
 	} else {
 		if (g_zcopy) {
@@ -882,7 +944,7 @@ bdevperf_timeout_cb(void *cb_arg, struct spdk_bdev_io *bdev_io)
 
 	job->io_timeout++;
 
-	if (job->is_draining || !g_abort ||
+	if (job->is_draining || !job->abort ||
 	    !spdk_bdev_io_type_supported(job->bdev, SPDK_BDEV_IO_TYPE_ABORT)) {
 		return;
 	}
@@ -910,14 +972,14 @@ bdevperf_job_run(void *ctx)
 
 	/* Start a timer to stop this I/O chain when the run is over */
 	job->run_timer = SPDK_POLLER_REGISTER(bdevperf_job_drain, job, g_time_in_usec);
-	if (g_reset) {
+	if (job->reset) {
 		job->reset_timer = SPDK_POLLER_REGISTER(reset_job, job,
 							10 * 1000000);
 	}
 
 	spdk_bdev_set_timeout(job->bdev_desc, g_timeout_in_sec, bdevperf_timeout_cb, job);
 
-	for (i = 0; i < g_queue_depth; i++) {
+	for (i = 0; i < job->queue_depth; i++) {
 		task = bdevperf_job_get_task(job);
 		bdevperf_submit_single(job, task);
 	}
@@ -1042,6 +1104,56 @@ _bdevperf_construct_job_done(void *ctx)
 	}
 }
 
+/* Checkformat will not allow to use inlined type,
+   this is a workaround */
+typedef struct spdk_thread *spdk_thread_t;
+
+static spdk_thread_t
+construct_job_thread(struct spdk_cpuset *cpumask, const char *tag)
+{
+	char thread_name[32];
+	struct spdk_cpuset tmp;
+
+	/* This function runs on the master thread. */
+	assert(g_master_thread == spdk_get_thread());
+
+	/* Handle default mask */
+	if (spdk_cpuset_count(cpumask) == 0) {
+		cpumask = &g_all_cpuset;
+	}
+
+	/* Warn user that mask might need to be changed */
+	spdk_cpuset_copy(&tmp, cpumask);
+	spdk_cpuset_or(&tmp, &g_all_cpuset);
+	if (!spdk_cpuset_equal(&tmp, &g_all_cpuset)) {
+		fprintf(stderr, "cpumask for '%s' is too big\n", tag);
+	}
+
+	snprintf(thread_name, sizeof(thread_name), "%s_%s",
+		 tag,
+		 spdk_cpuset_fmt(cpumask));
+
+	return spdk_thread_create(thread_name, cpumask);
+}
+
+static uint32_t
+_get_next_core(void)
+{
+	static uint32_t current_core = SPDK_ENV_LCORE_ID_ANY;
+
+	if (current_core == SPDK_ENV_LCORE_ID_ANY) {
+		current_core = spdk_env_get_first_core();
+		return current_core;
+	}
+
+	current_core = spdk_env_get_next_core(current_core);
+	if (current_core == SPDK_ENV_LCORE_ID_ANY) {
+		current_core = spdk_env_get_first_core();
+	}
+
+	return current_core;
+}
+
 static void
 _bdevperf_construct_job(void *ctx)
 {
@@ -1067,41 +1179,63 @@ end:
 	spdk_thread_send_msg(g_master_thread, _bdevperf_construct_job_done, NULL);
 }
 
+static void
+job_init_rw(struct bdevperf_job *job, enum job_config_rw rw)
+{
+	switch (rw) {
+	case JOB_CONFIG_RW_READ:
+		job->rw_percentage = 100;
+		break;
+	case JOB_CONFIG_RW_WRITE:
+		job->rw_percentage = 0;
+		break;
+	case JOB_CONFIG_RW_RANDREAD:
+		job->is_random = true;
+		job->rw_percentage = 100;
+		break;
+	case JOB_CONFIG_RW_RANDWRITE:
+		job->is_random = true;
+		job->rw_percentage = 0;
+		break;
+	case JOB_CONFIG_RW_RW:
+		job->is_random = false;
+		break;
+	case JOB_CONFIG_RW_RANDRW:
+		job->is_random = true;
+		break;
+	case JOB_CONFIG_RW_VERIFY:
+		job->verify = true;
+		job->rw_percentage = 50;
+		break;
+	case JOB_CONFIG_RW_RESET:
+		job->reset = true;
+		job->verify = true;
+		job->rw_percentage = 50;
+		break;
+	case JOB_CONFIG_RW_UNMAP:
+		job->unmap = true;
+		break;
+	case JOB_CONFIG_RW_FLUSH:
+		job->flush = true;
+		break;
+	case JOB_CONFIG_RW_WRITE_ZEROES:
+		job->write_zeroes = true;
+		break;
+	}
+}
+
 static int
-bdevperf_construct_job(struct spdk_bdev *bdev, struct spdk_cpuset *cpumask,
-		       uint32_t offset, uint32_t length)
+bdevperf_construct_job(struct spdk_bdev *bdev, struct job_config *config,
+		       struct spdk_thread *thread)
 {
 	struct bdevperf_job *job;
 	struct bdevperf_task *task;
 	int block_size, data_block_size;
 	int rc;
 	int task_num, n;
-	char thread_name[32];
-	struct spdk_thread *thread;
-
-	/* This function runs on the master thread. */
-	assert(g_master_thread == spdk_get_thread());
-
-	snprintf(thread_name, sizeof(thread_name), "%s_%s", spdk_bdev_get_name(bdev),
-		 spdk_cpuset_fmt(cpumask));
-
-	/* Create a new thread for the job */
-	thread = spdk_thread_create(thread_name, cpumask);
-	assert(thread != NULL);
 
 	block_size = spdk_bdev_get_block_size(bdev);
 	data_block_size = spdk_bdev_get_data_block_size(bdev);
-
-	if (g_unmap && !spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
-		printf("Skipping %s because it does not support unmap\n", spdk_bdev_get_name(bdev));
-		return -ENOTSUP;
-	}
-
-	if ((g_io_size % data_block_size) != 0) {
-		SPDK_ERRLOG("IO size (%d) is not multiples of data block size of bdev %s (%"PRIu32")\n",
-			    g_io_size, spdk_bdev_get_name(bdev), data_block_size);
-		return -ENOTSUP;
-	}
 
 	job = calloc(1, sizeof(struct bdevperf_job));
 	if (!job) {
@@ -1116,9 +1250,30 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct spdk_cpuset *cpumask,
 		return -ENOMEM;
 	}
 
+	job->workload_type = g_workload_type;
+	job->io_size = config->bs;
+	job->rw_percentage = config->rwmixread;
+	job->continue_on_failure = g_continue_on_failure;
+	job->queue_depth = config->iodepth;
 	job->bdev = bdev;
-	job->io_size_blocks = g_io_size / data_block_size;
+	job->io_size_blocks = job->io_size / data_block_size;
 	job->buf_size = job->io_size_blocks * block_size;
+	job_init_rw(job, config->rw);
+
+	if ((job->io_size % data_block_size) != 0) {
+		SPDK_ERRLOG("IO size (%d) is not multiples of data block size of bdev %s (%"PRIu32")\n",
+			    job->io_size, spdk_bdev_get_name(bdev), data_block_size);
+		free(job->name);
+		free(job);
+		return -ENOTSUP;
+	}
+
+	if (job->unmap && !spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
+		printf("Skipping %s because it does not support unmap\n", spdk_bdev_get_name(bdev));
+		free(job->name);
+		free(job);
+		return -ENOTSUP;
+	}
 
 	if (spdk_bdev_is_dif_check_enabled(bdev, SPDK_DIF_CHECK_TYPE_REFTAG)) {
 		job->dif_check_flags |= SPDK_DIF_FLAGS_REFTAG_CHECK;
@@ -1129,17 +1284,17 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct spdk_cpuset *cpumask,
 
 	job->offset_in_ios = 0;
 
-	if (length != 0) {
+	if (config->length != 0) {
 		/* Use subset of disk */
-		job->size_in_ios = length / job->io_size_blocks;
-		job->ios_base = offset / job->io_size_blocks;
+		job->size_in_ios = config->length / job->io_size_blocks;
+		job->ios_base = config->offset / job->io_size_blocks;
 	} else {
 		/* Use whole disk */
 		job->size_in_ios = spdk_bdev_get_num_blocks(bdev) / job->io_size_blocks;
 		job->ios_base = 0;
 	}
 
-	if (g_verify) {
+	if (job->verify) {
 		job->outstanding = spdk_bit_array_create(job->size_in_ios);
 		if (job->outstanding == NULL) {
 			SPDK_ERRLOG("Could not create outstanding array bitmap for bdev %s\n",
@@ -1152,12 +1307,12 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct spdk_cpuset *cpumask,
 
 	TAILQ_INIT(&job->task_list);
 
-	task_num = g_queue_depth;
-	if (g_reset) {
+	task_num = job->queue_depth;
+	if (job->reset) {
 		task_num += 1;
 	}
-	if (g_abort) {
-		task_num += g_queue_depth;
+	if (job->abort) {
+		task_num += job->queue_depth;
 	}
 
 	TAILQ_INSERT_TAIL(&g_bdevperf.jobs, job, link);
@@ -1203,16 +1358,148 @@ bdevperf_construct_job(struct spdk_bdev *bdev, struct spdk_cpuset *cpumask,
 	return rc;
 }
 
+static int
+parse_rw(const char *str, enum job_config_rw ret)
+{
+	if (str == NULL) {
+		return ret;
+	}
+
+	if (!strcmp(str, "read")) {
+		ret = JOB_CONFIG_RW_READ;
+	} else if (!strcmp(str, "randread")) {
+		ret = JOB_CONFIG_RW_RANDREAD;
+	} else if (!strcmp(str, "write")) {
+		ret = JOB_CONFIG_RW_WRITE;
+	} else if (!strcmp(str, "randwrite")) {
+		ret = JOB_CONFIG_RW_RANDWRITE;
+	} else if (!strcmp(str, "verify")) {
+		ret = JOB_CONFIG_RW_VERIFY;
+	} else if (!strcmp(str, "reset")) {
+		ret = JOB_CONFIG_RW_RESET;
+	} else if (!strcmp(str, "unmap")) {
+		ret = JOB_CONFIG_RW_UNMAP;
+	} else if (!strcmp(str, "write_zeroes")) {
+		ret = JOB_CONFIG_RW_WRITE_ZEROES;
+	} else if (!strcmp(str, "flush")) {
+		ret = JOB_CONFIG_RW_FLUSH;
+	} else if (!strcmp(str, "rw")) {
+		ret = JOB_CONFIG_RW_RW;
+	} else if (!strcmp(str, "randrw")) {
+		ret = JOB_CONFIG_RW_RANDRW;
+	} else {
+		fprintf(stderr, "rw must be one of\n"
+			"(read, write, randread, randwrite, rw, randrw, verify, reset, unmap, flush)\n");
+		ret = BDEVPERF_CONFIG_ERROR;
+	}
+
+	return ret;
+}
+
+static const char *
+config_filename_next(const char *filename, char *out)
+{
+	int i, k;
+
+	if (filename == NULL) {
+		out[0] = '\0';
+		return NULL;
+	}
+
+	if (filename[0] == ':') {
+		filename++;
+	}
+
+	for (i = 0, k = 0;
+	     filename[i] != '\0' &&
+	     filename[i] != ':' &&
+	     i < BDEVPERF_CONFIG_MAX_FILENAME;
+	     i++) {
+		if (filename[i] == ' ' || filename[i] == '\t') {
+			continue;
+		}
+
+		out[k++] = filename[i];
+	}
+	out[k] = 0;
+
+	return filename + i;
+}
+
+static void
+bdevperf_construct_config_jobs(void)
+{
+	char filename[BDEVPERF_CONFIG_MAX_FILENAME];
+	struct spdk_thread *thread;
+	struct job_config *config;
+	struct spdk_bdev *bdev;
+	const char *filenames;
+	int rc;
+
+	TAILQ_FOREACH(config, &job_config_list, link) {
+		filenames = config->filename;
+
+		thread = construct_job_thread(&config->cpumask, config->name);
+		assert(thread);
+
+		while (filenames) {
+			filenames = config_filename_next(filenames, filename);
+			if (strlen(filename) == 0) {
+				break;
+			}
+
+			bdev = spdk_bdev_get_by_name(filename);
+			if (!bdev) {
+				fprintf(stderr, "Unable to find bdev '%s'\n", filename);
+				g_run_rc = -EINVAL;
+				return;
+			}
+
+			rc = bdevperf_construct_job(bdev, config, thread);
+			if (rc < 0) {
+				g_run_rc = rc;
+				return;
+			}
+		}
+	}
+}
+
+static int
+make_cli_job_config(const char *filename, int64_t offset, int range)
+{
+	struct job_config *config = calloc(1, sizeof(*config));
+
+	if (config == NULL) {
+		fprintf(stderr, "Unable to allocate memory for job config\n");
+		return -ENOMEM;
+	}
+
+	config->name = filename;
+	config->filename = filename;
+	spdk_cpuset_zero(&config->cpumask);
+	spdk_cpuset_set_cpu(&config->cpumask, _get_next_core(), true);
+	config->bs = g_io_size;
+	config->iodepth = g_queue_depth;
+	config->rwmixread = g_rw_percentage;
+	config->offset = offset;
+	config->length = range;
+	config->rw = parse_rw(g_workload_type, BDEVPERF_CONFIG_ERROR);
+	if ((int)config->rw == BDEVPERF_CONFIG_ERROR) {
+		return -EINVAL;
+	}
+
+	TAILQ_INSERT_TAIL(&job_config_list, config, link);
+	return 0;
+}
+
 static void
 bdevperf_construct_multithread_jobs(void)
 {
 	struct spdk_bdev *bdev;
 	uint32_t i;
-	struct spdk_cpuset cpumask;
 	uint32_t num_cores;
 	uint32_t blocks_per_job;
-	uint32_t offset;
-	int rc;
+	int64_t offset;
 
 	num_cores = 0;
 	SPDK_ENV_FOREACH_CORE(i) {
@@ -1235,14 +1522,9 @@ bdevperf_construct_multithread_jobs(void)
 		offset = 0;
 
 		SPDK_ENV_FOREACH_CORE(i) {
-			spdk_cpuset_zero(&cpumask);
-			spdk_cpuset_set_cpu(&cpumask, i, true);
-
-			/* Construct the job */
-			rc = bdevperf_construct_job(bdev, &cpumask, offset, blocks_per_job);
-			if (rc < 0) {
-				g_run_rc = rc;
-				break;
+			g_run_rc = make_cli_job_config(g_job_bdev_name, offset, blocks_per_job);
+			if (g_run_rc) {
+				return;
 			}
 
 			offset += blocks_per_job;
@@ -1254,21 +1536,13 @@ bdevperf_construct_multithread_jobs(void)
 			offset = 0;
 
 			SPDK_ENV_FOREACH_CORE(i) {
-				spdk_cpuset_zero(&cpumask);
-				spdk_cpuset_set_cpu(&cpumask, i, true);
-
-				/* Construct the job */
-				rc = bdevperf_construct_job(bdev, &cpumask, offset, blocks_per_job);
-				if (rc < 0) {
-					g_run_rc = rc;
-					break;
+				g_run_rc = make_cli_job_config(spdk_bdev_get_name(bdev),
+							       offset, blocks_per_job);
+				if (g_run_rc) {
+					return;
 				}
 
 				offset += blocks_per_job;
-			}
-
-			if (g_run_rc != 0) {
-				break;
 			}
 
 			bdev = spdk_bdev_next_leaf(bdev);
@@ -1276,38 +1550,22 @@ bdevperf_construct_multithread_jobs(void)
 	}
 }
 
-static uint32_t
-_get_next_core(void)
-{
-	static uint32_t current_core = SPDK_ENV_LCORE_ID_ANY;
-
-	if (current_core == SPDK_ENV_LCORE_ID_ANY) {
-		current_core = spdk_env_get_first_core();
-		return current_core;
-	}
-
-	current_core = spdk_env_get_next_core(current_core);
-	if (current_core == SPDK_ENV_LCORE_ID_ANY) {
-		current_core = spdk_env_get_first_core();
-	}
-
-	return current_core;
-}
-
 static void
 bdevperf_construct_jobs(void)
 {
 	struct spdk_bdev *bdev;
-	uint32_t lcore;
-	struct spdk_cpuset cpumask;
-	int rc;
 
-	/* There are two entirely separate modes for allocating jobs. Standard mode
+	/* There are three different modes for allocating jobs. Standard mode
 	 * (the default) creates one spdk_thread per bdev and runs the I/O job there.
 	 *
 	 * The -C flag places bdevperf into "multithread" mode, meaning it creates
 	 * one spdk_thread per bdev PER CORE, and runs a copy of the job on each.
 	 * This runs multiple threads per bdev, effectively.
+	 *
+	 * The -j flag implies "FIO" mode which tries to mimic semantic of FIO jobs.
+	 * In "FIO" mode, threads are spawned per-job instead of per-bdev.
+	 * Each FIO job can be individually parameterized by filename, cpu mask, etc,
+	 * which is different from other modes in that they only support global options.
 	 */
 
 	/* Increment initial construct_jobs count so that it will never reach 0 in the middle
@@ -1315,7 +1573,9 @@ bdevperf_construct_jobs(void)
 	 */
 	g_construct_job_count = 1;
 
-	if (g_multithread_mode) {
+	if (g_bdevperf_conf) {
+		goto end;
+	} else if (g_multithread_mode) {
 		bdevperf_construct_multithread_jobs();
 		goto end;
 	}
@@ -1323,16 +1583,8 @@ bdevperf_construct_jobs(void)
 	if (g_job_bdev_name != NULL) {
 		bdev = spdk_bdev_get_by_name(g_job_bdev_name);
 		if (bdev) {
-			lcore = _get_next_core();
-
-			spdk_cpuset_zero(&cpumask);
-			spdk_cpuset_set_cpu(&cpumask, lcore, true);
-
 			/* Construct the job */
-			rc = bdevperf_construct_job(bdev, &cpumask, 0, 0);
-			if (rc < 0) {
-				g_run_rc = rc;
-			}
+			g_run_rc = make_cli_job_config(g_job_bdev_name, 0, 0);
 		} else {
 			fprintf(stderr, "Unable to find bdev '%s'\n", g_job_bdev_name);
 		}
@@ -1340,15 +1592,9 @@ bdevperf_construct_jobs(void)
 		bdev = spdk_bdev_first_leaf();
 
 		while (bdev != NULL) {
-			lcore = _get_next_core();
-
-			spdk_cpuset_zero(&cpumask);
-			spdk_cpuset_set_cpu(&cpumask, lcore, true);
-
 			/* Construct the job */
-			rc = bdevperf_construct_job(bdev, &cpumask, 0, 0);
-			if (rc < 0) {
-				g_run_rc = rc;
+			g_run_rc = make_cli_job_config(spdk_bdev_get_name(bdev), 0, 0);
+			if (g_run_rc) {
 				break;
 			}
 
@@ -1357,6 +1603,10 @@ bdevperf_construct_jobs(void)
 	}
 
 end:
+	if (g_run_rc == 0) {
+		bdevperf_construct_config_jobs();
+	}
+
 	if (--g_construct_job_count == 0) {
 		if (g_run_rc != 0) {
 			/* Something failed. */
@@ -1368,10 +1618,231 @@ end:
 	}
 }
 
+static int
+parse_uint_option(struct spdk_conf_section *s, const char *name, int def)
+{
+	const char *job_name;
+	int tmp;
+
+	tmp = spdk_conf_section_get_intval(s, name);
+	if (tmp == -1) {
+		/* Field was not found. Check default value
+		 * In [global] section it is ok to have undefined values
+		 * but for other sections it is not ok */
+		if (def == BDEVPERF_CONFIG_UNDEFINED) {
+			job_name = spdk_conf_section_get_name(s);
+			if (strcmp(job_name, "global") == 0) {
+				return def;
+			}
+
+			fprintf(stderr,
+				"Job '%s' has no '%s' assigned\n",
+				job_name, name);
+			return BDEVPERF_CONFIG_ERROR;
+		}
+		return def;
+	}
+
+	/* NOTE: get_intval returns nonnegative on success */
+	if (tmp < 0) {
+		fprintf(stderr, "Job '%s' has bad '%s' value.\n",
+			spdk_conf_section_get_name(s), name);
+		return BDEVPERF_CONFIG_ERROR;
+	}
+
+	return tmp;
+}
+
+/* CLI arguments override parameters for global sections */
+static void
+config_set_cli_args(struct job_config *config)
+{
+	if (g_job_bdev_name) {
+		config->filename = g_job_bdev_name;
+	}
+	if (g_io_size > 0) {
+		config->bs = g_io_size;
+	}
+	if (g_queue_depth > 0) {
+		config->iodepth = g_queue_depth;
+	}
+	if (g_rw_percentage > 0) {
+		config->rwmixread = g_rw_percentage;
+	}
+	if (g_workload_type) {
+		config->rw = parse_rw(g_workload_type, config->rw);
+	}
+}
+
+static int
+read_job_config(void)
+{
+	struct job_config global_default_config;
+	struct job_config global_config;
+	struct spdk_conf_section *s;
+	struct job_config *config;
+	const char *cpumask;
+	const char *rw;
+	bool is_global;
+	int n = 0;
+
+	if (g_bdevperf_conf_file == NULL) {
+		return 0;
+	}
+
+	g_bdevperf_conf = spdk_conf_allocate();
+	if (g_bdevperf_conf == NULL) {
+		fprintf(stderr, "Could not allocate job config structure\n");
+		return 1;
+	}
+
+	spdk_conf_disable_sections_merge(g_bdevperf_conf);
+	if (spdk_conf_read(g_bdevperf_conf, g_bdevperf_conf_file)) {
+		fprintf(stderr, "Invalid job config");
+		return 1;
+	}
+
+	/* Initialize global defaults */
+	global_default_config.filename = NULL;
+	/* Zero mask is the same as g_all_cpuset
+	 * The g_all_cpuset is not initialized yet,
+	 * so use zero mask as the default instead */
+	spdk_cpuset_zero(&global_default_config.cpumask);
+	global_default_config.bs = BDEVPERF_CONFIG_UNDEFINED;
+	global_default_config.iodepth = BDEVPERF_CONFIG_UNDEFINED;
+	/* bdevperf has no default for -M option but in FIO the default is 50 */
+	global_default_config.rwmixread = 50;
+	global_default_config.offset = 0;
+	/* length 0 means 100% */
+	global_default_config.length = 0;
+	global_default_config.rw = BDEVPERF_CONFIG_UNDEFINED;
+	config_set_cli_args(&global_default_config);
+
+	if ((int)global_default_config.rw == BDEVPERF_CONFIG_ERROR) {
+		return 1;
+	}
+
+	/* There is only a single instance of global job_config
+	 * We just reset its value when we encounter new [global] section */
+	global_config = global_default_config;
+
+	for (s = spdk_conf_first_section(g_bdevperf_conf);
+	     s != NULL;
+	     s = spdk_conf_next_section(s)) {
+		config = calloc(1, sizeof(*config));
+		if (config == NULL) {
+			fprintf(stderr, "Unable to allocate memory for job config\n");
+			return 1;
+		}
+
+		config->name = spdk_conf_section_get_name(s);
+		is_global = strcmp(config->name, "global") == 0;
+
+		if (is_global) {
+			global_config = global_default_config;
+		}
+
+		config->filename = spdk_conf_section_get_val(s, "filename");
+		if (config->filename == NULL) {
+			config->filename = global_config.filename;
+		}
+		if (!is_global) {
+			if (config->filename == NULL) {
+				fprintf(stderr, "Job '%s' expects 'filename' parameter\n", config->name);
+				goto error;
+			} else if (strnlen(config->filename, BDEVPERF_CONFIG_MAX_FILENAME)
+				   >= BDEVPERF_CONFIG_MAX_FILENAME) {
+				fprintf(stderr,
+					"filename for '%s' job is too long. Max length is %d\n",
+					config->name, BDEVPERF_CONFIG_MAX_FILENAME);
+				goto error;
+			}
+		}
+
+		cpumask = spdk_conf_section_get_val(s, "cpumask");
+		if (cpumask == NULL) {
+			config->cpumask = global_config.cpumask;
+		} else if (spdk_cpuset_parse(&config->cpumask, cpumask)) {
+			fprintf(stderr, "Job '%s' has bad 'cpumask' value\n", config->name);
+			goto error;
+		}
+
+		config->bs = parse_uint_option(s, "bs", global_config.bs);
+		if (config->bs == BDEVPERF_CONFIG_ERROR) {
+			goto error;
+		} else if (config->bs == 0) {
+			fprintf(stderr, "'bs' of job '%s' must be greater than 0\n", config->name);
+			goto error;
+		}
+
+		config->iodepth = parse_uint_option(s, "iodepth", global_config.iodepth);
+		if (config->iodepth == BDEVPERF_CONFIG_ERROR) {
+			goto error;
+		} else if (config->iodepth == 0) {
+			fprintf(stderr,
+				"'iodepth' of job '%s' must be greater than 0\n",
+				config->name);
+			goto error;
+		}
+
+		config->rwmixread = parse_uint_option(s, "rwmixread", global_config.rwmixread);
+		if (config->rwmixread == BDEVPERF_CONFIG_ERROR) {
+			goto error;
+		} else if (config->rwmixread > 100) {
+			fprintf(stderr,
+				"'rwmixread' value of '%s' job is not in 0-100 range\n",
+				config->name);
+			goto error;
+		}
+
+		config->offset = parse_uint_option(s, "offset", global_config.offset);
+		if (config->offset == BDEVPERF_CONFIG_ERROR) {
+			goto error;
+		}
+
+		config->length = parse_uint_option(s, "length", global_config.length);
+		if (config->length == BDEVPERF_CONFIG_ERROR) {
+			goto error;
+		}
+
+		rw = spdk_conf_section_get_val(s, "rw");
+		config->rw = parse_rw(rw, global_config.rw);
+		if ((int)config->rw == BDEVPERF_CONFIG_ERROR) {
+			fprintf(stderr, "Job '%s' has bad 'rw' value\n", config->name);
+			goto error;
+		} else if (!is_global && (int)config->rw == BDEVPERF_CONFIG_UNDEFINED) {
+			fprintf(stderr, "Job '%s' has no 'rw' assigned\n", config->name);
+			goto error;
+		}
+
+		if (is_global) {
+			config_set_cli_args(config);
+			global_config = *config;
+			free(config);
+		} else {
+			TAILQ_INSERT_TAIL(&job_config_list, config, link);
+			n++;
+		}
+	}
+
+	printf("Using job config with %d jobs\n", n);
+	return 0;
+error:
+	free(config);
+	return 1;
+}
+
 static void
 bdevperf_run(void *arg1)
 {
+	uint32_t i;
+
 	g_master_thread = spdk_get_thread();
+
+	spdk_cpuset_zero(&g_all_cpuset);
+	SPDK_ENV_FOREACH_CORE(i) {
+		spdk_cpuset_set_cpu(&g_all_cpuset, i, true);
+	}
 
 	if (g_wait_for_tests) {
 		/* Do not perform any tests until RPC is received */
@@ -1466,6 +1937,8 @@ bdevperf_parse_arg(int ch, char *arg)
 		g_multithread_mode = true;
 	} else if (ch == 'f') {
 		g_continue_on_failure = true;
+	} else if (ch == 'j') {
+		g_bdevperf_conf_file = optarg;
 	} else {
 		tmp = spdk_strtoll(optarg, 10);
 		if (tmp < 0) {
@@ -1527,6 +2000,7 @@ bdevperf_usage(void)
 	printf(" -z                        start bdevperf, but wait for RPC to start tests\n");
 	printf(" -A                        abort the timeout I/O\n");
 	printf(" -C                        enable every core to send I/Os to each bdev\n");
+	printf(" -j                        use job config file");
 }
 
 static int
@@ -1539,17 +2013,17 @@ verify_test_params(struct spdk_app_opts *opts)
 		opts->rpc_addr = SPDK_DEFAULT_RPC_ADDR;
 	}
 
-	if (g_queue_depth <= 0) {
+	if (!g_bdevperf_conf_file && g_queue_depth <= 0) {
 		spdk_app_usage();
 		bdevperf_usage();
 		return 1;
 	}
-	if (g_io_size <= 0) {
+	if (!g_bdevperf_conf_file && g_io_size <= 0) {
 		spdk_app_usage();
 		bdevperf_usage();
 		return 1;
 	}
-	if (!g_workload_type) {
+	if (!g_bdevperf_conf_file && !g_workload_type) {
 		spdk_app_usage();
 		bdevperf_usage();
 		return 1;
@@ -1573,43 +2047,16 @@ verify_test_params(struct spdk_app_opts *opts)
 		return 1;
 	}
 
-	if (strcmp(g_workload_type, "read") &&
-	    strcmp(g_workload_type, "write") &&
-	    strcmp(g_workload_type, "randread") &&
-	    strcmp(g_workload_type, "randwrite") &&
-	    strcmp(g_workload_type, "rw") &&
-	    strcmp(g_workload_type, "randrw") &&
-	    strcmp(g_workload_type, "verify") &&
-	    strcmp(g_workload_type, "reset") &&
-	    strcmp(g_workload_type, "unmap") &&
-	    strcmp(g_workload_type, "write_zeroes") &&
-	    strcmp(g_workload_type, "flush")) {
-		fprintf(stderr,
-			"io pattern type must be one of\n"
-			"(read, write, randread, randwrite, rw, randrw, verify, reset, unmap, flush)\n");
-		return 1;
+	if (g_io_size > SPDK_BDEV_LARGE_BUF_MAX_SIZE) {
+		printf("I/O size of %d is greater than zero copy threshold (%d).\n",
+		       g_io_size, SPDK_BDEV_LARGE_BUF_MAX_SIZE);
+		printf("Zero copy mechanism will not be used.\n");
+		g_zcopy = false;
 	}
 
-	if (!strcmp(g_workload_type, "read") ||
-	    !strcmp(g_workload_type, "randread")) {
-		g_rw_percentage = 100;
-	}
-
-	if (!strcmp(g_workload_type, "write") ||
-	    !strcmp(g_workload_type, "randwrite")) {
-		g_rw_percentage = 0;
-	}
-
-	if (!strcmp(g_workload_type, "unmap")) {
-		g_unmap = true;
-	}
-
-	if (!strcmp(g_workload_type, "write_zeroes")) {
-		g_write_zeroes = true;
-	}
-
-	if (!strcmp(g_workload_type, "flush")) {
-		g_flush = true;
+	if (g_bdevperf_conf_file) {
+		/* workload_type verification happens during config file parsing */
+		return 0;
 	}
 
 	if (!strcmp(g_workload_type, "verify") ||
@@ -1651,25 +2098,6 @@ verify_test_params(struct spdk_app_opts *opts)
 		}
 	}
 
-	if (!strcmp(g_workload_type, "read") ||
-	    !strcmp(g_workload_type, "write") ||
-	    !strcmp(g_workload_type, "rw") ||
-	    !strcmp(g_workload_type, "verify") ||
-	    !strcmp(g_workload_type, "reset") ||
-	    !strcmp(g_workload_type, "unmap") ||
-	    !strcmp(g_workload_type, "write_zeroes")) {
-		g_is_random = 0;
-	} else {
-		g_is_random = 1;
-	}
-
-	if (g_io_size > SPDK_BDEV_LARGE_BUF_MAX_SIZE) {
-		printf("I/O size of %d is greater than zero copy threshold (%d).\n",
-		       g_io_size, SPDK_BDEV_LARGE_BUF_MAX_SIZE);
-		printf("Zero copy mechanism will not be used.\n");
-		g_zcopy = false;
-	}
-
 	return 0;
 }
 
@@ -1685,18 +2113,25 @@ main(int argc, char **argv)
 	opts.reactor_mask = NULL;
 	opts.shutdown_cb = spdk_bdevperf_shutdown_cb;
 
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "xzfq:o:t:w:k:ACM:P:S:T:", NULL,
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "xzfq:o:t:w:k:ACM:P:S:T:j:", NULL,
 				      bdevperf_parse_arg, bdevperf_usage)) !=
 	    SPDK_APP_PARSE_ARGS_SUCCESS) {
 		return rc;
 	}
 
+	if (read_job_config()) {
+		free_job_config();
+		return 1;
+	}
+
 	if (verify_test_params(&opts) != 0) {
+		free_job_config();
 		exit(1);
 	}
 
 	rc = spdk_app_start(&opts, bdevperf_run, NULL);
 
 	spdk_app_fini();
+	free_job_config();
 	return rc;
 }

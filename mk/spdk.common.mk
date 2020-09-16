@@ -144,13 +144,16 @@ LIBS += -L$(CONFIG_PMDK_DIR)/src/nondebug
 COMMON_CFLAGS += -I$(CONFIG_PMDK_DIR)/src/include
 endif
 
-ifneq ($(CONFIG_VPP_DIR),)
-LIBS += -L$(CONFIG_VPP_DIR)/lib64
-COMMON_CFLAGS += -I$(CONFIG_VPP_DIR)/include
-endif
-
 ifeq ($(CONFIG_RDMA),y)
 SYS_LIBS += -libverbs -lrdmacm
+endif
+
+ifeq ($(CONFIG_URING),y)
+SYS_LIBS += -luring
+ifneq ($(strip $(CONFIG_URING_PATH)),)
+CFLAGS += -I$(CONFIG_URING_PATH)
+LDFLAGS += -L$(CONFIG_URING_PATH)
+endif
 endif
 
 IPSEC_MB_DIR=$(SPDK_ROOT_DIR)/intel-ipsec-mb
@@ -252,18 +255,21 @@ COMPILE_CXX=\
 	$(CXX) -o $@ $(DEPFLAGS) $(CXXFLAGS) -c $< && \
 	mv -f $*.d.tmp $*.d && touch -c $@
 
+ENV_LDFLAGS = $(if $(SPDK_NO_LINK_ENV),,$(ENV_LINKER_ARGS))
+
 # Link $(OBJS) and $(LIBS) into $@ (app)
 LINK_C=\
 	$(Q)echo "  LINK $(notdir $@)"; \
-	$(CC) -o $@ $(CPPFLAGS) $(LDFLAGS) $(OBJS) $(LIBS) $(ENV_LINKER_ARGS) $(SYS_LIBS)
+	$(CC) -o $@ $(CPPFLAGS) $(LDFLAGS) $(OBJS) $(LIBS) $(ENV_LDFLAGS) $(SYS_LIBS)
 
 LINK_CXX=\
 	$(Q)echo "  LINK $(notdir $@)"; \
-	$(CXX) -o $@ $(CPPFLAGS) $(LDFLAGS) $(OBJS) $(LIBS) $(ENV_LINKER_ARGS) $(SYS_LIBS)
+	$(CXX) -o $@ $(CPPFLAGS) $(LDFLAGS) $(OBJS) $(LIBS) $(ENV_LDFLAGS) $(SYS_LIBS)
 
 # Provide function to ease build of a shared lib
 define spdk_build_realname_shared_lib
 	$(CC) -o $@ -shared $(CPPFLAGS) $(LDFLAGS) \
+	    -Wl,-rpath=$(DESTDIR)/$(libdir) \
 	    -Wl,--soname,$(notdir $@) \
 	    -Wl,--whole-archive $(1) -Wl,--no-whole-archive \
 	    -Wl,--version-script=$(2) \

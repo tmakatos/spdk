@@ -94,6 +94,9 @@ struct spdk_nvmf_request {
 	struct spdk_nvmf_dif_info	dif;
 	spdk_nvmf_nvme_passthru_cmd_cb	cmd_cb_fn;
 	struct spdk_nvmf_request	*first_fused_req;
+	struct spdk_nvmf_request	*req_to_abort;
+	struct spdk_poller		*poller;
+	uint64_t			timeout_tsc;
 
 	STAILQ_ENTRY(spdk_nvmf_request)	buf_link;
 	TAILQ_ENTRY(spdk_nvmf_request)	link;
@@ -116,10 +119,12 @@ struct spdk_nvmf_qpair {
 	struct spdk_nvmf_transport		*transport;
 	struct spdk_nvmf_ctrlr			*ctrlr;
 	struct spdk_nvmf_poll_group		*group;
+	const struct spdk_nvme_transport_id	*trid;
 
 	uint16_t				qid;
 	uint16_t				sq_head;
 	uint16_t				sq_head_max;
+	bool					disconnect_started;
 
 	struct spdk_nvmf_request		*first_fused_req;
 
@@ -237,17 +242,11 @@ struct spdk_nvmf_transport_ops {
 	 * action here, as the enforcement of the association is done in the generic
 	 * code.
 	 *
-	 * The association is not considered complete until cb_fn is called. New
-	 * connections on the listener targeting this subsystem will be rejected
-	 * until that time.
-	 *
-	 * Pass a negated errno code to `cb_fn` to block the association. 0 to allow.
+	 * Returns a negated errno code to block the association. 0 to allow.
 	 */
-	void (*listen_associate)(struct spdk_nvmf_transport *transport,
-				 const struct spdk_nvmf_subsystem *subsystem,
-				 const struct spdk_nvme_transport_id *trid,
-				 spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn,
-				 void *cb_arg);
+	int (*listen_associate)(struct spdk_nvmf_transport *transport,
+				const struct spdk_nvmf_subsystem *subsystem,
+				const struct spdk_nvme_transport_id *trid);
 
 	/**
 	 * Check for new connections on the transport.
@@ -335,6 +334,15 @@ struct spdk_nvmf_transport_ops {
 				     struct spdk_nvme_transport_id *trid);
 
 	/*
+	 * Abort the request which the abort request specifies.
+	 * This function can complete synchronously or asynchronously, but
+	 * is expected to call spdk_nvmf_request_complete() in the end
+	 * for both cases.
+	 */
+	void (*qpair_abort_request)(struct spdk_nvmf_qpair *qpair,
+				    struct spdk_nvmf_request *req);
+
+	/*
 	 * Get transport poll group statistics
 	 */
 	int (*poll_group_get_stat)(struct spdk_nvmf_tgt *tgt,
@@ -396,7 +404,6 @@ int spdk_nvmf_request_get_buffers_multi(struct spdk_nvmf_request *req,
 bool spdk_nvmf_request_get_dif_ctx(struct spdk_nvmf_request *req, struct spdk_dif_ctx *dif_ctx);
 
 void spdk_nvmf_request_exec(struct spdk_nvmf_request *req);
-void spdk_nvmf_request_exec_fabrics(struct spdk_nvmf_request *req);
 int spdk_nvmf_request_free(struct spdk_nvmf_request *req);
 int spdk_nvmf_request_complete(struct spdk_nvmf_request *req);
 
@@ -416,6 +423,16 @@ void spdk_nvmf_poll_group_remove(struct spdk_nvmf_qpair *qpair);
  */
 struct spdk_nvmf_subsystem *
 spdk_nvmf_ctrlr_get_subsystem(struct spdk_nvmf_ctrlr *ctrlr);
+
+/**
+ * Get the NVMe-oF controller ID.
+ *
+ * \param ctrlr The NVMe-oF controller
+ *
+ * \return The NVMe-oF controller ID
+ */
+uint16_t
+spdk_nvmf_ctrlr_get_id(struct spdk_nvmf_ctrlr *ctrlr);
 
 static inline enum spdk_nvme_data_transfer
 spdk_nvmf_req_get_xfer(struct spdk_nvmf_request *req) {

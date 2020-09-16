@@ -145,6 +145,11 @@ extern pid_t g_spdk_nvme_pid;
  */
 #define NVME_QUIRK_MAXIMUM_PCI_ACCESS_WIDTH 0x1000
 
+/**
+ * The SSD does not support OPAL even through it sets the security bit in OACS.
+ */
+#define NVME_QUIRK_OACS_SECURITY 0x2000
+
 #define NVME_MAX_ASYNC_EVENTS	(8)
 
 #define NVME_MAX_ADMIN_TIMEOUT_IN_SECS	(30)
@@ -177,6 +182,14 @@ extern pid_t g_spdk_nvme_pid;
 #define MAX_IO_QUEUE_ENTRIES		(VALUE_2MB / spdk_max( \
 						sizeof(struct spdk_nvme_cmd), \
 						sizeof(struct spdk_nvme_cpl)))
+
+/* Default timeout for fabrics connect commands. */
+#ifdef DEBUG
+#define NVME_FABRIC_CONNECT_COMMAND_TIMEOUT 0
+#else
+/* 500 millisecond timeout. */
+#define NVME_FABRIC_CONNECT_COMMAND_TIMEOUT 500000
+#endif
 
 enum nvme_payload_type {
 	NVME_PAYLOAD_TYPE_INVALID = 0,
@@ -401,6 +414,7 @@ struct spdk_nvme_qpair {
 
 	STAILQ_HEAD(, nvme_request)		free_req;
 	STAILQ_HEAD(, nvme_request)		queued_req;
+	STAILQ_HEAD(, nvme_request)		aborting_queued_req;
 
 	/* List entry for spdk_nvme_transport_poll_group::qpairs */
 	STAILQ_ENTRY(spdk_nvme_qpair)		poll_group_stailq;
@@ -890,7 +904,7 @@ int	nvme_wait_for_completion_robust_lock(struct spdk_nvme_qpair *qpair,
 		pthread_mutex_t *robust_mutex);
 int	nvme_wait_for_completion_timeout(struct spdk_nvme_qpair *qpair,
 		struct nvme_completion_poll_status *status,
-		uint64_t timeout_in_secs);
+		uint64_t timeout_in_usecs);
 
 struct spdk_nvme_ctrlr_process *nvme_ctrlr_get_process(struct spdk_nvme_ctrlr *ctrlr,
 		pid_t pid);
@@ -928,6 +942,7 @@ void	nvme_qpair_complete_error_reqs(struct spdk_nvme_qpair *qpair);
 int	nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 				  struct nvme_request *req);
 void	nvme_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr);
+uint32_t nvme_qpair_abort_queued_reqs(struct spdk_nvme_qpair *qpair, void *cmd_cb_arg);
 void	nvme_qpair_resubmit_requests(struct spdk_nvme_qpair *qpair, uint32_t num_requests);
 
 int	nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr);
@@ -1192,6 +1207,10 @@ int nvme_transport_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nv
 int32_t nvme_transport_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 		uint32_t max_completions);
 void nvme_transport_admin_qpair_abort_aers(struct spdk_nvme_qpair *qpair);
+int nvme_transport_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
+		int (*iter_fn)(struct nvme_request *req, void *arg),
+		void *arg);
+
 struct spdk_nvme_transport_poll_group *nvme_transport_poll_group_create(
 	const struct spdk_nvme_transport *transport);
 int nvme_transport_poll_group_add(struct spdk_nvme_transport_poll_group *tgroup,

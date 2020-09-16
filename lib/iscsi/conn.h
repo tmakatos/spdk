@@ -137,8 +137,7 @@ struct spdk_iscsi_conn {
 	TAILQ_HEAD(, spdk_iscsi_pdu) write_pdu_list;
 	TAILQ_HEAD(, spdk_iscsi_pdu) snack_pdu_list;
 
-	int pending_r2t;
-	struct spdk_iscsi_task *outstanding_r2t_tasks[DEFAULT_MAXR2T];
+	uint32_t pending_r2t;
 
 	uint16_t cid;
 
@@ -189,13 +188,15 @@ struct spdk_iscsi_conn {
 	uint32_t ttt; /* target transfer tag */
 	char *partial_text_parameter;
 
-	STAILQ_ENTRY(spdk_iscsi_conn) link;
+	STAILQ_ENTRY(spdk_iscsi_conn) pg_link;
 	bool			is_stopped;  /* Set true when connection is stopped for migration */
 	TAILQ_HEAD(queued_r2t_tasks, spdk_iscsi_task)	queued_r2t_tasks;
 	TAILQ_HEAD(active_r2t_tasks, spdk_iscsi_task)	active_r2t_tasks;
 	TAILQ_HEAD(queued_datain_tasks, spdk_iscsi_task)	queued_datain_tasks;
 
 	struct spdk_iscsi_lun	*luns[SPDK_SCSI_DEV_MAX_LUN];
+
+	TAILQ_ENTRY(spdk_iscsi_conn)	conn_link;
 };
 
 extern struct spdk_iscsi_conn *g_conns_array;
@@ -205,7 +206,7 @@ void iscsi_task_mgmt_cpl(struct spdk_scsi_task *scsi_task);
 
 int initialize_iscsi_conns(void);
 void shutdown_iscsi_conns(void);
-void iscsi_conns_request_logout(struct spdk_iscsi_tgt_node *target);
+void iscsi_conns_request_logout(struct spdk_iscsi_tgt_node *target, int pg_tag);
 int iscsi_get_active_conns(struct spdk_iscsi_tgt_node *target);
 
 int iscsi_conn_construct(struct spdk_iscsi_portal *portal, struct spdk_sock *sock);
