@@ -1872,12 +1872,10 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: not found\n", trid->traddr);
 }
 
-static void
+static int
 muser_listen_associate(struct spdk_nvmf_transport *transport,
 		       const struct spdk_nvmf_subsystem *subsystem,
-		       const struct spdk_nvme_transport_id *trid,
-		       spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn,
-		       void *cb_arg)
+		       const struct spdk_nvme_transport_id *trid)
 {
 	struct muser_transport *mtransport;
 	struct muser_endpoint *muser_ep;
@@ -1891,13 +1889,12 @@ muser_listen_associate(struct spdk_nvmf_transport *transport,
 	}
 
 	if (muser_ep == NULL) {
-		cb_fn(cb_arg, -ENOENT);
-		return;
+		return -ENOENT;
 	}
 
 	muser_ep->subsystem = subsystem;
 
-	cb_fn(cb_arg, 0);
+	return 0;
 }
 
 /*
