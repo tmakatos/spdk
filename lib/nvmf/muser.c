@@ -1287,6 +1287,58 @@ muser_prop_req_rsp(struct muser_req *req, void *cb_arg)
 	return 0;
 }
 
+/*
+ * Handles a write at offset 0x1000 or more.
+ *
+ * DSTRD is set to fixed value 0 for NVMf.
+ *
+ * TODO this function won't be called when sparse mapping is used, however it
+ * might be used when we dynamically switch off polling, so I'll leave it here
+ * for now.
+ */
+static int
+handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
+		  const size_t count, loff_t pos, const bool is_write)
+{
+	assert(ctrlr != NULL);
+	assert(buf != NULL);
+
+	if (count != sizeof(uint32_t)) {
+		SPDK_ERRLOG("%s: bad doorbell buffer size %ld\n",
+			    ctrlr_id(ctrlr), count);
+		return -EINVAL;
+	}
+
+	pos -= DOORBELLS;
+
+	/* pos must be dword aligned */
+	if ((pos & 0x3) != 0) {
+		SPDK_ERRLOG("%s: bad doorbell offset %#lx\n", ctrlr_id(ctrlr), pos);
+		return -EINVAL;
+	}
+
+	/* convert byte offset to array index */
+	pos >>= 2;
+
+	if (pos > MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR * 2) {
+		/*
+		 * FIXME need to emit a "Write to Invalid Doorbell Register"
+		 * asynchronous event
+		 */
+		SPDK_ERRLOG("%s: bad doorbell index %#lx\n", ctrlr_id(ctrlr), pos);
+		return -EINVAL;
+	}
+
+	if (is_write) {
+		ctrlr->doorbells[pos] = *buf;
+		spdk_wmb();
+	} else {
+		spdk_rmb();
+		*buf = ctrlr->doorbells[pos];
+	}
+	return 0;
+}
+
 static ssize_t
 access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 	       bool is_write)
@@ -1294,6 +1346,7 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 	struct muser_endpoint *muser_ep = pvt;
 	struct muser_ctrlr *ctrlr;
 	struct muser_req *req;
+	int ret;
 
 	ctrlr = muser_ep->ctrlr;
 
@@ -1301,7 +1354,16 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 		      "%s: bar0 %s ctrlr: %p, count=%zu, pos=%"PRIX64"\n",
 		      endpoint_id(muser_ep), is_write ? "write" : "read",
 		      ctrlr, count, pos);
-	assert (pos <= DOORBELLS);
+
+	if (pos >= DOORBELLS) {
+		ret = handle_dbl_access(ctrlr, (uint32_t *)buf, count,
+					pos, is_write);
+		if (ret == 0) {
+			return count;
+		}
+		assert(ret < 0);
+		return ret;
+	}
 
 	/* Construct a Fabric Property Get/Set command and send it */
 
