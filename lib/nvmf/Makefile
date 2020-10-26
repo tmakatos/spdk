@@ -62,6 +62,11 @@ endif
 endif
 endif
 
+ifeq ($(CONFIG_VFIO_USER), y)
+C_SRCS += vfio_user.c
+LOCAL_SYS_LIBS += -lvfio-user
+endif
+
 ifeq ($(CONFIG_FC),y)
 C_SRCS += fc.c fc_ls.c
 CFLAGS += -I$(CURDIR)
