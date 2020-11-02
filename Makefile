@@ -45,6 +45,7 @@ DIRS-$(CONFIG_EXAMPLES) += examples
 DIRS-y += test
 DIRS-$(CONFIG_IPSEC_MB) += ipsecbuild
 DIRS-$(CONFIG_ISAL) += isalbuild
+DIRS-$(CONFIG_VFIO_USER) += vfiouserbuild
 
 .PHONY: all clean $(DIRS-y) include/spdk/config.h mk/config.mk \
 	cc_version cxx_version .libs_only_other .ldflags ldflags install \
@@ -76,6 +77,10 @@ endif
 ifeq ($(CONFIG_ISAL),y)
 LIB += isalbuild
 DPDK_DEPS += isalbuild
+endif
+
+ifeq ($(CONFIG_VFIO_USER),y)
+LIB += vfiouserbuild
 endif
 
 all: mk/cc.mk $(DIRS-y)
