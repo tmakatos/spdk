@@ -222,7 +222,7 @@ if [[ ${NOOP} -eq 0 ]]; then
 	export output_dir="${AUTOTEST_OUTPUT_PATH}"
 
 	# Runs agent scripts
-	"${rootdir}/autobuild.sh" "$conf"
+	sudo -E "${rootdir}/autobuild.sh" "$conf"
 	sudo -E "${rootdir}/autotest.sh" "$conf"
 	"${rootdir}/autopackage.sh" "$conf"
 	sudo -E "${rootdir}/autorun_post.py" -d "${AUTOTEST_OUTPUT_PATH}" -r "${rootdir}"

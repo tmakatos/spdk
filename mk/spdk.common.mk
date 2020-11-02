@@ -164,6 +164,11 @@ SYS_LIBS += -L$(ISAL_DIR)/.libs -lisal
 COMMON_CFLAGS += -I$(ISAL_DIR)/..
 endif
 
+VFIO_USER_DIR=$(SPDK_ROOT_DIR)/libvfio-user
+ifeq ($(CONFIG_VFIO_USER), y)
+SYS_LIBS += -lvfio-user
+endif
+
 #Attach only if FreeBSD and RDMA is specified with configure
 ifeq ($(OS),FreeBSD)
 ifeq ($(CONFIG_RDMA),y)

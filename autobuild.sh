@@ -249,7 +249,7 @@ function autobuild_test_suite() {
 	if [ "$SPDK_TEST_OCF" -eq 1 ]; then
 		run_test "autobuild_ocf_precompile" ocf_precompile
 	fi
-	run_test "autobuild_check_so_deps" $rootdir/test/make/check_so_deps.sh $1
+	run_test "autobuild_check_so_deps" sudo -E $rootdir/test/make/check_so_deps.sh $1
 	./configure $config_params --without-shared
 	run_test "scanbuild_make" scanbuild_make
 	run_test "autobuild_generated_files_check" porcelain_check
