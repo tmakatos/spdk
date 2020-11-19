@@ -427,7 +427,7 @@ map_one(lm_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *
 	 * a function to return pvt from lm_ctx_t.
 	 */
 
-	ret = lm_addr_to_sg(ctx, addr, len, sg, 1);
+	ret = lm_addr_to_sg(ctx, addr, len, sg, 1, PROT_READ | PROT_WRITE);
 	if (ret != 1) {
 		SPDK_ERRLOG("failed to map %#lx-%#lx\n", addr, addr + len);
 		errno = ret;
