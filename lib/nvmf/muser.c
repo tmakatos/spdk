@@ -1752,6 +1752,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	struct muser_transport *muser_transport;
 	struct muser_endpoint *muser_ep, *tmp;
 	char *path = NULL;
+	char uuid[PATH_MAX] = {};
 	int fd;
 	int err;
 	lm_dev_info_t dev_info = { 0 };
@@ -1804,11 +1805,11 @@ muser_listen(struct spdk_nvmf_transport *transport,
 	}
 
 	muser_ep->fd = fd;
-	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: doorbells %p\n", endpoint_id(muser_ep),
-		      muser_ep->doorbells);
+	snprintf(uuid, PATH_MAX, "%s/cntrl", endpoint_id(muser_ep));
+	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: doorbells %p\n", uuid, muser_ep->doorbells);
 
 	dev_info.pvt = muser_ep;
-	dev_info.uuid = endpoint_id(muser_ep);
+	dev_info.uuid = uuid;
 	muser_dev_info_fill(&dev_info);
 	dev_info.map_dma = &spdk_map_dma;
 	dev_info.unmap_dma = &spdk_unmap_dma;
