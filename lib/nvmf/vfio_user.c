@@ -1384,31 +1384,6 @@ access_pci_config(void *pvt, char *buf, size_t count, loff_t offset,
 	return count;
 }
 
-static unsigned long
-bar0_mmap(void *pvt, unsigned long off, unsigned long len)
-{
-	struct nvmf_vfio_user_endpoint *endpoint = pvt;
-	struct nvmf_vfio_user_ctrlr *ctrlr;
-
-	ctrlr = endpoint->ctrlr;
-
-	assert(ctrlr != NULL);
-
-	SPDK_DEBUGLOG(nvmf_vfio, "%s: map doorbells %#lx-%#lx\n",
-		      ctrlr_id(ctrlr), off, off + len);
-
-	if (off != NVMF_VFIO_USER_DOORBELLS_OFFSET || len != NVMF_VFIO_USER_DOORBELLS_SIZE) {
-		SPDK_ERRLOG("%s: bad map region %#lx-%#lx\n", ctrlr_id(ctrlr), off,
-			    off + len);
-		errno = EINVAL;
-		return (unsigned long)MAP_FAILED;
-	}
-
-	assert(ctrlr->doorbells != NULL);
-
-	return (unsigned long)ctrlr->endpoint->fd;
-}
-
 static void
 vfio_user_log(void *pvt, int level, char const *msg)
 {
@@ -1510,14 +1485,35 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_endpoint *endpoint)
 	}
 
 	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_CFG_REGION_IDX, NVME_REG_CFG_SIZE,
-			       access_pci_config, VFU_REGION_FLAG_RW, NULL, 0, NULL);
+			       access_pci_config, VFU_REGION_FLAG_RW, NULL, 0, -1);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup cfg\n", vfu_ctx);
 		return ret;
 	}
 
+#if 1
+	assert(endpoint->fd >= 0);
 	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX, NVME_REG_BAR0_SIZE,
-			       access_bar0_fn, VFU_REGION_FLAG_RW, sparse_mmap, 1, bar0_mmap);
+			       access_bar0_fn, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MMAP,
+			       sparse_mmap, 1, endpoint->fd);
+#else
+	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX, NVME_REG_BAR0_SIZE,
+			       access_bar0_fn, VFU_REGION_FLAG_RW, NULL, 0, NULL);
+#endif
+	if (ret < 0) {
+		SPDK_ERRLOG("vfu_ctx %p failed to setup bar 0\n", vfu_ctx);
+		return ret;
+	}
+
+	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR4_REGION_IDX, PAGE_SIZE,
+			       NULL, VFU_REGION_FLAG_RW, NULL, 0, -1);
+	if (ret < 0) {
+		SPDK_ERRLOG("vfu_ctx %p failed to setup bar 0\n", vfu_ctx);
+		return ret;
+	}
+
+	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR5_REGION_IDX, PAGE_SIZE,
+			       NULL, VFU_REGION_FLAG_RW, NULL, 0, -1);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup bar 0\n", vfu_ctx);
 		return ret;
@@ -1783,8 +1779,7 @@ nvmf_vfio_user_listen(struct spdk_nvmf_transport *transport,
 		err = -1;
 		goto out;
 	}
-	vfu_setup_log(endpoint->vfu_ctx, vfio_user_log,
-		      SPDK_DEBUGLOG_FLAG_ENABLED("nvmf_vfio") ? SPDK_LOG_DEBUG : SPDK_LOG_ERROR);
+	vfu_setup_log(endpoint->vfu_ctx, vfio_user_log, SPDK_LOG_DEBUG);
 
 	err = vfio_user_dev_info_fill(endpoint);
 	if (err < 0) {
@@ -2326,7 +2321,7 @@ nvmf_vfio_user_ctrlr_poll(struct nvmf_vfio_user_ctrlr *ctrlr)
 
 	/* This will call access_bar0_fn() if there are any writes
 	 * to the portion of the BAR that is not mmap'd */
-	return vfu_ctx_poll(ctrlr->endpoint->vfu_ctx);
+	return vfu_run_ctx(ctrlr->endpoint->vfu_ctx);
 }
 
 static void

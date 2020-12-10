@@ -21,11 +21,10 @@ mkdir -p /var/run/muser/domain/muser0/8
 mkdir -p /dev/shm/muser/muser0
 
 # Start the target
-"${NVMF_APP[@]}" -m 0x1 &
+"${NVMF_APP[@]}" -m 0x1 -L nvme -L nvmf -L nvmf_vfio &
 nvmfpid=$!
 echo "Process pid: $nvmfpid"
 
-trap 'killprocess $nvmfpid; exit 1' SIGINT SIGTERM EXIT
 waitforlisten $nvmfpid
 
 sleep 1
@@ -40,6 +39,8 @@ $rpc_py nvmf_subsystem_add_listener nqn.2019-07.io.spdk:cnode0 -t vfio-user -a "
 ln -s /var/run/muser/domain/muser0/8 /var/run/muser/domain/muser0/8/iommu_group
 ln -s /var/run/muser/domain/muser0/8 /var/run/muser/iommu_group/8
 ln -s /var/run/muser/domain/muser0/8/bar0 /dev/shm/muser/muser0/bar0
+
+exit
 
 $SPDK_EXAMPLE_DIR/identify -r 'trtype:CUSTOM traddr:/var/run/muser/domain/muser0/8' -d 128 -g -L nvme -L nvme_vfio -L vfio_pci
 sleep 1
