@@ -1415,6 +1415,48 @@ init_pci_config_space(vfu_pci_config_space_t *p)
 }
 
 static int
+migration_device_state_transition(vfu_ctx_t *vfu_ctx, vfu_migr_state_t state)
+{
+	assert(false);
+	return 0;
+}
+
+static __u64
+migration_get_pending_bytes(vfu_ctx_t *vfu_ctx)
+{
+	assert(false);
+	return 0;
+}
+
+static int
+migration_prepare_data(vfu_ctx_t *vfu_ctx, __u64 *offset, __u64 *size)
+{
+	assert(false);
+	return 0;
+}
+
+static size_t
+migration_read_data(vfu_ctx_t *vfu_ctx, void *buf, __u64 size, __u64 offset)
+{
+	assert(false);
+	return 0;
+}
+
+static int
+migration_data_written(vfu_ctx_t *vfu_ctx, __u64 count, __u64 offset)
+{
+	assert(false);
+	return 0;
+}
+
+static size_t
+migration_write_data(vfu_ctx_t *vfu_ctx, void *data, __u64 size, __u64 offset)
+{
+	assert(false);
+	return 0;
+}
+
+static int
 vfio_user_dev_info_fill(struct nvmf_vfio_user_endpoint *endpoint)
 {
 	int ret;
@@ -1515,6 +1557,24 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_endpoint *endpoint)
 	ret = vfu_setup_device_nr_irqs(vfu_ctx, VFU_DEV_MSIX_IRQ, NVME_IRQ_MSIX_NUM);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup MSIX\n", vfu_ctx);
+		return ret;
+	}
+
+	vfu_migration_t migration = {
+		.size = sysconf(_SC_PAGESIZE),
+		.callbacks = {
+			.transition = &migration_device_state_transition,
+			.get_pending_bytes = &migration_get_pending_bytes,
+			.prepare_data = &migration_prepare_data,
+			.read_data = &migration_read_data,
+			.data_written = &migration_data_written,
+			.write_data = &migration_write_data
+		}
+	};
+
+	ret = vfu_setup_device_migration(vfu_ctx, &migration);
+	if (ret < 0) {
+		SPDK_ERRLOG("failed to setup device migration");
 		return ret;
 	}
 

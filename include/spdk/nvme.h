@@ -3284,13 +3284,13 @@ struct spdk_nvme_transport_ops {
 
 	int (*ctrlr_enable)(struct spdk_nvme_ctrlr *ctrlr);
 
-	int (*ctrlr_set_reg_4)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value);
+	int (*ctrlr_set_reg_4)(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint32_t value);
 
-	int (*ctrlr_set_reg_8)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value);
+	int (*ctrlr_set_reg_8)(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint64_t value);
 
-	int (*ctrlr_get_reg_4)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value);
+	int (*ctrlr_get_reg_4)(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint32_t *value);
 
-	int (*ctrlr_get_reg_8)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value);
+	int (*ctrlr_get_reg_8)(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint64_t *value);
 
 	uint32_t (*ctrlr_get_max_xfer_size)(struct spdk_nvme_ctrlr *ctrlr);
 

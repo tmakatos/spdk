@@ -52,6 +52,9 @@ struct vfio_device *spdk_vfio_user_setup(const char *path);
 
 void spdk_vfio_user_release(struct vfio_device *dev);
 
+int
+spdk_vfio_user_get_migration_region(struct vfio_device *dev);
+
 #ifdef __cplusplus
 }
 #endif

@@ -42,6 +42,7 @@
 #include "spdk/vfio_user_pci.h"
 
 #include "vfio_user_internal.h"
+#include <vfio-user/libvfio-user.h>
 
 static TAILQ_HEAD(, vfio_device) g_vfio_devices = TAILQ_HEAD_INITIALIZER(g_vfio_devices);
 static uint32_t g_vfio_dev_id;
@@ -269,6 +270,25 @@ vfio_device_setup_sparse_mmaps(struct vfio_device *device, int index,
 }
 
 static int
+vfio_device_setup_migration(struct vfio_device *device, int index,
+                            struct vfio_region_info *info)
+{
+	struct vfio_info_cap_header *hdr;
+	struct vfio_region_info_cap_type *type;
+
+	hdr = vfio_device_get_info_cap(info, VFIO_REGION_INFO_CAP_TYPE);
+	if (!hdr) {
+		return -ENOENT;
+	}
+	type = (struct vfio_region_info_cap_type*)hdr;
+	if (type->type != VFIO_REGION_TYPE_MIGRATION ||
+	    type->subtype != VFIO_REGION_SUBTYPE_MIGRATION) {
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int
 vfio_device_map_region(struct vfio_device *device, struct vfio_pci_region *region, int fd)
 {
 	int prot = 0;
@@ -292,7 +312,8 @@ vfio_device_map_region(struct vfio_device *device, struct vfio_pci_region *regio
 }
 
 static int
-vfio_device_map_bars_and_config_region(struct vfio_device *device)
+vfio_device_map_bars_and_config_region(struct vfio_device *device,
+                                       int *migration_region)
 {
 	uint32_t i;
 	int ret;
@@ -323,22 +344,35 @@ vfio_device_map_bars_and_config_region(struct vfio_device *device)
 		device->regions[i].offset = info->offset;
 		device->regions[i].flags = info->flags;
 
-		SPDK_DEBUGLOG(vfio_pci, "Bar %d, Size 0x%llx, Offset 0x%llx, Flags 0x%x, Cap offset %u\n",
-			      i, info->size, info->offset, info->flags, info->cap_offset);
+		SPDK_NOTICELOG("Bar %d, Size 0x%llx, Offset 0x%llx, Flags 0x%x, Cap offset %u\n",
+			       i, info->size, info->offset, info->flags, info->cap_offset);
 
-		/* Setup MMAP if any */
-		if (info->size && (info->flags & VFIO_REGION_INFO_FLAG_MMAP)) {
-			/* try to map sparse memory region first */
-			ret = vfio_device_setup_sparse_mmaps(device, i, info, fds);
-			if (ret < 0) {
-				ret = vfio_device_map_region(device, &device->regions[i], fds[0]);
+		if (info->size) {
+			/* Setup MMAP if any */
+			if ((info->flags & VFIO_REGION_INFO_FLAG_MMAP)) {
+				/* try to map sparse memory region first */
+				ret = vfio_device_setup_sparse_mmaps(device, i, info, fds);
+				if (ret < 0) {
+					ret = vfio_device_map_region(device, &device->regions[i], fds[0]);
+				}
+
+				if (ret != 0) {
+					SPDK_ERRLOG("Setup Device %s region %d failed\n", device->name, i);
+					free(buf);
+					return ret;
+				}
 			}
 
-			if (ret != 0) {
-				SPDK_ERRLOG("Setup Device %s region %d failed\n", device->name, i);
-				free(buf);
-				return ret;
+			/* Setup migration */
+			ret = vfio_device_setup_migration(device, i, info);
+			if (ret == 0) {
+				*migration_region = i;
+			} else if (ret != -ENOENT) {
+				SPDK_ERRLOG("bad migration region %d\n", i);
+				assert(false);
 			}
+		} else {
+			SPDK_NOTICELOG("empty region %d\n", i);
 		}
 	}
 
@@ -394,10 +428,16 @@ spdk_vfio_user_setup(const char *path)
 	device->pci_regions = dev_info.num_regions;
 	device->flags = dev_info.flags;
 
-	ret = vfio_device_map_bars_and_config_region(device);
+	device->migration_region = -1;
+	ret = vfio_device_map_bars_and_config_region(device, &device->migration_region);
 	if (ret) {
 		close(device->fd);
 		goto cleanup;
+	}
+
+	if (device->migration_region < 0) {
+		SPDK_ERRLOG("no migration region\n");
+		assert(false);
 	}
 
 	/* Register DMA Region */
@@ -450,6 +490,12 @@ spdk_vfio_user_get_bar_addr(struct vfio_device *dev, uint32_t index, uint64_t of
 	}
 
 	return NULL;
+}
+
+int
+spdk_vfio_user_get_migration_region(struct vfio_device *dev)
+{
+	return dev->migration_region;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(vfio_pci)

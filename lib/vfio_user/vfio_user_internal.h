@@ -79,6 +79,8 @@ struct vfio_device {
 	struct vfio_pci_region regions[VFIO_PCI_NUM_REGIONS + 1];
 	uint64_t flags;
 
+	int migration_region;
+
 	struct spdk_mem_map *map;
 	TAILQ_HEAD(, vfio_memory_region) mrs_head;
 	uint32_t nr_mrs;

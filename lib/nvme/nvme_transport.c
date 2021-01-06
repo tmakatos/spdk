@@ -167,7 +167,7 @@ nvme_transport_ctrlr_enable(struct spdk_nvme_ctrlr *ctrlr)
 }
 
 int
-nvme_transport_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value)
+nvme_transport_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint32_t value)
 {
 	const struct spdk_nvme_transport *transport = nvme_get_transport(ctrlr->trid.trstring);
 
@@ -176,7 +176,7 @@ nvme_transport_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, u
 }
 
 int
-nvme_transport_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value)
+nvme_transport_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint64_t value)
 {
 	const struct spdk_nvme_transport *transport = nvme_get_transport(ctrlr->trid.trstring);
 
@@ -185,7 +185,7 @@ nvme_transport_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, u
 }
 
 int
-nvme_transport_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value)
+nvme_transport_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint32_t *value)
 {
 	const struct spdk_nvme_transport *transport = nvme_get_transport(ctrlr->trid.trstring);
 
@@ -194,7 +194,7 @@ nvme_transport_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, u
 }
 
 int
-nvme_transport_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value)
+nvme_transport_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint64_t *value)
 {
 	const struct spdk_nvme_transport *transport = nvme_get_transport(ctrlr->trid.trstring);
 

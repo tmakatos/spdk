@@ -40,6 +40,9 @@
 #include "nvme_internal.h"
 
 #include <linux/vfio.h>
+#include <vfio-user/vfio-user.h>
+#include "vfio-user/libvfio-user.h"
+#include <stddef.h>
 
 #define NVME_MIN_COMPLETIONS	(1)
 #define NVME_MAX_COMPLETIONS	(128)
@@ -147,7 +150,7 @@ vfio_vtophys(void *vaddr)
 	return (uint64_t)(uintptr_t)vaddr;
 }
 
-static inline struct nvme_vfio_ctrlr *
+struct nvme_vfio_ctrlr *
 nvme_vfio_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
 {
 	return SPDK_CONTAINEROF(ctrlr, struct nvme_vfio_ctrlr, ctrlr);
@@ -160,52 +163,63 @@ nvme_vfio_qpair(struct spdk_nvme_qpair *qpair)
 }
 
 static int
-nvme_vfio_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value)
+nvme_vfio_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint32_t value)
 {
 	struct nvme_vfio_ctrlr *vctrlr = nvme_vfio_ctrlr(ctrlr);
+	int region = vfu_get_region(offset, 4, &offset);
 
+	/* FIXME re-enable assert but only for BAR0 */
+#if 0
 	assert(offset <= sizeof(struct spdk_nvme_registers) - 4);
-	SPDK_DEBUGLOG(nvme_vfio, "ctrlr %s: offset 0x%x, value 0x%x\n", ctrlr->trid.traddr, offset, value);
+#endif
+	SPDK_DEBUGLOG(nvme_vfio, "ctrlr %s: region %d, offset %#lx, value %#x\n",
+	              ctrlr->trid.traddr, region, offset, value);
 
-	return spdk_vfio_user_pci_bar_access(vctrlr->dev, VFIO_PCI_BAR0_REGION_INDEX,
+	return spdk_vfio_user_pci_bar_access(vctrlr->dev, region,
 					     offset, 4, &value, true);
 }
 
 static int
-nvme_vfio_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value)
+nvme_vfio_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint64_t value)
 {
 	struct nvme_vfio_ctrlr *vctrlr = nvme_vfio_ctrlr(ctrlr);
 
 	assert(offset <= sizeof(struct spdk_nvme_registers) - 8);
-	SPDK_DEBUGLOG(nvme_vfio, "ctrlr %s: offset 0x%x, value 0x%"PRIx64"\n", ctrlr->trid.traddr, offset,
-		      value);
+	SPDK_DEBUGLOG(nvme_vfio, "ctrlr %s: offset 0x%lx, value 0x%"PRIx64"\n",
+	              ctrlr->trid.traddr, offset, value);
 
 	return spdk_vfio_user_pci_bar_access(vctrlr->dev, VFIO_PCI_BAR0_REGION_INDEX,
 					     offset, 8, &value, true);
 }
 
 static int
-nvme_vfio_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value)
+nvme_vfio_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint32_t *value)
 {
 	struct nvme_vfio_ctrlr *vctrlr = nvme_vfio_ctrlr(ctrlr);
 	int ret;
+	int region = vfu_get_region(offset, 4, &offset);
 
+	/* FIXME re-enable assert but only for BAR0 */
+#if 0
 	assert(offset <= sizeof(struct spdk_nvme_registers) - 4);
+#endif
 
-	ret = spdk_vfio_user_pci_bar_access(vctrlr->dev, VFIO_PCI_BAR0_REGION_INDEX,
-					    offset, 4, value, false);
+	ret = spdk_vfio_user_pci_bar_access(vctrlr->dev, region, offset,
+	                                    4, value, false);
 	if (ret != 0) {
-		SPDK_ERRLOG("ctrlr %p, offset %x\n", ctrlr, offset);
+		SPDK_ERRLOG("ctrlr %p, region %d, offset %lx\n", ctrlr, region,
+		            offset);
 		return ret;
 	}
 
-	SPDK_DEBUGLOG(nvme_vfio, "ctrlr %s: offset 0x%x, value 0x%x\n", ctrlr->trid.traddr, offset, *value);
+	SPDK_DEBUGLOG(nvme_vfio, "ctrlr %s: offset %#lx, value %#x\n",
+	              ctrlr->trid.traddr, offset, *value);
 
 	return 0;
 }
 
 static int
-nvme_vfio_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value)
+nvme_vfio_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint64_t offset, uint64_t *value)
 {
 	struct nvme_vfio_ctrlr *vctrlr = nvme_vfio_ctrlr(ctrlr);
 	int ret;
@@ -215,12 +229,12 @@ nvme_vfio_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64
 	ret = spdk_vfio_user_pci_bar_access(vctrlr->dev, VFIO_PCI_BAR0_REGION_INDEX,
 					    offset, 8, value, false);
 	if (ret != 0) {
-		SPDK_ERRLOG("ctrlr %p, offset %x\n", ctrlr, offset);
+		SPDK_ERRLOG("ctrlr %p, offset %lx\n", ctrlr, offset);
 		return ret;
 	}
 
-	SPDK_DEBUGLOG(nvme_vfio, "ctrlr %s: offset 0x%x, value 0x%"PRIx64"\n", ctrlr->trid.traddr, offset,
-		      *value);
+	SPDK_DEBUGLOG(nvme_vfio, "ctrlr %s: offset %#lx, value 0x%"PRIx64"\n",
+	              ctrlr->trid.traddr, offset, *value);
 
 	return 0;
 }
@@ -1440,6 +1454,12 @@ nvme_vfio_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 	}
 
 	return num_completions;
+}
+
+int
+nvme_vfio_ctrlr_get_migration_region(struct spdk_nvme_ctrlr *ctrlr)
+{
+	return spdk_vfio_user_get_migration_region(nvme_vfio_ctrlr(ctrlr)->dev);
 }
 
 const struct spdk_nvme_transport_ops vfio_ops = {
