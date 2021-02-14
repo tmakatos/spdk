@@ -139,7 +139,9 @@ mobj_ctor(struct spdk_mempool *mp, __attribute__((unused)) void *arg,
 			  ~ISCSI_DATA_BUFFER_MASK);
 }
 
-#define NUM_PDU_PER_CONNECTION(iscsi)	(2 * (iscsi->MaxQueueDepth + MAX_LARGE_DATAIN_PER_CONNECTION + 8))
+#define NUM_PDU_PER_CONNECTION(iscsi)	(2 * (iscsi->MaxQueueDepth +	\
+					 iscsi->MaxLargeDataInPerConnection +	\
+					 2 * iscsi->MaxR2TPerConnection + 8))
 #define PDU_POOL_SIZE(iscsi)		(iscsi->MaxConnections * NUM_PDU_PER_CONNECTION(iscsi))
 #define IMMEDIATE_DATA_POOL_SIZE(iscsi)	(iscsi->MaxConnections * 128)
 #define DATA_OUT_POOL_SIZE(iscsi)	(iscsi->MaxConnections * MAX_DATA_OUT_PER_CONNECTION)
@@ -376,6 +378,12 @@ iscsi_log_globals(void)
 			      "DiscoveryAuthGroup AuthGroup%d\n",
 			      g_iscsi.chap_group);
 	}
+
+	SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "MaxLargeDataInPerConnection %d\n",
+		      g_iscsi.MaxLargeDataInPerConnection);
+
+	SPDK_DEBUGLOG(SPDK_LOG_ISCSI, "MaxR2TPerConnection %d\n",
+		      g_iscsi.MaxR2TPerConnection);
 }
 
 static void
@@ -398,6 +406,8 @@ iscsi_opts_init(struct spdk_iscsi_opts *opts)
 	opts->chap_group = 0;
 	opts->authfile = NULL;
 	opts->nodebase = NULL;
+	opts->MaxLargeDataInPerConnection = DEFAULT_MAX_LARGE_DATAIN_PER_CONNECTION;
+	opts->MaxR2TPerConnection = DEFAULT_MAXR2T;
 }
 
 struct spdk_iscsi_opts *
@@ -470,6 +480,8 @@ iscsi_opts_copy(struct spdk_iscsi_opts *src)
 	dst->require_chap = src->require_chap;
 	dst->mutual_chap = src->mutual_chap;
 	dst->chap_group = src->chap_group;
+	dst->MaxLargeDataInPerConnection = src->MaxLargeDataInPerConnection;
+	dst->MaxR2TPerConnection = src->MaxR2TPerConnection;
 
 	return dst;
 }
@@ -694,6 +706,16 @@ iscsi_opts_verify(struct spdk_iscsi_opts *opts)
 		return -EINVAL;
 	}
 
+	if (opts->MaxLargeDataInPerConnection == 0) {
+		SPDK_ERRLOG("0 is invalid. MaxLargeDataInPerConnection must be more than 0\n");
+		return -EINVAL;
+	}
+
+	if (opts->MaxR2TPerConnection == 0) {
+		SPDK_ERRLOG("0 is invalid. MaxR2TPerConnection must be more than 0\n");
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
@@ -767,6 +789,8 @@ iscsi_set_global_params(struct spdk_iscsi_opts *opts)
 	g_iscsi.require_chap = opts->require_chap;
 	g_iscsi.mutual_chap = opts->mutual_chap;
 	g_iscsi.chap_group = opts->chap_group;
+	g_iscsi.MaxLargeDataInPerConnection = opts->MaxLargeDataInPerConnection;
+	g_iscsi.MaxR2TPerConnection = opts->MaxR2TPerConnection;
 
 	iscsi_log_globals();
 
@@ -1189,7 +1213,7 @@ iscsi_poll_group_poll(void *ctx)
 	int rc;
 
 	if (spdk_unlikely(STAILQ_EMPTY(&group->connections))) {
-		return 0;
+		return SPDK_POLLER_IDLE;
 	}
 
 	rc = spdk_sock_group_poll(group->sock_group);
@@ -1197,13 +1221,13 @@ iscsi_poll_group_poll(void *ctx)
 		SPDK_ERRLOG("Failed to poll sock_group=%p\n", group->sock_group);
 	}
 
-	STAILQ_FOREACH_SAFE(conn, &group->connections, link, tmp) {
+	STAILQ_FOREACH_SAFE(conn, &group->connections, pg_link, tmp) {
 		if (conn->state == ISCSI_CONN_STATE_EXITING) {
 			iscsi_conn_destruct(conn);
 		}
 	}
 
-	return rc;
+	return rc != 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 static int
@@ -1212,11 +1236,11 @@ iscsi_poll_group_handle_nop(void *ctx)
 	struct spdk_iscsi_poll_group *group = ctx;
 	struct spdk_iscsi_conn *conn, *tmp;
 
-	STAILQ_FOREACH_SAFE(conn, &group->connections, link, tmp) {
+	STAILQ_FOREACH_SAFE(conn, &group->connections, pg_link, tmp) {
 		iscsi_conn_handle_nop(conn);
 	}
 
-	return -1;
+	return SPDK_POLLER_BUSY;
 }
 
 static int
@@ -1482,6 +1506,11 @@ iscsi_opts_info_json(struct spdk_json_write_ctx *w)
 	spdk_json_write_named_bool(w, "require_chap", g_iscsi.require_chap);
 	spdk_json_write_named_bool(w, "mutual_chap", g_iscsi.mutual_chap);
 	spdk_json_write_named_int32(w, "chap_group", g_iscsi.chap_group);
+
+	spdk_json_write_named_uint32(w, "max_large_datain_per_connection",
+				     g_iscsi.MaxLargeDataInPerConnection);
+	spdk_json_write_named_uint32(w, "max_r2t_per_connection",
+				     g_iscsi.MaxR2TPerConnection);
 
 	spdk_json_write_object_end(w);
 }

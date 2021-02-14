@@ -1,11 +1,19 @@
 # Network configuration
-TARGET_INTERFACE="spdk_tgt_int"
+# There is one initiator interface and it is accessed directly.
+# There are two target interfaces and they are accessed through an namespace.
+ISCSI_BRIDGE="iscsi_br"
 INITIATOR_INTERFACE="spdk_init_int"
+INITIATOR_BRIDGE="init_br"
 TARGET_NAMESPACE="spdk_iscsi_ns"
 TARGET_NS_CMD=(ip netns exec "$TARGET_NAMESPACE")
+TARGET_INTERFACE="spdk_tgt_int"
+TARGET_INTERFACE2="spdk_tgt_int2"
+TARGET_BRIDGE="tgt_br"
+TARGET_BRIDGE2="tgt_br2"
 
 # iSCSI target configuration
 TARGET_IP=10.0.0.1
+TARGET_IP2=10.0.0.3
 INITIATOR_IP=10.0.0.2
 ISCSI_PORT=3260
 NETMASK=$INITIATOR_IP/32
@@ -13,65 +21,88 @@ INITIATOR_TAG=2
 INITIATOR_NAME=ANY
 PORTAL_TAG=1
 ISCSI_APP=("${TARGET_NS_CMD[@]}" "${ISCSI_APP[@]}")
-if [ $SPDK_TEST_VPP -eq 1 ]; then
-	ISCSI_APP+=(-L sock_vpp)
-fi
 ISCSI_TEST_CORE_MASK=0xFF
 
 function create_veth_interfaces() {
-	# $1 = test type (posix/vpp)
-	ip netns del $TARGET_NAMESPACE || true
+	ip link set $INITIATOR_BRIDGE nomaster || true
+	ip link set $TARGET_BRIDGE nomaster || true
+	ip link set $TARGET_BRIDGE2 nomaster || true
+	ip link set $INITIATOR_BRIDGE down || true
+	ip link set $TARGET_BRIDGE down || true
+	ip link set $TARGET_BRIDGE2 down || true
+	ip link delete $ISCSI_BRIDGE type bridge || true
 	ip link delete $INITIATOR_INTERFACE || true
+	"${TARGET_NS_CMD[@]}" ip link delete $TARGET_INTERFACE || true
+	"${TARGET_NS_CMD[@]}" ip link delete $TARGET_INTERFACE2 || true
+	ip netns del $TARGET_NAMESPACE || true
 
-	trap 'cleanup_veth_interfaces $1; exit 1' SIGINT SIGTERM EXIT
+	trap 'cleanup_veth_interfaces; exit 1' SIGINT SIGTERM EXIT
 
-	# Create veth (Virtual ethernet) interface pair
-	ip link add $INITIATOR_INTERFACE type veth peer name $TARGET_INTERFACE
-	ip addr add $INITIATOR_IP/24 dev $INITIATOR_INTERFACE
-	ip link set $INITIATOR_INTERFACE up
-
-	# Create and add interface for target to network namespace
+	# Create network namespace
 	ip netns add $TARGET_NAMESPACE
+
+	# Create veth (Virtual ethernet) interface pairs
+	ip link add $INITIATOR_INTERFACE type veth peer name $INITIATOR_BRIDGE
+	ip link add $TARGET_INTERFACE type veth peer name $TARGET_BRIDGE
+	ip link add $TARGET_INTERFACE2 type veth peer name $TARGET_BRIDGE2
+
+	# Associate veth interface pairs with network namespace
 	ip link set $TARGET_INTERFACE netns $TARGET_NAMESPACE
+	ip link set $TARGET_INTERFACE2 netns $TARGET_NAMESPACE
+
+	# Allocate IP addresses
+	ip addr add $INITIATOR_IP/24 dev $INITIATOR_INTERFACE
+	"${TARGET_NS_CMD[@]}" ip addr add $TARGET_IP/24 dev $TARGET_INTERFACE
+	"${TARGET_NS_CMD[@]}" ip addr add $TARGET_IP2/24 dev $TARGET_INTERFACE2
+
+	# Link up veth interfaces
+	ip link set $INITIATOR_INTERFACE up
+	ip link set $INITIATOR_BRIDGE up
+	ip link set $TARGET_BRIDGE up
+	ip link set $TARGET_BRIDGE2 up
+	"${TARGET_NS_CMD[@]}" ip link set $TARGET_INTERFACE up
+	"${TARGET_NS_CMD[@]}" ip link set $TARGET_INTERFACE2 up
+	"${TARGET_NS_CMD[@]}" ip link set lo up
+
+	# Create a bridge
+	ip link add $ISCSI_BRIDGE type bridge
+	ip link set $ISCSI_BRIDGE up
+
+	# Add veth interfaces to the bridge
+	ip link set $INITIATOR_BRIDGE master $ISCSI_BRIDGE
+	ip link set $TARGET_BRIDGE master $ISCSI_BRIDGE
+	ip link set $TARGET_BRIDGE2 master $ISCSI_BRIDGE
 
 	# Accept connections from veth interface
 	iptables -I INPUT 1 -i $INITIATOR_INTERFACE -p tcp --dport $ISCSI_PORT -j ACCEPT
 
-	"${TARGET_NS_CMD[@]}" ip link set $TARGET_INTERFACE up
-
-	if [ "$1" == "posix" ]; then
-		"${TARGET_NS_CMD[@]}" ip link set lo up
-		"${TARGET_NS_CMD[@]}" ip addr add $TARGET_IP/24 dev $TARGET_INTERFACE
-
-		# Verify connectivity
-		ping -c 1 $TARGET_IP
-		ip netns exec $TARGET_NAMESPACE ping -c 1 $INITIATOR_IP
-	else
-		start_vpp
-	fi
+	# Verify connectivity
+	ping -c 1 $TARGET_IP
+	ping -c 1 $TARGET_IP2
+	"${TARGET_NS_CMD[@]}" ping -c 1 $INITIATOR_IP
+	"${TARGET_NS_CMD[@]}" ping -c 1 $INITIATOR_IP
 }
 
 function cleanup_veth_interfaces() {
-	# $1 = test type (posix/vpp)
-	if [ "$1" == "vpp" ]; then
-		kill_vpp
-	fi
-
-	# Cleanup veth interfaces and network namespace
+	# Cleanup bridge, veth interfaces, and network namespace
 	# Note: removing one veth, removes the pair
+	ip link set $INITIATOR_BRIDGE nomaster
+	ip link set $TARGET_BRIDGE nomaster
+	ip link set $TARGET_BRIDGE2 nomaster
+	ip link set $INITIATOR_BRIDGE down
+	ip link set $TARGET_BRIDGE down
+	ip link set $TARGET_BRIDGE2 down
+	ip link delete $ISCSI_BRIDGE type bridge
 	ip link delete $INITIATOR_INTERFACE
+	"${TARGET_NS_CMD[@]}" ip link delete $TARGET_INTERFACE
+	"${TARGET_NS_CMD[@]}" ip link delete $TARGET_INTERFACE2
 	ip netns del $TARGET_NAMESPACE
 }
 
 function iscsitestinit() {
-	if [ "$1" == "iso" ]; then
+	if [ "$TEST_MODE" == "iso" ]; then
 		$rootdir/scripts/setup.sh
-		if [ -n "$2" ]; then
-			create_veth_interfaces $2
-		else
-			# default to posix
-			create_veth_interfaces "posix"
-		fi
+		create_veth_interfaces
 	fi
 }
 
@@ -91,100 +122,12 @@ function waitforiscsidevices() {
 }
 
 function iscsitestfini() {
-	if [ "$1" == "iso" ]; then
-		if [ -n "$2" ]; then
-			cleanup_veth_interfaces $2
-		else
-			# default to posix
-			cleanup_veth_interfaces "posix"
-		fi
+	if [ "$TEST_MODE" == "iso" ]; then
+		cleanup_veth_interfaces
 		$rootdir/scripts/setup.sh reset
 	fi
 }
 
-function start_vpp() {
-	# We need to make sure that posix side doesn't send jumbo packets while
-	# for VPP side maximal size of MTU for TCP is 1460 and tests doesn't work
-	# stable with larger packets
-	MTU=1460
-	MTU_W_HEADER=$((MTU + 20))
-	ip link set dev $INITIATOR_INTERFACE mtu $MTU
-	ethtool -K $INITIATOR_INTERFACE tso off
-	ethtool -k $INITIATOR_INTERFACE
-
-	# Start VPP process in SPDK target network namespace
-	"${TARGET_NS_CMD[@]}" vpp \
-		unix { nodaemon cli-listen /run/vpp/cli.sock } \
-		dpdk { no-pci } \
-		session { evt_qs_memfd_seg } \
-		socksvr { socket-name /run/vpp-api.sock } \
-		plugins { \
-		plugin default { disable } \
-		plugin dpdk_plugin.so { enable } \
-		} &
-
-	vpp_pid=$!
-	echo "VPP Process pid: $vpp_pid"
-
-	gdb_attach $vpp_pid &
-
-	# Wait until VPP starts responding
-	xtrace_disable
-	counter=40
-	while [ $counter -gt 0 ]; do
-		vppctl show version | grep -E "vpp v[0-9]+\.[0-9]+" && break
-		counter=$((counter - 1))
-		sleep 0.5
-	done
-	xtrace_restore
-	if [ $counter -eq 0 ]; then
-		return 1
-	fi
-
-	# Below VPP commands are masked with "|| true" for the sake of
-	# running the test in the CI system. For reasons unknown when
-	# run via CI these commands result in 141 return code (pipefail)
-	# even despite producing valid output.
-	# Using "|| true" does not impact the "-e" flag used in test scripts
-	# because vppctl cli commands always return with 0, even if
-	# there was an error.
-	# As a result - grep checks on command outputs must be used to
-	# verify vpp configuration and connectivity.
-
-	# Setup host interface
-	vppctl create host-interface name $TARGET_INTERFACE || true
-	VPP_TGT_INT="host-$TARGET_INTERFACE"
-	vppctl set interface state $VPP_TGT_INT up || true
-	vppctl set interface ip address $VPP_TGT_INT $TARGET_IP/24 || true
-	vppctl set interface mtu $MTU $VPP_TGT_INT || true
-
-	vppctl show interface | tr -s " " | grep -E "host-$TARGET_INTERFACE [0-9]+ up $MTU/0/0/0"
-
-	# Disable session layer
-	# NOTE: VPP net framework should enable it itself.
-	vppctl session disable || true
-
-	# Verify connectivity
-	vppctl show int addr | grep -E "$TARGET_IP/24"
-	ip addr show $INITIATOR_INTERFACE
-	ip netns exec $TARGET_NAMESPACE ip addr show $TARGET_INTERFACE
-	sleep 3
-	# SC1010: ping -M do - in this case do is an option not bash special word
-	# shellcheck disable=SC1010
-	ping -c 1 $TARGET_IP -s $((MTU - 28)) -M do
-	vppctl ping $INITIATOR_IP repeat 1 size $((MTU - (28 + 8))) verbose | grep -E "$MTU_W_HEADER bytes from $INITIATOR_IP"
-}
-
-function kill_vpp() {
-	vppctl delete host-interface name $TARGET_INTERFACE || true
-
-	# Dump VPP configuration before kill
-	vppctl show api clients || true
-	vppctl show session || true
-	vppctl show errors || true
-
-	killprocess $vpp_pid
-}
 function initiator_json_config() {
 	# Prepare config file for iSCSI initiator
 	jq . <<- JSON

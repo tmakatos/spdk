@@ -1,4 +1,6 @@
 NVMF_PORT=4420
+NVMF_SECOND_PORT=4421
+NVMF_THIRD_PORT=4422
 NVMF_IP_PREFIX="192.168.100"
 NVMF_IP_LEAST_ADDR=8
 NVMF_TCP_IP_ADDRESS="127.0.0.1"
@@ -41,6 +43,7 @@ function load_ib_rdma_modules() {
 }
 
 function detect_soft_roce_nics() {
+	rxe_cfg stop # make sure we run tests with a clean slate
 	rxe_cfg start
 }
 
@@ -222,6 +225,9 @@ function revert_soft_roce() {
 }
 
 function check_ip_is_soft_roce() {
+	if [ "$TEST_TRANSPORT" != "rdma" ]; then
+		return 0
+	fi
 	rxe_cfg status rxe | grep -wq "$1"
 }
 

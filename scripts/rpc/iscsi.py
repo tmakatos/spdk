@@ -20,7 +20,9 @@ def iscsi_set_options(
         first_burst_length=None,
         immediate_data=None,
         error_recovery_level=None,
-        allow_duplicated_isid=None):
+        allow_duplicated_isid=None,
+        max_large_datain_per_connection=None,
+        max_r2t_per_connection=None):
     """Set iSCSI target options.
 
     Args:
@@ -41,6 +43,8 @@ def iscsi_set_options(
         immediate_data: Negotiated parameter, ImmediateData
         error_recovery_level: Negotiated parameter, ErrorRecoveryLevel
         allow_duplicated_isid: Allow duplicated initiator session ID
+        max_large_datain_per_connection: Max number of outstanding split read I/Os per connection (optional)
+        max_r2t_per_connection: Max number of outstanding R2Ts per connection (optional)
 
     Returns:
         True or False
@@ -81,6 +85,10 @@ def iscsi_set_options(
         params['error_recovery_level'] = error_recovery_level
     if allow_duplicated_isid:
         params['allow_duplicated_isid'] = allow_duplicated_isid
+    if max_large_datain_per_connection:
+        params['max_large_datain_per_connection'] = max_large_datain_per_connection
+    if max_r2t_per_connection:
+        params['max_r2t_per_connection'] = max_r2t_per_connection
 
     return client.call('iscsi_set_options', params)
 
@@ -374,18 +382,63 @@ def iscsi_target_node_add_pg_ig_maps(client, pg_ig_maps, name):
     return client.call('iscsi_target_node_add_pg_ig_maps', params)
 
 
+def iscsi_target_node_set_redirect(client, name, pg_tag, redirect_host, redirect_port):
+    """Update redirect portal of the public portal group for the target node.
+
+    Args:
+        name: Target node name (ASCII)
+        pg_tag: Portal group tag (unique, integer > 0)
+        redirect_host: Numeric IP address to which the target node is redirected
+        redirect_port: Numeric TCP port to which the target node is redirected
+
+    Returns:
+        True or False
+    """
+    params = {
+        'name': name,
+        'pg_tag': pg_tag
+    }
+
+    if redirect_host:
+        params['redirect_host'] = redirect_host
+    if redirect_port:
+        params['redirect_port'] = redirect_port
+    return client.call('iscsi_target_node_set_redirect', params)
+
+
+def iscsi_target_node_request_logout(client, name, pg_tag):
+    """Request connections to the target node to logout.
+
+    Args:
+        name: Target node name (ASCII)
+        pg_tag: Portal group tag (unique, integer > 0) (optional)
+
+    Returns:
+        True or False
+    """
+    params = {'name': name}
+
+    if pg_tag:
+        params['pg_tag'] = pg_tag
+    return client.call('iscsi_target_node_request_logout', params)
+
+
 @deprecated_alias('add_portal_group')
-def iscsi_create_portal_group(client, portals, tag):
+def iscsi_create_portal_group(client, portals, tag, private):
     """Add a portal group.
 
     Args:
         portals: List of portals, e.g. [{'host': ip, 'port': port}]
         tag: Initiator group tag (unique, integer > 0)
+        private: Public (false) or private (true) portal group for login redirection.
 
     Returns:
         True or False
     """
     params = {'tag': tag, 'portals': portals}
+
+    if private:
+        params['private'] = private
     return client.call('iscsi_create_portal_group', params)
 
 

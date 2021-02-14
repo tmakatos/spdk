@@ -133,13 +133,18 @@ static int
 ftl_band_init_md(struct ftl_band *band)
 {
 	struct ftl_lba_map *lba_map = &band->lba_map;
+	int rc;
 
 	lba_map->vld = spdk_bit_array_create(ftl_get_num_blocks_in_band(band->dev));
 	if (!lba_map->vld) {
 		return -ENOMEM;
 	}
 
-	pthread_spin_init(&lba_map->lock, PTHREAD_PROCESS_PRIVATE);
+	rc = pthread_spin_init(&lba_map->lock, PTHREAD_PROCESS_PRIVATE);
+	if (rc) {
+		spdk_bit_array_free(&lba_map->vld);
+		return rc;
+	}
 	ftl_band_md_clear(band);
 	return 0;
 }
@@ -1207,11 +1212,17 @@ _ftl_io_channel_destroy_cb(void *ctx)
 {
 	struct ftl_io_channel *ioch = ctx;
 	struct spdk_ftl_dev *dev = ioch->dev;
+	uint32_t i;
 
 	/* Do not destroy the channel if some of its entries are still in use */
 	if (spdk_ring_count(ioch->free_queue) != ioch->num_entries) {
 		spdk_thread_send_msg(spdk_get_thread(), _ftl_io_channel_destroy_cb, ctx);
 		return;
+	}
+
+	/* Evict all valid entries from cache */
+	for (i = 0; i < ioch->num_entries; ++i) {
+		ftl_evict_cache_entry(dev, &ioch->wbuf_entries[i]);
 	}
 
 	spdk_poller_unregister(&ioch->poller);
@@ -1626,7 +1637,7 @@ ftl_halt_poller(void *ctx)
 		}
 	}
 
-	return 0;
+	return SPDK_POLLER_BUSY;
 }
 
 static void

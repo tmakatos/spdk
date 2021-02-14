@@ -17,6 +17,7 @@ packages=(
 	ceph
 	gdb
 	fio
+	libaio-devel
 	librbd-devel
 	kernel-devel
 	gflags-devel
@@ -56,16 +57,10 @@ packages=(
 	systemd-devel
 	smartmontools
 	wget
+	xfsprogs
 )
 
-pre_install() {
-	if [[ $INTSALL_TSOCKS == true ]]; then
-		# currently, tsocks package is retired in fedora 31, so don't exit in case
-		# installation failed
-		# FIXME: Review when fedora starts to successfully build this package again.
-		install tsocks || echo "Installation of the tsocks package failed, proxy may not be available"
-	fi
-}
+pre_install() { :; }
 
 if [[ $OSID != fedora ]]; then
 	echo "Located dnf package manager, but it was tested for Fedora only"

@@ -278,7 +278,16 @@ nvme_transport_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid
 int
 nvme_transport_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
-	return qpair->transport->ops.ctrlr_delete_io_qpair(ctrlr, qpair);
+	const struct spdk_nvme_transport *transport = nvme_get_transport(ctrlr->trid.trstring);
+
+	assert(transport != NULL);
+
+	/* Do not rely on qpair->transport.  For multi-process cases, a foreign process may delete
+	 * the IO qpair, in which case the transport object would be invalid (each process has their
+	 * own unique transport objects since they contain function pointers).  So we look up the
+	 * transport object in the delete_io_qpair case.
+	 */
+	return transport->ops.ctrlr_delete_io_qpair(ctrlr, qpair);
 }
 
 int
@@ -397,6 +406,22 @@ nvme_transport_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t
 	transport = nvme_get_transport(qpair->ctrlr->trid.trstring);
 	assert(transport != NULL);
 	return transport->ops.qpair_process_completions(qpair, max_completions);
+}
+
+int
+nvme_transport_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
+				      int (*iter_fn)(struct nvme_request *req, void *arg),
+				      void *arg)
+{
+	const struct spdk_nvme_transport *transport;
+
+	if (spdk_likely(!nvme_qpair_is_admin_queue(qpair))) {
+		return qpair->transport->ops.qpair_iterate_requests(qpair, iter_fn, arg);
+	}
+
+	transport = nvme_get_transport(qpair->ctrlr->trid.trstring);
+	assert(transport != NULL);
+	return transport->ops.qpair_iterate_requests(qpair, iter_fn, arg);
 }
 
 void

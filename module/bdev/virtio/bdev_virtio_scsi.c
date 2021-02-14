@@ -344,19 +344,21 @@ virtio_pci_scsi_dev_create(const char *name, struct virtio_pci_ctx *pci_ctx)
 					&num_queues, sizeof(num_queues));
 	if (rc) {
 		SPDK_ERRLOG("%s: config read failed: %s\n", vdev->name, spdk_strerror(-rc));
-		virtio_dev_destruct(vdev);
-		free(svdev);
-		return NULL;
+		goto fail;
 	}
 
 	rc = virtio_scsi_dev_init(svdev, num_queues);
 	if (rc != 0) {
-		virtio_dev_destruct(vdev);
-		free(svdev);
-		return NULL;
+		goto fail;
 	}
 
 	return svdev;
+
+fail:
+	vdev->ctx = NULL;
+	virtio_dev_destruct(vdev);
+	free(svdev);
+	return NULL;
 }
 
 static struct virtio_scsi_dev *
@@ -811,7 +813,7 @@ bdev_virtio_poll(void *arg)
 		if (spdk_unlikely(scan_ctx && io[i] == &scan_ctx->io_ctx)) {
 			if (svdev->removed) {
 				_virtio_scsi_dev_scan_finish(scan_ctx, -EINTR);
-				return -1;
+				return SPDK_POLLER_BUSY;
 			}
 
 			if (scan_ctx->restart) {
@@ -831,9 +833,9 @@ bdev_virtio_poll(void *arg)
 	if (spdk_unlikely(scan_ctx && scan_ctx->needs_resend)) {
 		if (svdev->removed) {
 			_virtio_scsi_dev_scan_finish(scan_ctx, -EINTR);
-			return -1;
+			return SPDK_POLLER_BUSY;
 		} else if (cnt == 0) {
-			return 0;
+			return SPDK_POLLER_IDLE;
 		}
 
 		rc = send_scan_io(scan_ctx);
@@ -1967,6 +1969,7 @@ bdev_virtio_pci_scsi_dev_create_cb(struct virtio_pci_ctx *pci_ctx, void *ctx)
 
 	rc = virtio_scsi_dev_scan(svdev, create_ctx->cb_fn, create_ctx->cb_arg);
 	if (rc) {
+		svdev->vdev.ctx = NULL;
 		virtio_scsi_dev_remove(svdev, NULL, NULL);
 	}
 

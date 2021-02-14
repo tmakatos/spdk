@@ -46,9 +46,10 @@
 #include "spdk_internal/log.h"
 #include "spdk_internal/nvme_tcp.h"
 
+#include "nvmf_internal.h"
+
 #define NVMF_TCP_MAX_ACCEPT_SOCK_ONE_TIME 16
 #define SPDK_NVMF_TCP_DEFAULT_MAX_SOCK_PRIORITY 6
-#define SPDK_NVMF_TCP_RECV_BUF_SIZE_FACTOR 4
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_tcp;
 
@@ -214,7 +215,7 @@ struct spdk_nvmf_tcp_qpair {
 	/* This is a spare PDU used for sending special management
 	 * operations. Primarily, this is used for the initial
 	 * connection response and c2h termination request. */
-	struct nvme_tcp_pdu			mgmt_pdu;
+	struct nvme_tcp_pdu			*mgmt_pdu;
 
 	TAILQ_HEAD(, nvme_tcp_pdu)		send_queue;
 
@@ -472,7 +473,8 @@ nvmf_tcp_create(struct spdk_nvmf_transport_opts *opts)
 		     "  max_io_qpairs_per_ctrlr=%d, io_unit_size=%d,\n"
 		     "  in_capsule_data_size=%d, max_aq_depth=%d\n"
 		     "  num_shared_buffers=%d, c2h_success=%d,\n"
-		     "  dif_insert_or_strip=%d, sock_priority=%d\n",
+		     "  dif_insert_or_strip=%d, sock_priority=%d\n"
+		     "  abort_timeout_sec=%d\n",
 		     opts->max_queue_depth,
 		     opts->max_io_size,
 		     opts->max_qpairs_per_ctrlr - 1,
@@ -482,7 +484,8 @@ nvmf_tcp_create(struct spdk_nvmf_transport_opts *opts)
 		     opts->num_shared_buffers,
 		     opts->c2h_success,
 		     opts->dif_insert_or_strip,
-		     opts->sock_priority);
+		     opts->sock_priority,
+		     opts->abort_timeout_sec);
 
 	if (opts->sock_priority > SPDK_NVMF_TCP_DEFAULT_MAX_SOCK_PRIORITY) {
 		SPDK_ERRLOG("Unsupported socket_priority=%d, the current range is: 0 to %d\n"
@@ -504,7 +507,7 @@ nvmf_tcp_create(struct spdk_nvmf_transport_opts *opts)
 		return NULL;
 	}
 
-	min_shared_buffers = spdk_thread_get_count() * opts->buf_cache_size;
+	min_shared_buffers = spdk_env_get_core_count() * opts->buf_cache_size;
 	if (min_shared_buffers > opts->num_shared_buffers) {
 		SPDK_ERRLOG("There are not enough buffers to satisfy"
 			    "per-poll group caches for each thread. (%" PRIu32 ")"
@@ -776,8 +779,6 @@ nvmf_tcp_qpair_init_mem_resource(struct spdk_nvmf_tcp_qpair *tqpair)
 
 	tqpair->resource_count = opts->max_queue_depth;
 
-	tqpair->mgmt_pdu.qpair = tqpair;
-
 	tqpair->reqs = calloc(tqpair->resource_count, sizeof(*tqpair->reqs));
 	if (!tqpair->reqs) {
 		SPDK_ERRLOG("Unable to allocate reqs on tqpair=%p\n", tqpair);
@@ -794,7 +795,8 @@ nvmf_tcp_qpair_init_mem_resource(struct spdk_nvmf_tcp_qpair *tqpair)
 		}
 	}
 
-	tqpair->pdus = spdk_dma_malloc(tqpair->resource_count * sizeof(*tqpair->pdus), 0x1000, NULL);
+	/* Add addtional one member, which will be used for mgmt_pdu owned by the tqpair */
+	tqpair->pdus = spdk_dma_malloc((tqpair->resource_count + 1) * sizeof(*tqpair->pdus), 0x1000, NULL);
 	if (!tqpair->pdus) {
 		SPDK_ERRLOG("Unable to allocate pdu pool on tqpair =%p.\n", tqpair);
 		return -1;
@@ -823,6 +825,9 @@ nvmf_tcp_qpair_init_mem_resource(struct spdk_nvmf_tcp_qpair *tqpair)
 		TAILQ_INSERT_TAIL(&tqpair->state_queue[tcp_req->state], tcp_req, state_link);
 		tqpair->state_cntr[TCP_REQUEST_STATE_FREE]++;
 	}
+
+	tqpair->mgmt_pdu = &tqpair->pdus[i];
+	tqpair->mgmt_pdu->qpair = tqpair;
 
 	tqpair->recv_buf_size = (in_capsule_data_size + sizeof(struct spdk_nvme_tcp_cmd) + 2 *
 				 SPDK_NVME_TCP_DIGEST_LEN) * SPDK_NVMF_TCP_RECV_BUF_SIZE_FACTOR;
@@ -890,6 +895,7 @@ nvmf_tcp_handle_connect(struct spdk_nvmf_transport *transport,
 	tqpair->state_cntr[TCP_REQUEST_STATE_FREE] = 0;
 	tqpair->port = port;
 	tqpair->qpair.transport = transport;
+	tqpair->qpair.trid = port->trid;
 
 	rc = spdk_sock_getaddr(tqpair->sock, tqpair->target_addr,
 			       sizeof(tqpair->target_addr), &tqpair->target_port,
@@ -1056,7 +1062,7 @@ nvmf_tcp_qpair_handle_timeout(void *ctx)
 		    SPDK_NVME_TCP_QPAIR_EXIT_TIMEOUT);
 
 	nvmf_tcp_qpair_disconnect(tqpair);
-	return 0;
+	return SPDK_POLLER_BUSY;
 }
 
 static void
@@ -1079,7 +1085,7 @@ nvmf_tcp_send_c2h_term_req(struct spdk_nvmf_tcp_qpair *tqpair, struct nvme_tcp_p
 	uint32_t c2h_term_req_hdr_len = sizeof(*c2h_term_req);
 	uint32_t copy_len;
 
-	rsp_pdu = &tqpair->mgmt_pdu;
+	rsp_pdu = tqpair->mgmt_pdu;
 
 	c2h_term_req = &rsp_pdu->hdr.term_req;
 	c2h_term_req->common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_C2H_TERM_REQ;
@@ -1518,7 +1524,7 @@ nvmf_tcp_icreq_handle(struct spdk_nvmf_tcp_transport *ttransport,
 	tqpair->cpda = spdk_min(ic_req->hpda, SPDK_NVME_TCP_CPDA_MAX);
 	SPDK_DEBUGLOG(SPDK_LOG_NVMF_TCP, "cpda of tqpair=(%p) is : %u\n", tqpair, tqpair->cpda);
 
-	rsp_pdu = &tqpair->mgmt_pdu;
+	rsp_pdu = tqpair->mgmt_pdu;
 
 	ic_resp = &rsp_pdu->hdr.ic_resp;
 	ic_resp->common.pdu_type = SPDK_NVME_TCP_PDU_TYPE_IC_RESP;
@@ -1785,7 +1791,7 @@ nvmf_tcp_sock_process(struct spdk_nvmf_tcp_qpair *tqpair)
 
 			rc = nvme_tcp_read_payload_data(tqpair->sock, pdu);
 			if (rc < 0) {
-				return NVME_TCP_PDU_IN_PROGRESS;
+				return NVME_TCP_PDU_FATAL;
 			}
 			pdu->readv_offset += rc;
 
@@ -2084,6 +2090,14 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 	group = &tqpair->group->group;
 	assert(tcp_req->state != TCP_REQUEST_STATE_FREE);
 
+	/* If the qpair is not active, we need to abort the outstanding requests. */
+	if (tqpair->qpair.state != SPDK_NVMF_QPAIR_ACTIVE) {
+		if (tcp_req->state == TCP_REQUEST_STATE_NEED_BUFFER) {
+			STAILQ_REMOVE(&group->pending_buf_queue, &tcp_req->req, spdk_nvmf_request, buf_link);
+		}
+		nvmf_tcp_req_set_state(tcp_req, TCP_REQUEST_STATE_COMPLETED);
+	}
+
 	/* The loop here is to allow for several back-to-back state changes. */
 	do {
 		prev_state = tcp_req->state;
@@ -2109,6 +2123,14 @@ nvmf_tcp_req_process(struct spdk_nvmf_tcp_transport *ttransport,
 
 			/* The next state transition depends on the data transfer needs of this request. */
 			tcp_req->req.xfer = spdk_nvmf_req_get_xfer(&tcp_req->req);
+
+			if (spdk_unlikely(tcp_req->req.xfer == SPDK_NVME_DATA_BIDIRECTIONAL)) {
+				tcp_req->req.rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+				tcp_req->req.rsp->nvme_cpl.status.sct = SPDK_NVME_SC_INVALID_OPCODE;
+				nvmf_tcp_req_set_state(tcp_req, TCP_REQUEST_STATE_READY_TO_COMPLETE);
+				SPDK_DEBUGLOG(SPDK_LOG_NVMF_TCP, "Request %p: invalid xfer type (BIDIRECTIONAL)\n", tcp_req);
+				break;
+			}
 
 			/* If no data to transfer, ready to execute. */
 			if (tcp_req->req.xfer == SPDK_NVME_DATA_NONE) {
@@ -2459,6 +2481,103 @@ nvmf_tcp_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 	return nvmf_tcp_qpair_get_trid(qpair, trid, 0);
 }
 
+static void
+nvmf_tcp_req_set_abort_status(struct spdk_nvmf_request *req,
+			      struct spdk_nvmf_tcp_req *tcp_req_to_abort)
+{
+	tcp_req_to_abort->req.rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+	tcp_req_to_abort->req.rsp->nvme_cpl.status.sc = SPDK_NVME_SC_ABORTED_BY_REQUEST;
+
+	nvmf_tcp_req_set_state(tcp_req_to_abort, TCP_REQUEST_STATE_READY_TO_COMPLETE);
+
+	req->rsp->nvme_cpl.cdw0 &= ~1U; /* Command was successfully aborted. */
+}
+
+static int
+_nvmf_tcp_qpair_abort_request(void *ctx)
+{
+	struct spdk_nvmf_request *req = ctx;
+	struct spdk_nvmf_tcp_req *tcp_req_to_abort = SPDK_CONTAINEROF(req->req_to_abort,
+			struct spdk_nvmf_tcp_req, req);
+	struct spdk_nvmf_tcp_qpair *tqpair = SPDK_CONTAINEROF(req->req_to_abort->qpair,
+					     struct spdk_nvmf_tcp_qpair, qpair);
+	int rc;
+
+	spdk_poller_unregister(&req->poller);
+
+	switch (tcp_req_to_abort->state) {
+	case TCP_REQUEST_STATE_EXECUTING:
+		rc = nvmf_ctrlr_abort_request(req);
+		if (rc == SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS) {
+			return SPDK_POLLER_BUSY;
+		}
+		break;
+
+	case TCP_REQUEST_STATE_NEED_BUFFER:
+		STAILQ_REMOVE(&tqpair->group->group.pending_buf_queue,
+			      &tcp_req_to_abort->req, spdk_nvmf_request, buf_link);
+
+		nvmf_tcp_req_set_abort_status(req, tcp_req_to_abort);
+		break;
+
+	case TCP_REQUEST_STATE_AWAITING_R2T_ACK:
+		nvmf_tcp_req_set_abort_status(req, tcp_req_to_abort);
+		break;
+
+	case TCP_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER:
+		if (spdk_get_ticks() < req->timeout_tsc) {
+			req->poller = SPDK_POLLER_REGISTER(_nvmf_tcp_qpair_abort_request, req, 0);
+			return SPDK_POLLER_BUSY;
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	spdk_nvmf_request_complete(req);
+	return SPDK_POLLER_BUSY;
+}
+
+static void
+nvmf_tcp_qpair_abort_request(struct spdk_nvmf_qpair *qpair,
+			     struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_tcp_qpair *tqpair;
+	struct spdk_nvmf_tcp_transport *ttransport;
+	struct spdk_nvmf_transport *transport;
+	uint16_t cid;
+	uint32_t i;
+	struct spdk_nvmf_tcp_req *tcp_req_to_abort = NULL;
+
+	tqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_tcp_qpair, qpair);
+	ttransport = SPDK_CONTAINEROF(qpair->transport, struct spdk_nvmf_tcp_transport, transport);
+	transport = &ttransport->transport;
+
+	cid = req->cmd->nvme_cmd.cdw10_bits.abort.cid;
+
+	for (i = 0; i < tqpair->resource_count; i++) {
+		tcp_req_to_abort = &tqpair->reqs[i];
+
+		if (tcp_req_to_abort->state != TCP_REQUEST_STATE_FREE &&
+		    tcp_req_to_abort->req.cmd->nvme_cmd.cid == cid) {
+			break;
+		}
+	}
+
+	if (tcp_req_to_abort == NULL) {
+		spdk_nvmf_request_complete(req);
+		return;
+	}
+
+	req->req_to_abort = &tcp_req_to_abort->req;
+	req->timeout_tsc = spdk_get_ticks() +
+			   transport->opts.abort_timeout_sec * spdk_get_ticks_hz();
+	req->poller = NULL;
+
+	_nvmf_tcp_qpair_abort_request(req);
+}
+
 #define SPDK_NVMF_TCP_DEFAULT_MAX_QUEUE_DEPTH 128
 #define SPDK_NVMF_TCP_DEFAULT_AQ_DEPTH 128
 #define SPDK_NVMF_TCP_DEFAULT_MAX_QPAIRS_PER_CTRLR 128
@@ -2470,6 +2589,7 @@ nvmf_tcp_qpair_get_listen_trid(struct spdk_nvmf_qpair *qpair,
 #define SPDK_NVMF_TCP_DEFAULT_SUCCESS_OPTIMIZATION true
 #define SPDK_NVMF_TCP_DEFAULT_DIF_INSERT_OR_STRIP false
 #define SPDK_NVMF_TCP_DEFAULT_SOCK_PRIORITY 0
+#define SPDK_NVMF_TCP_DEFAULT_ABORT_TIMEOUT_SEC 1
 
 static void
 nvmf_tcp_opts_init(struct spdk_nvmf_transport_opts *opts)
@@ -2485,6 +2605,7 @@ nvmf_tcp_opts_init(struct spdk_nvmf_transport_opts *opts)
 	opts->c2h_success =		SPDK_NVMF_TCP_DEFAULT_SUCCESS_OPTIMIZATION;
 	opts->dif_insert_or_strip =	SPDK_NVMF_TCP_DEFAULT_DIF_INSERT_OR_STRIP;
 	opts->sock_priority =		SPDK_NVMF_TCP_DEFAULT_SOCK_PRIORITY;
+	opts->abort_timeout_sec =	SPDK_NVMF_TCP_DEFAULT_ABORT_TIMEOUT_SEC;
 }
 
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_tcp = {
@@ -2514,6 +2635,7 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_tcp = {
 	.qpair_get_local_trid = nvmf_tcp_qpair_get_local_trid,
 	.qpair_get_peer_trid = nvmf_tcp_qpair_get_peer_trid,
 	.qpair_get_listen_trid = nvmf_tcp_qpair_get_listen_trid,
+	.qpair_abort_request = nvmf_tcp_qpair_abort_request,
 };
 
 SPDK_NVMF_TRANSPORT_REGISTER(tcp, &spdk_nvmf_transport_tcp);

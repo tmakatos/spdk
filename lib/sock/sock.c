@@ -146,13 +146,29 @@ sock_remove_sock_group_from_map_table(struct spdk_sock_group *group)
 
 }
 
+static int
+sock_get_placement_id(struct spdk_sock *sock)
+{
+	int rc;
+	int placement_id;
+
+	if (!sock->placement_id) {
+		rc = sock->net_impl->get_placement_id(sock, &placement_id);
+		if (!rc && (placement_id != 0)) {
+			sock->placement_id = placement_id;
+		}
+	}
+
+	return sock->placement_id;
+}
+
 int
 spdk_sock_get_optimal_sock_group(struct spdk_sock *sock, struct spdk_sock_group **group)
 {
-	int placement_id = 0, rc;
+	int placement_id;
 
-	rc = sock->net_impl->get_placement_id(sock, &placement_id);
-	if (!rc && (placement_id != 0)) {
+	placement_id = sock_get_placement_id(sock);
+	if (placement_id != 0) {
 		sock_map_lookup(placement_id, group);
 		return 0;
 	} else {
@@ -508,8 +524,8 @@ spdk_sock_group_add_sock(struct spdk_sock_group *group, struct spdk_sock *sock,
 		return -1;
 	}
 
-	rc = sock->net_impl->get_placement_id(sock, &placement_id);
-	if (!rc && (placement_id != 0)) {
+	placement_id = sock_get_placement_id(sock);
+	if (placement_id != 0) {
 		rc = sock_map_insert(placement_id, group);
 		if (rc < 0) {
 			return -1;
@@ -557,8 +573,8 @@ spdk_sock_group_remove_sock(struct spdk_sock_group *group, struct spdk_sock *soc
 
 	assert(group_impl == sock->group_impl);
 
-	rc = sock->net_impl->get_placement_id(sock, &placement_id);
-	if (!rc && (placement_id != 0)) {
+	placement_id = sock_get_placement_id(sock);
+	if (placement_id != 0) {
 		sock_map_release(placement_id);
 	}
 
@@ -749,6 +765,42 @@ spdk_sock_impl_set_opts(const char *impl_name, const struct spdk_sock_impl_opts 
 	}
 
 	return impl->set_opts(opts, len);
+}
+
+void
+spdk_sock_write_config_json(struct spdk_json_write_ctx *w)
+{
+	struct spdk_net_impl *impl;
+	struct spdk_sock_impl_opts opts;
+	size_t len;
+
+	assert(w != NULL);
+
+	spdk_json_write_array_begin(w);
+
+	STAILQ_FOREACH(impl, &g_net_impls, link) {
+		if (!impl->get_opts) {
+			continue;
+		}
+
+		len = sizeof(opts);
+		if (impl->get_opts(&opts, &len) == 0) {
+			spdk_json_write_object_begin(w);
+			spdk_json_write_named_string(w, "method", "sock_impl_set_options");
+			spdk_json_write_named_object_begin(w, "params");
+			spdk_json_write_named_string(w, "impl_name", impl->name);
+			spdk_json_write_named_uint32(w, "recv_buf_size", opts.recv_buf_size);
+			spdk_json_write_named_uint32(w, "send_buf_size", opts.send_buf_size);
+			spdk_json_write_named_bool(w, "enable_recv_pipe", opts.enable_recv_pipe);
+			spdk_json_write_named_bool(w, "enable_zerocopy_send", opts.enable_zerocopy_send);
+			spdk_json_write_object_end(w);
+			spdk_json_write_object_end(w);
+		} else {
+			SPDK_ERRLOG("Failed to get socket options for socket implementation %s\n", impl->name);
+		}
+	}
+
+	spdk_json_write_array_end(w);
 }
 
 void

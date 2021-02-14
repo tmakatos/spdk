@@ -52,6 +52,7 @@ extern "C" {
 #define SPDK_NVME_TRANSPORT_NAME_PCIE	"PCIE"
 #define SPDK_NVME_TRANSPORT_NAME_RDMA	"RDMA"
 #define SPDK_NVME_TRANSPORT_NAME_TCP	"TCP"
+#define SPDK_NVME_TRANSPORT_NAME_CUSTOM	"CUSTOM"
 
 #define SPDK_NVMF_PRIORITY_MAX_LEN 4
 
@@ -248,6 +249,12 @@ struct spdk_nvme_ctrlr_opts {
 	 * structure are valid. And the library will populate any remaining fields with default values.
 	 */
 	size_t opts_size;
+
+	/**
+	 * The amount of time to spend before timing out during fabric connect on qpairs associated with
+	 * this controller in microseconds.
+	 */
+	uint64_t fabrics_connect_timeout_us;
 };
 
 /**
@@ -1602,6 +1609,25 @@ int spdk_nvme_ctrlr_cmd_abort(struct spdk_nvme_ctrlr *ctrlr,
 			      void *cb_arg);
 
 /**
+ * Abort previously submitted commands which have cmd_cb_arg as its callback argument.
+ *
+ * \param ctrlr NVMe controller to which the commands were submitted.
+ * \param qpair NVMe queue pair to which the commands were submitted. For admin
+ * commands, pass NULL for the qpair.
+ * \param cmd_cb_arg Callback argument for the NVMe commands which this function
+ * attempts to abort.
+ * \param cb_fn Callback function to invoke when this function has completed.
+ * \param cb_arg Argument to pass to the callback function.
+ *
+ * \return 0 if successfully submitted, negated errno otherwise.
+ */
+int spdk_nvme_ctrlr_cmd_abort_ext(struct spdk_nvme_ctrlr *ctrlr,
+				  struct spdk_nvme_qpair *qpair,
+				  void *cmd_cb_arg,
+				  spdk_nvme_cmd_cb cb_fn,
+				  void *cb_arg);
+
+/**
  * Set specific feature for the given NVMe controller.
  *
  * This function is thread safe and can be called at any point while the controller
@@ -1968,6 +1994,27 @@ const struct spdk_nvme_transport_id *spdk_nvme_ctrlr_get_transport_id(
 	struct spdk_nvme_ctrlr *ctrlr);
 
 /**
+ * \brief Alloc NVMe I/O queue identifier.
+ *
+ * This function is only needed for the non-standard case of allocating queues using the raw
+ * command interface. In most cases \ref spdk_nvme_ctrlr_alloc_io_qpair should be sufficient.
+ *
+ * \param ctrlr Opaque handle to NVMe controller.
+ * \return qid on success, -1 on failure.
+ */
+int32_t spdk_nvme_ctrlr_alloc_qid(struct spdk_nvme_ctrlr *ctrlr);
+
+/**
+ * \brief Free NVMe I/O queue identifier.
+ *
+ * This function must only be called with qids previously allocated with \ref spdk_nvme_ctrlr_alloc_qid.
+ *
+ * \param ctrlr Opaque handle to NVMe controller.
+ * \param qid NVMe Queue Identifier.
+ */
+void spdk_nvme_ctrlr_free_qid(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid);
+
+/**
  * Opaque handle for a poll group. A poll group is a collection of spdk_nvme_qpair
  * objects that are polled for completions as a unit.
  *
@@ -2247,6 +2294,15 @@ uint32_t spdk_nvme_ns_get_optimal_io_boundary(struct spdk_nvme_ns *ns);
  * \return a pointer to namespace UUID, or NULL if ns does not have a UUID.
  */
 const struct spdk_uuid *spdk_nvme_ns_get_uuid(const struct spdk_nvme_ns *ns);
+
+/**
+ * Get the Command Set Identifier for the given namespace.
+ *
+ * \param ns Namespace to query.
+ *
+ * \return the namespace Command Set Identifier.
+ */
+enum spdk_nvme_csi spdk_nvme_ns_get_csi(const struct spdk_nvme_ns *ns);
 
 /**
  * \brief Namespace command support flags.
@@ -2975,6 +3031,22 @@ void spdk_nvme_qpair_print_command(struct spdk_nvme_qpair *qpair,
 void spdk_nvme_qpair_print_completion(struct spdk_nvme_qpair *qpair,
 				      struct spdk_nvme_cpl *cpl);
 
+/**
+ * \brief Prints (SPDK_NOTICELOG) the contents of an NVMe submission queue entry (command).
+ *
+ * \param qid Queue identifier.
+ * \param cmd Pointer to the submission queue command to be formatted.
+ */
+void spdk_nvme_print_command(uint16_t qid, struct spdk_nvme_cmd *cmd);
+
+/**
+ * \brief Prints (SPDK_NOTICELOG) the contents of an NVMe completion queue entry.
+ *
+ * \param qid Queue identifier.
+ * \param cpl Pointer to the completion queue element to be formatted.
+ */
+void spdk_nvme_print_completion(uint16_t qid, struct spdk_nvme_cpl *cpl);
+
 struct ibv_context;
 struct ibv_pd;
 struct ibv_mr;
@@ -3151,6 +3223,10 @@ struct spdk_nvme_transport_ops {
 	int (*qpair_submit_request)(struct spdk_nvme_qpair *qpair, struct nvme_request *req);
 
 	int32_t (*qpair_process_completions)(struct spdk_nvme_qpair *qpair, uint32_t max_completions);
+
+	int (*qpair_iterate_requests)(struct spdk_nvme_qpair *qpair,
+				      int (*iter_fn)(struct nvme_request *req, void *arg),
+				      void *arg);
 
 	void (*admin_qpair_abort_aers)(struct spdk_nvme_qpair *qpair);
 

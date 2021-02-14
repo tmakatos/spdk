@@ -49,8 +49,6 @@
 
 #define MAX_TMPBUF 1024
 #define PORTNUMLEN 32
-#define MIN_SO_RCVBUF_SIZE (2 * 1024 * 1024)
-#define MIN_SO_SNDBUF_SIZE (2 * 1024 * 1024)
 #define IOV_BATCH_SIZE 64
 
 #if defined(SO_ZEROCOPY) && defined(MSG_ZEROCOPY)
@@ -68,6 +66,7 @@ struct spdk_posix_sock {
 	void			*recv_buf;
 	int			recv_buf_sz;
 	bool			pending_recv;
+	int			so_priority;
 
 	TAILQ_ENTRY(spdk_posix_sock)	link;
 };
@@ -80,7 +79,11 @@ struct spdk_posix_sock_group_impl {
 
 static struct spdk_sock_impl_opts g_spdk_posix_sock_impl_opts = {
 	.recv_buf_size = MIN_SO_RCVBUF_SIZE,
-	.send_buf_size = MIN_SO_SNDBUF_SIZE
+	.send_buf_size = MIN_SO_SNDBUF_SIZE,
+	.enable_recv_pipe = true,
+	.enable_zerocopy_send = true,
+	.enable_quickack = false,
+	.enable_placement_id = false,
 };
 
 static int
@@ -266,9 +269,11 @@ posix_sock_set_recvbuf(struct spdk_sock *_sock, int sz)
 
 	assert(sock != NULL);
 
-	rc = posix_sock_alloc_pipe(sock, sz);
-	if (rc) {
-		return rc;
+	if (g_spdk_posix_sock_impl_opts.enable_recv_pipe) {
+		rc = posix_sock_alloc_pipe(sock, sz);
+		if (rc) {
+			return rc;
+		}
 	}
 
 	/* Set kernel buffer size to be at least MIN_SO_RCVBUF_SIZE */
@@ -308,9 +313,9 @@ static struct spdk_posix_sock *
 posix_sock_alloc(int fd, bool enable_zero_copy)
 {
 	struct spdk_posix_sock *sock;
-#ifdef SPDK_ZEROCOPY
-	int rc;
+#if defined(SPDK_ZEROCOPY) || defined(__linux__)
 	int flag;
+	int rc;
 #endif
 
 	sock = calloc(1, sizeof(*sock));
@@ -321,16 +326,28 @@ posix_sock_alloc(int fd, bool enable_zero_copy)
 
 	sock->fd = fd;
 
-#ifdef SPDK_ZEROCOPY
-	if (!enable_zero_copy) {
+#if defined(SPDK_ZEROCOPY)
+	flag = 1;
+
+	if (!enable_zero_copy || !g_spdk_posix_sock_impl_opts.enable_zerocopy_send) {
 		return sock;
 	}
 
 	/* Try to turn on zero copy sends */
-	flag = 1;
 	rc = setsockopt(sock->fd, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag));
 	if (rc == 0) {
 		sock->zcopy = true;
+	}
+#endif
+
+#if defined(__linux__)
+	flag = 1;
+
+	if (g_spdk_posix_sock_impl_opts.enable_quickack) {
+		rc = setsockopt(sock->fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag));
+		if (rc != 0) {
+			SPDK_ERRLOG("quickack was failed to set\n");
+		}
 	}
 #endif
 
@@ -422,7 +439,7 @@ posix_sock_create(const char *ip, int port,
 	hints.ai_flags |= AI_NUMERICHOST;
 	rc = getaddrinfo(ip, portnum, &hints, &res0);
 	if (rc != 0) {
-		SPDK_ERRLOG("getaddrinfo() failed (errno=%d)\n", errno);
+		SPDK_ERRLOG("getaddrinfo() failed %s (%d)\n", gai_strerror(rc), rc);
 		return NULL;
 	}
 
@@ -552,6 +569,9 @@ retry:
 		return NULL;
 	}
 
+	if (opts != NULL) {
+		sock->so_priority = opts->priority;
+	}
 	return &sock->base;
 }
 
@@ -614,6 +634,7 @@ posix_sock_accept(struct spdk_sock *_sock)
 		close(fd);
 		return NULL;
 	}
+	new_sock->so_priority = sock->base.opts.priority;
 
 	return &new_sock->base;
 }
@@ -780,13 +801,19 @@ _sock_flush(struct spdk_sock *sock)
 	}
 	rc = sendmsg(psock->fd, &msg, flags);
 	if (rc <= 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK || (errno == ENOBUFS && psock->zcopy)) {
 			return 0;
 		}
 		return rc;
 	}
 
-	psock->sendmsg_idx++;
+	/* Handling overflow case, because we use psock->sendmsg_idx - 1 for the
+	 * req->internal.offset, so sendmsg_idx should not be zero  */
+	if (spdk_unlikely(psock->sendmsg_idx == UINT32_MAX)) {
+		psock->sendmsg_idx = 1;
+	} else {
+		psock->sendmsg_idx++;
+	}
 
 	/* Consume the requests that were actually written */
 	req = TAILQ_FIRST(&sock->queued_reqs);
@@ -1077,6 +1104,10 @@ posix_sock_get_placement_id(struct spdk_sock *_sock, int *placement_id)
 {
 	int rc = -1;
 
+	if (!g_spdk_posix_sock_impl_opts.enable_placement_id) {
+		return rc;
+	}
+
 #if defined(SO_INCOMING_NAPI_ID)
 	struct spdk_posix_sock *sock = __posix_sock(_sock);
 	socklen_t salen = sizeof(int);
@@ -1225,6 +1256,17 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 
 	if (num_events == -1) {
 		return -1;
+	} else if (num_events == 0 && !TAILQ_EMPTY(&_group->socks)) {
+		uint8_t byte;
+
+		sock = TAILQ_FIRST(&_group->socks);
+		psock = __posix_sock(sock);
+		/* a recv is done here to busy poll the queue associated with
+		 * first socket in list and potentially reap incoming data.
+		 */
+		if (psock->so_priority) {
+			recv(psock->fd, &byte, 1, MSG_PEEK);
+		}
 	}
 
 	for (i = 0; i < num_events; i++) {
@@ -1309,13 +1351,19 @@ posix_sock_impl_get_opts(struct spdk_sock_impl_opts *opts, size_t *len)
 #define FIELD_OK(field) \
 	offsetof(struct spdk_sock_impl_opts, field) + sizeof(opts->field) <= *len
 
-	if (FIELD_OK(recv_buf_size)) {
-		opts->recv_buf_size = g_spdk_posix_sock_impl_opts.recv_buf_size;
-	}
-	if (FIELD_OK(send_buf_size)) {
-		opts->send_buf_size = g_spdk_posix_sock_impl_opts.send_buf_size;
+#define GET_FIELD(field) \
+	if (FIELD_OK(field)) { \
+		opts->field = g_spdk_posix_sock_impl_opts.field; \
 	}
 
+	GET_FIELD(recv_buf_size);
+	GET_FIELD(send_buf_size);
+	GET_FIELD(enable_recv_pipe);
+	GET_FIELD(enable_zerocopy_send);
+	GET_FIELD(enable_quickack);
+	GET_FIELD(enable_placement_id);
+
+#undef GET_FIELD
 #undef FIELD_OK
 
 	*len = spdk_min(*len, sizeof(g_spdk_posix_sock_impl_opts));
@@ -1333,13 +1381,19 @@ posix_sock_impl_set_opts(const struct spdk_sock_impl_opts *opts, size_t len)
 #define FIELD_OK(field) \
 	offsetof(struct spdk_sock_impl_opts, field) + sizeof(opts->field) <= len
 
-	if (FIELD_OK(recv_buf_size)) {
-		g_spdk_posix_sock_impl_opts.recv_buf_size = opts->recv_buf_size;
-	}
-	if (FIELD_OK(send_buf_size)) {
-		g_spdk_posix_sock_impl_opts.send_buf_size = opts->send_buf_size;
+#define SET_FIELD(field) \
+	if (FIELD_OK(field)) { \
+		g_spdk_posix_sock_impl_opts.field = opts->field; \
 	}
 
+	SET_FIELD(recv_buf_size);
+	SET_FIELD(send_buf_size);
+	SET_FIELD(enable_recv_pipe);
+	SET_FIELD(enable_zerocopy_send);
+	SET_FIELD(enable_quickack);
+	SET_FIELD(enable_placement_id);
+
+#undef SET_FIELD
 #undef FIELD_OK
 
 	return 0;

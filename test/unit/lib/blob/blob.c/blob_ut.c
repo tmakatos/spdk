@@ -47,8 +47,8 @@
 
 struct spdk_blob_store *g_bs;
 spdk_blob_id g_blobid;
-struct spdk_blob *g_blob;
-int g_bserrno;
+struct spdk_blob *g_blob, *g_blob2;
+int g_bserrno, g_bserrno2;
 struct spdk_xattr_names *g_names;
 int g_done;
 char *g_xattr_names[] = {"first", "second", "third"};
@@ -168,6 +168,18 @@ blob_op_with_handle_complete(void *cb_arg, struct spdk_blob *blb, int bserrno)
 {
 	g_blob = blb;
 	g_bserrno = bserrno;
+}
+
+static void
+blob_op_with_handle_complete2(void *cb_arg, struct spdk_blob *blob, int bserrno)
+{
+	if (g_blob == NULL) {
+		g_blob = blob;
+		g_bserrno = bserrno;
+	} else {
+		g_blob2 = blob;
+		g_bserrno2 = bserrno;
+	}
 }
 
 static void
@@ -322,8 +334,32 @@ blob_open(void)
 	CU_ASSERT(g_bserrno == 0);
 	CU_ASSERT(g_blob != NULL);
 	blob = g_blob;
+	spdk_blob_close(blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
 
-	ut_blob_close_and_delete(bs, blob);
+	/* Try to open file twice in succession.  This should return the same
+	 * blob object.
+	 */
+	g_blob = NULL;
+	g_blob2 = NULL;
+	g_bserrno = -1;
+	g_bserrno2 = -1;
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete2, NULL);
+	spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete2, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+	CU_ASSERT(g_bserrno2 == 0);
+	CU_ASSERT(g_blob != NULL);
+	CU_ASSERT(g_blob2 != NULL);
+	CU_ASSERT(g_blob == g_blob2);
+
+	g_bserrno = -1;
+	spdk_blob_close(g_blob, blob_op_complete, NULL);
+	poll_threads();
+	CU_ASSERT(g_bserrno == 0);
+
+	ut_blob_close_and_delete(bs, g_blob);
 }
 
 static void
@@ -405,6 +441,36 @@ blob_create(void)
 	spdk_bs_create_blob_ext(bs, &opts, blob_op_with_id_complete, NULL);
 	poll_threads();
 	CU_ASSERT(g_bserrno == -ENOSPC);
+}
+
+/*
+ * Create and delete one blob in a loop over and over again.  This helps ensure
+ * that the internal bit masks tracking used clusters and md_pages are being
+ * tracked correctly.
+ */
+static void
+blob_create_loop(void)
+{
+	struct spdk_blob_store *bs = g_bs;
+	struct spdk_blob_opts opts;
+	uint32_t i, loop_count;
+
+	loop_count = 4 * spdk_max(spdk_bit_array_capacity(bs->used_md_pages),
+				  spdk_bit_pool_capacity(bs->used_clusters));
+
+	for (i = 0; i < loop_count; i++) {
+		ut_spdk_blob_opts_init(&opts);
+		opts.num_clusters = 1;
+		g_bserrno = -1;
+		g_blobid = SPDK_BLOBID_INVALID;
+		spdk_bs_create_blob_ext(bs, &opts, blob_op_with_id_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+		CU_ASSERT(g_blobid != SPDK_BLOBID_INVALID);
+		spdk_bs_delete_blob(bs, g_blobid, blob_op_complete, NULL);
+		poll_threads();
+		CU_ASSERT(g_bserrno == 0);
+	}
 }
 
 static void
@@ -5351,8 +5417,8 @@ blob_delete_snapshot_power_failure(void)
 		CU_ASSERT(g_bserrno == 0);
 		CU_ASSERT(g_blobid != SPDK_BLOBID_INVALID);
 		snapshotid = g_blobid;
-		SPDK_CU_ASSERT_FATAL(spdk_bit_array_get(bs->used_clusters, 1));
-		SPDK_CU_ASSERT_FATAL(!spdk_bit_array_get(bs->used_clusters, 11));
+		SPDK_CU_ASSERT_FATAL(spdk_bit_pool_is_allocated(bs->used_clusters, 1));
+		SPDK_CU_ASSERT_FATAL(!spdk_bit_pool_is_allocated(bs->used_clusters, 11));
 
 		dev_set_power_failure_thresholds(thresholds);
 
@@ -5365,8 +5431,8 @@ blob_delete_snapshot_power_failure(void)
 		dev_reset_power_failure_event();
 		ut_bs_dirty_load(&bs, NULL);
 
-		SPDK_CU_ASSERT_FATAL(spdk_bit_array_get(bs->used_clusters, 1));
-		SPDK_CU_ASSERT_FATAL(!spdk_bit_array_get(bs->used_clusters, 11));
+		SPDK_CU_ASSERT_FATAL(spdk_bit_pool_is_allocated(bs->used_clusters, 1));
+		SPDK_CU_ASSERT_FATAL(!spdk_bit_pool_is_allocated(bs->used_clusters, 11));
 
 		spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
 		poll_threads();
@@ -5452,8 +5518,8 @@ blob_create_snapshot_power_failure(void)
 		CU_ASSERT(g_bserrno == 0);
 		CU_ASSERT(g_blobid != SPDK_BLOBID_INVALID);
 		blobid = g_blobid;
-		SPDK_CU_ASSERT_FATAL(spdk_bit_array_get(bs->used_clusters, 1));
-		SPDK_CU_ASSERT_FATAL(!spdk_bit_array_get(bs->used_clusters, 11));
+		SPDK_CU_ASSERT_FATAL(spdk_bit_pool_is_allocated(bs->used_clusters, 1));
+		SPDK_CU_ASSERT_FATAL(!spdk_bit_pool_is_allocated(bs->used_clusters, 11));
 
 		dev_set_power_failure_thresholds(thresholds);
 
@@ -5462,16 +5528,16 @@ blob_create_snapshot_power_failure(void)
 		poll_threads();
 		create_snapshot_bserrno = g_bserrno;
 		snapshotid = g_blobid;
-		SPDK_CU_ASSERT_FATAL(spdk_bit_array_get(bs->used_clusters, 1));
-		SPDK_CU_ASSERT_FATAL(!spdk_bit_array_get(bs->used_clusters, 11));
+		SPDK_CU_ASSERT_FATAL(spdk_bit_pool_is_allocated(bs->used_clusters, 1));
+		SPDK_CU_ASSERT_FATAL(!spdk_bit_pool_is_allocated(bs->used_clusters, 11));
 
 		/* Do not shut down cleanly. Assumption is that after create snapshot
 		 * reports success, both blobs should be power-fail safe. */
 		dev_reset_power_failure_event();
 		ut_bs_dirty_load(&bs, NULL);
 
-		SPDK_CU_ASSERT_FATAL(spdk_bit_array_get(bs->used_clusters, 1));
-		SPDK_CU_ASSERT_FATAL(!spdk_bit_array_get(bs->used_clusters, 11));
+		SPDK_CU_ASSERT_FATAL(spdk_bit_pool_is_allocated(bs->used_clusters, 1));
+		SPDK_CU_ASSERT_FATAL(!spdk_bit_pool_is_allocated(bs->used_clusters, 11));
 
 		spdk_bs_open_blob(bs, blobid, blob_op_with_handle_complete, NULL);
 		poll_threads();
@@ -6612,6 +6678,7 @@ int main(int argc, char **argv)
 	CU_ADD_TEST(suite, blob_init);
 	CU_ADD_TEST(suite_bs, blob_open);
 	CU_ADD_TEST(suite_bs, blob_create);
+	CU_ADD_TEST(suite_bs, blob_create_loop);
 	CU_ADD_TEST(suite_bs, blob_create_fail);
 	CU_ADD_TEST(suite_bs, blob_create_internal);
 	CU_ADD_TEST(suite, blob_thin_provision);

@@ -269,8 +269,6 @@ _nvme_pcie_hotplug_monitor(struct spdk_nvme_probe_ctx *probe_ctx)
 	struct spdk_nvme_ctrlr *ctrlr, *tmp;
 	struct spdk_uevent event;
 	struct spdk_pci_addr pci_addr;
-	union spdk_nvme_csts_register csts;
-	struct spdk_nvme_ctrlr_process *proc;
 
 	if (g_spdk_nvme_driver->hotplug_fd < 0) {
 		return 0;
@@ -313,25 +311,20 @@ _nvme_pcie_hotplug_monitor(struct spdk_nvme_probe_ctx *probe_ctx)
 		}
 	}
 
-	/* This is a work around for vfio-attached device hot remove detection. */
+	/* Initiate removal of physically hotremoved PCI controllers. Even after
+	 * they're hotremoved from the system, SPDK might still report them via RPC.
+	 */
 	TAILQ_FOREACH_SAFE(ctrlr, &g_spdk_nvme_driver->shared_attached_ctrlrs, tailq, tmp) {
 		bool do_remove = false;
+		struct nvme_pcie_ctrlr *pctrlr;
 
-		if (ctrlr->trid.trtype == SPDK_NVME_TRANSPORT_PCIE) {
-			struct nvme_pcie_ctrlr *pctrlr = nvme_pcie_ctrlr(ctrlr);
-
-			if (spdk_pci_device_is_removed(pctrlr->devhandle)) {
-				do_remove = true;
-			}
+		if (ctrlr->trid.trtype != SPDK_NVME_TRANSPORT_PCIE) {
+			continue;
 		}
 
-		/* NVMe controller BAR must be mapped in the current process before any access. */
-		proc = nvme_ctrlr_get_current_process(ctrlr);
-		if (proc) {
-			csts = spdk_nvme_ctrlr_get_regs_csts(ctrlr);
-			if (csts.raw == 0xffffffffU) {
-				do_remove = true;
-			}
+		pctrlr = nvme_pcie_ctrlr(ctrlr);
+		if (spdk_pci_device_is_removed(pctrlr->devhandle)) {
+			do_remove = true;
 		}
 
 		if (do_remove) {
@@ -620,8 +613,6 @@ nvme_pcie_ctrlr_map_io_cmb(struct spdk_nvme_ctrlr *ctrlr, size_t *size)
 				       VALUE_2MB - 1);
 	mem_register_end = _2MB_PAGE((uintptr_t)pctrlr->cmb.bar_va + pctrlr->cmb.current_offset +
 				     pctrlr->cmb.size);
-	pctrlr->cmb.mem_register_addr = (void *)mem_register_start;
-	pctrlr->cmb.mem_register_size = mem_register_end - mem_register_start;
 
 	rc = spdk_mem_register((void *)mem_register_start, mem_register_end - mem_register_start);
 	if (rc) {
@@ -1153,6 +1144,22 @@ nvme_pcie_qpair_construct(struct spdk_nvme_qpair *qpair,
 	return 0;
 }
 
+/* Used when dst points to MMIO (i.e. CMB) in a virtual machine - in these cases we must
+ * not use wide instructions because QEMU will not emulate such instructions to MMIO space.
+ * So this function ensures we only copy 8 bytes at a time.
+ */
+static inline void
+nvme_pcie_copy_command_mmio(struct spdk_nvme_cmd *dst, const struct spdk_nvme_cmd *src)
+{
+	uint64_t *dst64 = (uint64_t *)dst;
+	const uint64_t *src64 = (const uint64_t *)src;
+	uint32_t i;
+
+	for (i = 0; i < sizeof(*dst) / 8; i++) {
+		dst64[i] = src64[i];
+	}
+}
+
 static inline void
 nvme_pcie_copy_command(struct spdk_nvme_cmd *dst, const struct spdk_nvme_cmd *src)
 {
@@ -1336,7 +1343,7 @@ nvme_pcie_qpair_submit_tracker(struct spdk_nvme_qpair *qpair, struct nvme_tracke
 	 * virtual NVMe controller, the maximum access width is 8 Bytes for one time.
 	 */
 	if (spdk_unlikely((ctrlr->quirks & NVME_QUIRK_MAXIMUM_PCI_ACCESS_WIDTH) && pqpair->sq_in_cmb)) {
-		pqpair->cmd[pqpair->sq_tail] = req->cmd;
+		nvme_pcie_copy_command_mmio(&pqpair->cmd[pqpair->sq_tail], &req->cmd);
 	} else {
 		/* Copy the command from the tracker to the submission queue. */
 		nvme_pcie_copy_command(&pqpair->cmd[pqpair->sq_tail], &req->cmd);
@@ -1383,6 +1390,8 @@ nvme_pcie_qpair_complete_tracker(struct spdk_nvme_qpair *qpair, struct nvme_trac
 		req->retries++;
 		nvme_pcie_qpair_submit_tracker(qpair, tr);
 	} else {
+		TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
+
 		/* Only check admin requests from different processes. */
 		if (nvme_qpair_is_admin_queue(qpair) && req->pid != getpid()) {
 			req_from_current_proc = false;
@@ -1397,7 +1406,6 @@ nvme_pcie_qpair_complete_tracker(struct spdk_nvme_qpair *qpair, struct nvme_trac
 
 		tr->req = NULL;
 
-		TAILQ_REMOVE(&pqpair->outstanding_tr, tr, tq_list);
 		TAILQ_INSERT_HEAD(&pqpair->free_tr, tr, tq_list);
 	}
 }
@@ -1438,6 +1446,29 @@ nvme_pcie_qpair_abort_trackers(struct spdk_nvme_qpair *qpair, uint32_t dnr)
 			break;
 		}
 	}
+}
+
+static int
+nvme_pcie_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
+				 int (*iter_fn)(struct nvme_request *req, void *arg),
+				 void *arg)
+{
+	struct nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);
+	struct nvme_tracker *tr, *tmp;
+	int rc;
+
+	assert(iter_fn != NULL);
+
+	TAILQ_FOREACH_SAFE(tr, &pqpair->outstanding_tr, tq_list, tmp) {
+		assert(tr->req != NULL);
+
+		rc = iter_fn(tr->req, arg);
+		if (rc != 0) {
+			return rc;
+		}
+	}
+
+	return 0;
 }
 
 static void
@@ -1729,6 +1760,9 @@ nvme_pcie_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 {
 }
 
+static int32_t nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair,
+		uint32_t max_completions);
+
 static int
 nvme_pcie_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
@@ -1760,6 +1794,11 @@ nvme_pcie_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 		}
 		return -1;
 	}
+
+	/* Now that the submission queue is deleted, the device is supposed to have
+	 * completed any outstanding I/O. Try to complete them. If they don't complete,
+	 * they'll be marked as aborted and completed below. */
+	nvme_pcie_qpair_process_completions(qpair, 0);
 
 	memset(status, 0, sizeof(*status));
 	/* Delete the completion queue */
@@ -2513,6 +2552,20 @@ nvme_pcie_poll_group_destroy(struct spdk_nvme_transport_poll_group *tgroup)
 	return 0;
 }
 
+static struct spdk_pci_id nvme_pci_driver_id[] = {
+	{
+		.class_id = SPDK_PCI_CLASS_NVME,
+		.vendor_id = SPDK_PCI_ANY_ID,
+		.device_id = SPDK_PCI_ANY_ID,
+		.subvendor_id = SPDK_PCI_ANY_ID,
+		.subdevice_id = SPDK_PCI_ANY_ID,
+	},
+	{ .vendor_id = 0, /* sentinel */ },
+};
+
+SPDK_PCI_DRIVER_REGISTER(nvme, nvme_pci_driver_id,
+			 SPDK_PCI_DRIVER_NEED_MAPPING | SPDK_PCI_DRIVER_WC_ACTIVATE);
+
 const struct spdk_nvme_transport_ops pcie_ops = {
 	.name = "PCIE",
 	.type = SPDK_NVME_TRANSPORT_PCIE,
@@ -2542,6 +2595,7 @@ const struct spdk_nvme_transport_ops pcie_ops = {
 	.qpair_reset = nvme_pcie_qpair_reset,
 	.qpair_submit_request = nvme_pcie_qpair_submit_request,
 	.qpair_process_completions = nvme_pcie_qpair_process_completions,
+	.qpair_iterate_requests = nvme_pcie_qpair_iterate_requests,
 	.admin_qpair_abort_aers = nvme_pcie_admin_qpair_abort_aers,
 
 	.poll_group_create = nvme_pcie_poll_group_create,

@@ -731,6 +731,7 @@ struct rpc_portal_list {
 struct rpc_portal_group {
 	int32_t tag;
 	struct rpc_portal_list portal_list;
+	bool is_private;
 };
 
 static void
@@ -784,6 +785,7 @@ decode_rpc_portal_list(const struct spdk_json_val *val, void *out)
 static const struct spdk_json_object_decoder rpc_portal_group_decoders[] = {
 	{"tag", offsetof(struct rpc_portal_group, tag), spdk_json_decode_int32},
 	{"portals", offsetof(struct rpc_portal_group, portal_list), decode_rpc_portal_list},
+	{"private", offsetof(struct rpc_portal_group, is_private), spdk_json_decode_bool, true},
 };
 
 static void
@@ -804,7 +806,7 @@ rpc_iscsi_create_portal_group(struct spdk_jsonrpc_request *request,
 		goto out;
 	}
 
-	pg = iscsi_portal_grp_create(req.tag);
+	pg = iscsi_portal_grp_create(req.tag, req.is_private);
 	if (pg == NULL) {
 		SPDK_ERRLOG("portal_grp_create failed\n");
 		goto out;
@@ -977,7 +979,7 @@ _rpc_iscsi_get_connections(struct spdk_io_channel_iter *i)
 	struct spdk_iscsi_poll_group *pg = spdk_io_channel_get_ctx(ch);
 	struct spdk_iscsi_conn *conn;
 
-	STAILQ_FOREACH(conn, &pg->connections, link) {
+	STAILQ_FOREACH(conn, &pg->connections, pg_link) {
 		iscsi_conn_info_json(ctx->w, conn);
 	}
 
@@ -1146,6 +1148,134 @@ exit:
 SPDK_RPC_REGISTER("iscsi_target_node_set_auth", rpc_iscsi_target_node_set_auth,
 		  SPDK_RPC_RUNTIME)
 SPDK_RPC_REGISTER_ALIAS_DEPRECATED(iscsi_target_node_set_auth, set_iscsi_target_node_auth)
+
+struct rpc_target_redirect {
+	char *name;
+	int32_t pg_tag;
+	char *redirect_host;
+	char *redirect_port;
+};
+
+static void
+free_rpc_target_redirect(struct rpc_target_redirect *req)
+{
+	free(req->name);
+	free(req->redirect_host);
+	free(req->redirect_port);
+}
+
+static const struct spdk_json_object_decoder rpc_target_redirect_decoders[] = {
+	{"name", offsetof(struct rpc_target_redirect, name), spdk_json_decode_string},
+	{"pg_tag", offsetof(struct rpc_target_redirect, pg_tag), spdk_json_decode_int32},
+	{"redirect_host", offsetof(struct rpc_target_redirect, redirect_host), spdk_json_decode_string, true},
+	{"redirect_port", offsetof(struct rpc_target_redirect, redirect_port), spdk_json_decode_string, true},
+};
+
+static void
+rpc_iscsi_target_node_set_redirect(struct spdk_jsonrpc_request *request,
+				   const struct spdk_json_val *params)
+{
+	struct rpc_target_redirect req = {};
+	struct spdk_iscsi_tgt_node *target;
+	struct spdk_json_write_ctx *w;
+	int rc;
+
+	if (spdk_json_decode_object(params, rpc_target_redirect_decoders,
+				    SPDK_COUNTOF(rpc_target_redirect_decoders),
+				    &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		free_rpc_target_redirect(&req);
+		return;
+	}
+
+	target = iscsi_find_tgt_node(req.name);
+	if (target == NULL) {
+		SPDK_ERRLOG("target %s is not found\n", req.name);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "Target %s is not found", req.name);
+		free_rpc_target_redirect(&req);
+		return;
+	}
+
+	rc = iscsi_tgt_node_redirect(target, req.pg_tag, req.redirect_host, req.redirect_port);
+	if (rc != 0) {
+		SPDK_ERRLOG("failed to redirect target %s\n", req.name);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "Failed to redirect target %s, (%d): %s",
+						     req.name, rc, spdk_strerror(-rc));
+		free_rpc_target_redirect(&req);
+		return;
+	}
+
+	free_rpc_target_redirect(&req);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_bool(w, true);
+	spdk_jsonrpc_end_result(request, w);
+}
+SPDK_RPC_REGISTER("iscsi_target_node_set_redirect", rpc_iscsi_target_node_set_redirect,
+		  SPDK_RPC_RUNTIME)
+
+struct rpc_target_logout {
+	char *name;
+	int32_t pg_tag;
+};
+
+static void
+free_rpc_target_logout(struct rpc_target_logout *req)
+{
+	free(req->name);
+}
+
+static const struct spdk_json_object_decoder rpc_target_logout_decoders[] = {
+	{"name", offsetof(struct rpc_target_logout, name), spdk_json_decode_string},
+	{"pg_tag", offsetof(struct rpc_target_logout, pg_tag), spdk_json_decode_int32, true},
+};
+
+static void
+rpc_iscsi_target_node_request_logout(struct spdk_jsonrpc_request *request,
+				     const struct spdk_json_val *params)
+{
+	struct rpc_target_logout req = {};
+	struct spdk_iscsi_tgt_node *target;
+	struct spdk_json_write_ctx *w;
+
+	/* If pg_tag is omitted, request all connections to the specified target
+	 * to logout.
+	 */
+	req.pg_tag = -1;
+
+	if (spdk_json_decode_object(params, rpc_target_logout_decoders,
+				    SPDK_COUNTOF(rpc_target_logout_decoders),
+				    &req)) {
+		SPDK_ERRLOG("spdk_json_decode_object failed\n");
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "Invalid parameters");
+		free_rpc_target_logout(&req);
+		return;
+	}
+
+	target = iscsi_find_tgt_node(req.name);
+	if (target == NULL) {
+		SPDK_ERRLOG("target %s is not found\n", req.name);
+		spdk_jsonrpc_send_error_response_fmt(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						     "Target %s is not found", req.name);
+		free_rpc_target_logout(&req);
+		return;
+	}
+
+	iscsi_conns_request_logout(target, req.pg_tag);
+
+	free_rpc_target_logout(&req);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_bool(w, true);
+	spdk_jsonrpc_end_result(request, w);
+}
+SPDK_RPC_REGISTER("iscsi_target_node_request_logout", rpc_iscsi_target_node_request_logout,
+		  SPDK_RPC_RUNTIME)
 
 static void
 rpc_iscsi_get_options(struct spdk_jsonrpc_request *request,
@@ -1586,6 +1716,8 @@ static const struct spdk_json_object_decoder rpc_set_iscsi_opts_decoders[] = {
 	{"immediate_data", offsetof(struct spdk_iscsi_opts, ImmediateData), spdk_json_decode_bool, true},
 	{"error_recovery_level", offsetof(struct spdk_iscsi_opts, ErrorRecoveryLevel), spdk_json_decode_uint32, true},
 	{"allow_duplicated_isid", offsetof(struct spdk_iscsi_opts, AllowDuplicateIsid), spdk_json_decode_bool, true},
+	{"max_large_datain_per_connection", offsetof(struct spdk_iscsi_opts, MaxLargeDataInPerConnection), spdk_json_decode_uint32, true},
+	{"max_r2t_per_connection", offsetof(struct spdk_iscsi_opts, MaxR2TPerConnection), spdk_json_decode_uint32, true},
 };
 
 static void

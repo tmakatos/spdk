@@ -119,6 +119,12 @@ DEFINE_STUB(spdk_nvmf_subsystem_listener_allowed,
 	    (struct spdk_nvmf_subsystem *subsystem, const struct spdk_nvme_transport_id *trid),
 	    true);
 
+DEFINE_STUB(nvmf_subsystem_find_listener,
+	    struct spdk_nvmf_subsystem_listener *,
+	    (struct spdk_nvmf_subsystem *subsystem,
+	     const struct spdk_nvme_transport_id *trid),
+	    (void *)0x1);
+
 DEFINE_STUB(nvmf_bdev_ctrlr_read_cmd,
 	    int,
 	    (struct spdk_bdev *bdev, struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
@@ -178,6 +184,12 @@ DEFINE_STUB(nvmf_bdev_ctrlr_get_dif_ctx, bool,
 	    (struct spdk_bdev *bdev, struct spdk_nvme_cmd *cmd,
 	     struct spdk_dif_ctx *dif_ctx),
 	    true);
+
+DEFINE_STUB_V(nvmf_transport_qpair_abort_request,
+	      (struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_request *req));
+
+DEFINE_STUB_V(spdk_nvme_print_command, (uint16_t qid, struct spdk_nvme_cmd *cmd));
+DEFINE_STUB_V(spdk_nvme_print_completion, (uint16_t qid, struct spdk_nvme_cpl *cpl));
 
 int
 spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair, nvmf_qpair_disconnect_cb cb_fn, void *ctx)
@@ -938,7 +950,10 @@ test_set_get_features(void)
 {
 	struct spdk_nvmf_subsystem subsystem = {};
 	struct spdk_nvmf_qpair admin_qpair = {};
-	struct spdk_nvmf_ctrlr ctrlr = { .subsys = &subsystem, .admin_qpair = &admin_qpair };
+	struct spdk_nvmf_subsystem_listener listener = {};
+	struct spdk_nvmf_ctrlr ctrlr = {
+		.subsys = &subsystem, .admin_qpair = &admin_qpair, .listener = &listener
+	};
 	union nvmf_h2c_msg cmd = {};
 	union nvmf_c2h_msg rsp = {};
 	struct spdk_nvmf_ns ns[3];
@@ -948,6 +963,7 @@ test_set_get_features(void)
 
 	subsystem.ns = ns_arr;
 	subsystem.max_nsid = SPDK_COUNTOF(ns_arr);
+	listener.ana_state = SPDK_NVME_ANA_OPTIMIZED_STATE;
 	admin_qpair.ctrlr = &ctrlr;
 	req.qpair = &admin_qpair;
 	cmd.nvme_cmd.nsid = 1;
@@ -1509,6 +1525,7 @@ test_fused_compare_and_write(void)
 	struct spdk_nvmf_subsystem subsystem = {};
 	struct spdk_nvmf_ns ns = {};
 	struct spdk_nvmf_ns *subsys_ns[1] = {};
+	struct spdk_nvmf_subsystem_listener listener = {};
 	struct spdk_bdev bdev = {};
 
 	struct spdk_nvmf_poll_group group = {};
@@ -1522,9 +1539,12 @@ test_fused_compare_and_write(void)
 	subsys_ns[0] = &ns;
 	subsystem.ns = (struct spdk_nvmf_ns **)&subsys_ns;
 
+	listener.ana_state = SPDK_NVME_ANA_OPTIMIZED_STATE;
+
 	/* Enable controller */
 	ctrlr.vcprop.cc.bits.en = 1;
 	ctrlr.subsys = (struct spdk_nvmf_subsystem *)&subsystem;
+	ctrlr.listener = &listener;
 
 	group.num_sgroups = 1;
 	sgroups.state = SPDK_NVMF_SUBSYSTEM_ACTIVE;

@@ -83,6 +83,12 @@ DEFINE_STUB(spdk_nvmf_subsystem_listener_allowed,
 	    (struct spdk_nvmf_subsystem *subsystem, const struct spdk_nvme_transport_id *trid),
 	    true);
 
+DEFINE_STUB(nvmf_subsystem_find_listener,
+	    struct spdk_nvmf_subsystem_listener *,
+	    (struct spdk_nvmf_subsystem *subsystem,
+	     const struct spdk_nvme_transport_id *trid),
+	    (void *)0x1);
+
 DEFINE_STUB_V(nvmf_get_discovery_log_page,
 	      (struct spdk_nvmf_tgt *tgt, const char *hostnqn, struct iovec *iov,
 	       uint32_t iovcnt, uint64_t offset, uint32_t length));
@@ -163,6 +169,12 @@ DEFINE_STUB(nvmf_bdev_ctrlr_nvme_passthru_io,
 	     struct spdk_nvmf_request *req),
 	    0);
 
+DEFINE_STUB(spdk_nvmf_bdev_ctrlr_abort_cmd,
+	    int,
+	    (struct spdk_bdev *bdev, struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+	     struct spdk_nvmf_request *req, struct spdk_nvmf_request *req_to_abort),
+	    0);
+
 DEFINE_STUB(nvmf_bdev_ctrlr_get_dif_ctx,
 	    bool,
 	    (struct spdk_bdev *bdev, struct spdk_nvme_cmd *cmd, struct spdk_dif_ctx *dif_ctx),
@@ -199,6 +211,12 @@ DEFINE_STUB_V(spdk_nvme_trid_populate_transport, (struct spdk_nvme_transport_id 
 DEFINE_STUB_V(spdk_nvmf_transport_register, (const struct spdk_nvmf_transport_ops *ops));
 
 DEFINE_STUB_V(spdk_nvmf_tgt_new_qpair, (struct spdk_nvmf_tgt *tgt, struct spdk_nvmf_qpair *qpair));
+
+DEFINE_STUB_V(nvmf_transport_qpair_abort_request,
+	      (struct spdk_nvmf_qpair *qpair, struct spdk_nvmf_request *req));
+
+DEFINE_STUB_V(spdk_nvme_print_command, (uint16_t qid, struct spdk_nvme_cmd *cmd));
+DEFINE_STUB_V(spdk_nvme_print_completion, (uint16_t qid, struct spdk_nvme_cpl *cpl));
 
 struct spdk_trace_histories *g_trace_histories;
 
@@ -632,6 +650,7 @@ test_nvmf_tcp_incapsule_data_handle(void)
 	tqpair.qpair.transport = &ttransport.transport;
 	tqpair.state = NVME_TCP_QPAIR_STATE_RUNNING;
 	tqpair.recv_state = NVME_TCP_PDU_RECV_STATE_AWAIT_PDU_PSH;
+	tqpair.qpair.state = SPDK_NVMF_QPAIR_ACTIVE;
 
 	/* init a null tcp_req into tqpair TCP_REQUEST_STATE_FREE queue */
 	tcp_req2.req.qpair = &tqpair.qpair;

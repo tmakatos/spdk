@@ -9,9 +9,6 @@ ftl_restore_nv_cache
 # Waiting for test refactor
 iscsi_tgt_fio_remote_nvme
 
-# VPP deprecated with 20.07
-iscsi_tgt_vpp
-
 # Waiting on significant test rewrite
 nvme_opal
 nvme_opal_bdevio
@@ -23,9 +20,6 @@ nvmf_fc
 spdkcli_nvmf_fc
 unittest_nvmf_fc
 unittest_nvmf_fc_ls
-
-# Enable after cuse tests switch to physical devices
-nvme_ns_manage_cuse
 
 # These tests are currently only run manually
 vhost_blk_fs_integrity

@@ -91,11 +91,11 @@
 #define MAX_DATA_OUT_PER_CONNECTION 16
 
 /*
- * Defines maximum number of data in buffers each connection can have in
+ * Defines default maximum number of data in buffers each connection can have in
  *  use at any given time. So this limit does not affect I/O smaller than
  *  SPDK_BDEV_SMALL_BUF_MAX_SIZE.
  */
-#define MAX_LARGE_DATAIN_PER_CONNECTION 64
+#define DEFAULT_MAX_LARGE_DATAIN_PER_CONNECTION 64
 
 #define SPDK_ISCSI_MAX_BURST_LENGTH	\
 		(SPDK_ISCSI_MAX_RECV_DATA_SEGMENT_LENGTH * MAX_DATA_OUT_PER_CONNECTION)
@@ -320,6 +320,8 @@ struct spdk_iscsi_opts {
 	bool ImmediateData;
 	uint32_t ErrorRecoveryLevel;
 	bool AllowDuplicateIsid;
+	uint32_t MaxLargeDataInPerConnection;
+	uint32_t MaxR2TPerConnection;
 };
 
 struct spdk_iscsi_globals {
@@ -351,6 +353,8 @@ struct spdk_iscsi_globals {
 	bool ImmediateData;
 	uint32_t ErrorRecoveryLevel;
 	bool AllowDuplicateIsid;
+	uint32_t MaxLargeDataInPerConnection;
+	uint32_t MaxR2TPerConnection;
 
 	struct spdk_mempool *pdu_pool;
 	struct spdk_mempool *pdu_immediate_data_pool;

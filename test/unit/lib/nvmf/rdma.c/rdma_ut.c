@@ -77,6 +77,7 @@ DEFINE_STUB_V(_spdk_trace_record, (uint64_t tsc, uint16_t tpoint_id, uint16_t po
 DEFINE_STUB_V(spdk_nvmf_ctrlr_data_init, (struct spdk_nvmf_transport_opts *opts,
 		struct spdk_nvmf_ctrlr_data *cdata));
 DEFINE_STUB_V(spdk_nvmf_request_exec, (struct spdk_nvmf_request *req));
+DEFINE_STUB(spdk_nvmf_request_complete, int, (struct spdk_nvmf_request *req), 0);
 DEFINE_STUB(spdk_nvme_transport_id_compare, int, (const struct spdk_nvme_transport_id *trid1,
 		const struct spdk_nvme_transport_id *trid2), 0);
 DEFINE_STUB_V(nvmf_ctrlr_abort_aer, (struct spdk_nvmf_ctrlr *ctrlr));
@@ -85,6 +86,7 @@ DEFINE_STUB(spdk_nvmf_request_get_dif_ctx, bool, (struct spdk_nvmf_request *req,
 DEFINE_STUB_V(spdk_nvme_trid_populate_transport, (struct spdk_nvme_transport_id *trid,
 		enum spdk_nvme_transport_type trtype));
 DEFINE_STUB_V(spdk_nvmf_tgt_new_qpair, (struct spdk_nvmf_tgt *tgt, struct spdk_nvmf_qpair *qpair));
+DEFINE_STUB(nvmf_ctrlr_abort_request, int, (struct spdk_nvmf_request *req), 0);
 
 const char *
 spdk_nvme_transport_id_trtype_str(enum spdk_nvme_transport_type trtype)
@@ -751,6 +753,35 @@ test_spdk_nvmf_rdma_request_process(void)
 		free_req(req1);
 		free_recv(recv2);
 		free_req(req2);
+		poller_reset(&poller, &group);
+		qpair_reset(&rqpair, &poller, &device, &resources);
+	}
+
+	/* Test 4, invalid command, check xfer type */
+	{
+		struct spdk_nvmf_rdma_recv *rdma_recv_inv;
+		struct spdk_nvmf_rdma_request *rdma_req_inv;
+		/* construct an opcode that specifies BIDIRECTIONAL transfer */
+		uint8_t opc = 0x10 | SPDK_NVME_DATA_BIDIRECTIONAL;
+
+		rdma_recv_inv = create_recv(&rqpair, opc);
+		rdma_req_inv = create_req(&rqpair, rdma_recv_inv);
+
+		/* NEW -> RDMA_REQUEST_STATE_COMPLETING */
+		rqpair.current_recv_depth = 1;
+		progress = nvmf_rdma_request_process(&rtransport, rdma_req_inv);
+		CU_ASSERT(progress == true);
+		CU_ASSERT(rdma_req_inv->state == RDMA_REQUEST_STATE_COMPLETING);
+		CU_ASSERT(rdma_req_inv->req.rsp->nvme_cpl.status.sct == SPDK_NVME_SCT_GENERIC);
+		CU_ASSERT(rdma_req_inv->req.rsp->nvme_cpl.status.sc == SPDK_NVME_SC_INVALID_OPCODE);
+
+		/* RDMA_REQUEST_STATE_COMPLETED -> FREE */
+		rdma_req_inv->state = RDMA_REQUEST_STATE_COMPLETED;
+		nvmf_rdma_request_process(&rtransport, rdma_req_inv);
+		CU_ASSERT(rdma_req_inv->state == RDMA_REQUEST_STATE_FREE);
+
+		free_recv(rdma_recv_inv);
+		free_req(rdma_req_inv);
 		poller_reset(&poller, &group);
 		qpair_reset(&rqpair, &poller, &device, &resources);
 	}

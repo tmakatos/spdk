@@ -40,9 +40,8 @@ function setup_bdev_conf() {
 		bdev_passthru_create -p TestPT -b Malloc3
 		bdev_raid_create -n raid0 -z 64 -r 0 -b "Malloc4 Malloc5"
 	RPC
-	# FIXME: QoS doesn't work properly with json_config, see issue 1146
-	#$rpc_py bdev_set_qos_limit --rw_mbytes_per_sec 100 Malloc3
-	#$rpc_py bdev_set_qos_limit --rw_ios_per_sec 20000 Malloc0
+	$rpc_py bdev_set_qos_limit --rw_mbytes_per_sec 100 Malloc3
+	$rpc_py bdev_set_qos_limit --rw_ios_per_sec 20000 Malloc0
 	if [[ $(uname -s) != "FreeBSD" ]]; then
 		dd if=/dev/zero of="$SPDK_TEST_STORAGE/aiofile" bs=2048 count=5000
 		"$rpc_py" bdev_aio_create "$SPDK_TEST_STORAGE/aiofile" AIO0 2048
@@ -56,11 +55,6 @@ function setup_nvme_conf() {
 function setup_gpt_conf() {
 	if [[ $(uname -s) = Linux ]] && hash sgdisk; then
 		$rootdir/scripts/setup.sh reset
-		# FIXME: Note that we are racing with the kernel here. There's no guarantee that
-		# proper object will be already in place under sysfs nor that any udev-like
-		# helper created proper block devices for us. Replace the below sleep with proper
-		# udev settle routine.
-		sleep 1s
 		# Get nvme devices by following drivers' links towards nvme class
 		local nvme_devs=(/sys/bus/pci/drivers/nvme/*/nvme/nvme*/nvme*n*) nvme_dev
 		gpt_nvme=""
@@ -399,7 +393,6 @@ fi
 #-----------------------------------------------------
 if [ "$test_type" = "gpt" ]; then
 	"$rootdir/scripts/setup.sh" reset
-	sleep 1s
 	if [[ -b $gpt_nvme ]]; then
 		dd if=/dev/zero of="$gpt_nvme" bs=4096 count=8 oflag=direct
 	fi

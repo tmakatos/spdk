@@ -5,16 +5,7 @@ rootdir=$(readlink -f $testdir/../../..)
 source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/iscsi_tgt/common.sh
 
-# $1 = test type posix or vpp.
-# $2 = "iso" - triggers isolation mode (setting up required environment).
-iscsitestinit $2 $1
-
-if [ "$1" == "posix" ] || [ "$1" == "vpp" ]; then
-	TEST_TYPE=$1
-else
-	echo "No iSCSI test type specified"
-	exit 1
-fi
+iscsitestinit
 
 MALLOC_BDEV_SIZE=64
 
@@ -51,7 +42,7 @@ sleep 1
 
 timing_exit start_iscsi_tgt
 
-$rpc_config_py $rpc_py $TARGET_IP $INITIATOR_IP $ISCSI_PORT $NETMASK $TARGET_NAMESPACE $TEST_TYPE
+$rpc_config_py $rpc_py $TARGET_IP $INITIATOR_IP $ISCSI_PORT $NETMASK $TARGET_NAMESPACE
 
 $rpc_py bdev_get_bdevs
 
@@ -60,4 +51,4 @@ trap - SIGINT SIGTERM EXIT
 iscsicleanup
 killprocess $pid
 
-iscsitestfini $2 $1
+iscsitestfini

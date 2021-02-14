@@ -44,6 +44,7 @@ DIRS-y += spdk_lspci
 DIRS-y += spdk_top
 ifeq ($(OS),Linux)
 DIRS-$(CONFIG_VHOST) += vhost
+DIRS-y += spdk_dd
 endif
 
 .PHONY: all clean $(DIRS-y)

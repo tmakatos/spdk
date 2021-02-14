@@ -164,7 +164,7 @@ nvme_wait_for_completion(struct spdk_nvme_qpair *qpair,
  * \param qpair queue to poll
  * \param status completion status. The user must fill this structure with zeroes before calling
  * this function
- * \param timeout_in_secs optional timeout
+ * \param timeout_in_usecs optional timeout
  *
  * \return 0 if command completed without error,
  * -EIO if command completed with error,
@@ -176,13 +176,13 @@ nvme_wait_for_completion(struct spdk_nvme_qpair *qpair,
 int
 nvme_wait_for_completion_timeout(struct spdk_nvme_qpair *qpair,
 				 struct nvme_completion_poll_status *status,
-				 uint64_t timeout_in_secs)
+				 uint64_t timeout_in_usecs)
 {
 	uint64_t timeout_tsc = 0;
 	int rc = 0;
 
-	if (timeout_in_secs) {
-		timeout_tsc = spdk_get_ticks() + timeout_in_secs * spdk_get_ticks_hz();
+	if (timeout_in_usecs) {
+		timeout_tsc = spdk_get_ticks() + timeout_in_usecs * spdk_get_ticks_hz() / SPDK_SEC_TO_USEC;
 	}
 
 	while (status->done == false) {
@@ -895,8 +895,10 @@ spdk_nvme_trid_populate_transport(struct spdk_nvme_transport_id *trid,
 		trstring = SPDK_NVME_TRANSPORT_NAME_TCP;
 		break;
 	case SPDK_NVME_TRANSPORT_CUSTOM:
+		trstring = SPDK_NVME_TRANSPORT_NAME_CUSTOM;
+		break;
 	default:
-		SPDK_ERRLOG("don't use this for custom transports\n");
+		SPDK_ERRLOG("no available transports\n");
 		assert(0);
 		return;
 	}

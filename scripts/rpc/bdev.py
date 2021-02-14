@@ -22,18 +22,32 @@ def bdev_set_options(client, bdev_io_pool_size=None, bdev_io_cache_size=None, bd
     return client.call('bdev_set_options', params)
 
 
+def bdev_examine(client, name):
+    """Examine a bdev manually. If the bdev does not exist yet when this RPC is called,
+    it will be examined when it is created
+
+    Args:
+        name: name of the bdev
+    """
+    params = {
+        'name': name
+    }
+    return client.call('bdev_examine', params)
+
+
 @deprecated_alias('construct_compress_bdev')
-def bdev_compress_create(client, base_bdev_name, pm_path):
+def bdev_compress_create(client, base_bdev_name, pm_path, lb_size):
     """Construct a compress virtual block device.
 
     Args:
         base_bdev_name: name of the underlying base bdev
         pm_path: path to persistent memory
+        lb_size: logical block size for the compressed vol in bytes.  Must be 4K or 512.
 
     Returns:
         Name of created virtual block device.
     """
-    params = {'base_bdev_name': base_bdev_name, 'pm_path': pm_path}
+    params = {'base_bdev_name': base_bdev_name, 'pm_path': pm_path, 'lb_size': lb_size}
 
     return client.call('bdev_compress_create', params)
 
@@ -50,7 +64,8 @@ def bdev_compress_delete(client, name):
 
 
 @deprecated_alias('set_compress_pmd')
-def compress_set_pmd(client, pmd):
+@deprecated_alias('compress_set_pmd')
+def bdev_compress_set_pmd(client, pmd):
     """Set pmd options for the bdev compress.
 
     Args:
@@ -58,7 +73,7 @@ def compress_set_pmd(client, pmd):
     """
     params = {'pmd': pmd}
 
-    return client.call('compress_set_pmd', params)
+    return client.call('bdev_compress_set_pmd', params)
 
 
 def bdev_compress_get_orphans(client, name=None):
@@ -109,19 +124,26 @@ def bdev_crypto_delete(client, name):
 
 
 @deprecated_alias('construct_ocf_bdev')
-def bdev_ocf_create(client, name, mode, cache_bdev_name, core_bdev_name):
+def bdev_ocf_create(client, name, mode, cache_line_size, cache_bdev_name, core_bdev_name):
     """Add an OCF block device
 
     Args:
         name: name of constructed OCF bdev
         mode: OCF cache mode: {'wb', 'wt', 'pt', 'wa', 'wi', 'wo'}
+        cache_line_size: OCF cache line size. The unit is KiB: {4, 8, 16, 32, 64}
         cache_bdev_name: name of underlying cache bdev
         core_bdev_name: name of underlying core bdev
 
     Returns:
         Name of created block device
     """
-    params = {'name': name, 'mode': mode, 'cache_bdev_name': cache_bdev_name, 'core_bdev_name': core_bdev_name}
+    params = {
+        'name': name,
+        'mode': mode,
+        'cache_line_size': cache_line_size,
+        'cache_bdev_name': cache_bdev_name,
+        'core_bdev_name': core_bdev_name,
+    }
 
     return client.call('bdev_ocf_create', params)
 
@@ -441,10 +463,10 @@ def bdev_nvme_attach_controller(client, name, trtype, traddr, adrfam=None, trsvc
 
     Args:
         name: bdev name prefix; "n" + namespace ID will be appended to create unique names
-        trtype: transport type ("PCIe", "RDMA")
+        trtype: transport type ("PCIe", "RDMA", "FC", "TCP")
         traddr: transport address (PCI BDF or IP address)
-        adrfam: address family ("IPv4", "IPv6", "IB", or "FC") (optional for PCIe)
-        trsvcid: transport service ID (port number for IP-based addresses; optional for PCIe)
+        adrfam: address family ("IPv4", "IPv6", "IB", or "FC")
+        trsvcid: transport service ID (port number for IP-based addresses)
         priority: transport connection priority (Sock priority for TCP-based transports; optional)
         subnqn: subsystem NQN to connect to (optional)
         hostnqn: NQN to connect from (optional)
@@ -491,14 +513,40 @@ def bdev_nvme_attach_controller(client, name, trtype, traddr, adrfam=None, trsvc
 
 
 @deprecated_alias('delete_nvme_controller')
-def bdev_nvme_detach_controller(client, name):
-    """Detach NVMe controller and delete any associated bdevs.
+def bdev_nvme_detach_controller(client, name, trtype=None, traddr=None,
+                                adrfam=None, trsvcid=None, subnqn=None):
+    """Detach NVMe controller and delete any associated bdevs. Optionally,
+       If all of the transport ID options are specified, only remove that
+       transport path from the specified controller. If that is the only
+       available path for the controller, this will also result in the
+       controller being detached and the associated bdevs being deleted.
 
     Args:
         name: controller name
+        trtype: transport type ("PCIe", "RDMA")
+        traddr: transport address (PCI BDF or IP address)
+        adrfam: address family ("IPv4", "IPv6", "IB", or "FC")
+        trsvcid: transport service ID (port number for IP-based addresses)
+        subnqn: subsystem NQN to connect to (optional)
     """
 
     params = {'name': name}
+
+    if trtype:
+        params['trtype'] = trtype
+
+    if traddr:
+        params['traddr'] = traddr
+
+    if adrfam:
+        params['adrfam'] = adrfam
+
+    if trsvcid:
+        params['trsvcid'] = trsvcid
+
+    if subnqn:
+        params['subnqn'] = subnqn
+
     return client.call('bdev_nvme_detach_controller', params)
 
 
@@ -1071,7 +1119,7 @@ def bdev_set_qos_limit(
 
     Args:
         name: name of block device
-        rw_ios_per_sec: R/W IOs per second limit (>=10000, example: 20000). 0 means unlimited.
+        rw_ios_per_sec: R/W IOs per second limit (>=1000, example: 20000). 0 means unlimited.
         rw_mbytes_per_sec: R/W megabytes per second limit (>=10, example: 100). 0 means unlimited.
         r_mbytes_per_sec: Read megabytes per second limit (>=10, example: 100). 0 means unlimited.
         w_mbytes_per_sec: Write megabytes per second limit (>=10, example: 100). 0 means unlimited.

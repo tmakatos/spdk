@@ -135,6 +135,15 @@ get_other_cache_base(struct vbdev_ocf_base *base)
 	return NULL;
 }
 
+static bool
+is_ocf_cache_running(struct vbdev_ocf *vbdev)
+{
+	if (vbdev->cache.attached && vbdev->ocf_cache) {
+		return ocf_cache_is_running(vbdev->ocf_cache);
+	}
+	return false;
+}
+
 /* Get existing OCF cache instance
  * that is started by other vbdev */
 static ocf_cache_t
@@ -149,7 +158,7 @@ get_other_cache_instance(struct vbdev_ocf *vbdev)
 		if (strcmp(cmp->cache.name, vbdev->cache.name)) {
 			continue;
 		}
-		if (cmp->ocf_cache) {
+		if (is_ocf_cache_running(cmp)) {
 			return cmp->ocf_cache;
 		}
 	}
@@ -190,6 +199,7 @@ static void
 unregister_finish(struct vbdev_ocf *vbdev)
 {
 	spdk_bdev_destruct_done(&vbdev->exp_bdev, vbdev->state.stop_status);
+	ocf_mngt_cache_put(vbdev->ocf_cache);
 	vbdev_ocf_cache_ctx_put(vbdev->cache_ctx);
 	vbdev_ocf_mngt_continue(vbdev, 0);
 }
@@ -230,7 +240,7 @@ remove_core_cache_lock_cmpl(ocf_cache_t cache, void *priv, int error)
 static void
 detach_core(struct vbdev_ocf *vbdev)
 {
-	if (vbdev->ocf_cache && ocf_cache_is_running(vbdev->ocf_cache)) {
+	if (is_ocf_cache_running(vbdev)) {
 		ocf_mngt_cache_lock(vbdev->ocf_cache, remove_core_cache_lock_cmpl, vbdev);
 	} else {
 		vbdev_ocf_mngt_continue(vbdev, 0);
@@ -291,7 +301,7 @@ stop_vbdev_cache_lock_cmpl(ocf_cache_t cache, void *priv, int error)
 static void
 stop_vbdev(struct vbdev_ocf *vbdev)
 {
-	if (!ocf_cache_is_running(vbdev->ocf_cache)) {
+	if (!is_ocf_cache_running(vbdev)) {
 		vbdev_ocf_mngt_continue(vbdev, 0);
 		return;
 	}
@@ -334,7 +344,7 @@ flush_vbdev_cache_lock_cmpl(ocf_cache_t cache, void *priv, int error)
 static void
 flush_vbdev(struct vbdev_ocf *vbdev)
 {
-	if (!ocf_cache_is_running(vbdev->ocf_cache)) {
+	if (!is_ocf_cache_running(vbdev)) {
 		vbdev_ocf_mngt_continue(vbdev, -EINVAL);
 		return;
 	}
@@ -751,6 +761,8 @@ vbdev_ocf_write_json_config(struct spdk_bdev *bdev, struct spdk_json_write_ctx *
 	spdk_json_write_named_string(w, "name", vbdev->name);
 	spdk_json_write_named_string(w, "mode",
 				     ocf_get_cache_modename(ocf_cache_get_mode(vbdev->ocf_cache)));
+	spdk_json_write_named_uint32(w, "cache_line_size",
+				     ocf_cache_get_line_size(vbdev->ocf_cache));
 	spdk_json_write_named_string(w, "cache_bdev_name", vbdev->cache.name);
 	spdk_json_write_named_string(w, "core_bdev_name", vbdev->core.name);
 	spdk_json_write_object_end(w);
@@ -783,9 +795,9 @@ queue_poll(void *opaque)
 	}
 
 	if (iono > 0) {
-		return 1;
+		return SPDK_POLLER_BUSY;
 	} else {
-		return 0;
+		return SPDK_POLLER_IDLE;
 	}
 }
 
@@ -891,9 +903,9 @@ mngt_queue_poll(void *opaque)
 	}
 
 	if (iono > 0) {
-		return 1;
+		return SPDK_POLLER_BUSY;
 	} else {
-		return 0;
+		return SPDK_POLLER_IDLE;
 	}
 }
 
@@ -1040,7 +1052,7 @@ start_cache(struct vbdev_ocf *vbdev)
 	ocf_cache_t existing;
 	int rc;
 
-	if (vbdev->ocf_cache) {
+	if (is_ocf_cache_running(vbdev)) {
 		vbdev_ocf_mngt_stop(vbdev, NULL, -EALREADY);
 		return;
 	}
@@ -1050,6 +1062,7 @@ start_cache(struct vbdev_ocf *vbdev)
 		SPDK_NOTICELOG("OCF bdev %s connects to existing cache device %s\n",
 			       vbdev->name, vbdev->cache.name);
 		vbdev->ocf_cache = existing;
+		ocf_mngt_cache_get(vbdev->ocf_cache);
 		vbdev->cache_ctx = ocf_cache_get_priv(existing);
 		vbdev_ocf_cache_ctx_get(vbdev->cache_ctx);
 		vbdev_ocf_mngt_continue(vbdev, 0);
@@ -1070,6 +1083,7 @@ start_cache(struct vbdev_ocf *vbdev)
 		vbdev_ocf_mngt_exit(vbdev, unregister_path_dirty, rc);
 		return;
 	}
+	ocf_mngt_cache_get(vbdev->ocf_cache);
 
 	ocf_cache_set_priv(vbdev->ocf_cache, vbdev->cache_ctx);
 
@@ -1127,17 +1141,11 @@ init_vbdev_config(struct vbdev_ocf *vbdev)
 	 * metadata support */
 	cfg->cache.metadata_volatile = false;
 
-	/* TODO [cache line size]: make cache line size configurable
-	 * Using standard 4KiB for now */
-	cfg->cache.cache_line_size = ocf_cache_line_size_4;
-
 	/* This are suggested values that
 	 * should be sufficient for most use cases */
 	cfg->cache.backfill.max_queue_size = 65536;
 	cfg->cache.backfill.queue_unblock_size = 60000;
 
-	/* TODO [cache line size] */
-	cfg->device.cache_line_size = ocf_cache_line_size_4;
 	cfg->device.force = true;
 	cfg->device.perform_test = false;
 	cfg->device.discard_on_start = false;
@@ -1172,6 +1180,7 @@ init_vbdev_config(struct vbdev_ocf *vbdev)
 static int
 init_vbdev(const char *vbdev_name,
 	   const char *cache_mode_name,
+	   const uint64_t cache_line_size,
 	   const char *cache_name,
 	   const char *core_name,
 	   bool loadq)
@@ -1208,6 +1217,17 @@ init_vbdev(const char *vbdev_name,
 		goto error_free;
 	}
 
+	ocf_cache_line_size_t set_cache_line_size = cache_line_size ?
+			(ocf_cache_line_size_t)cache_line_size * KiB :
+			ocf_cache_line_size_default;
+	if (set_cache_line_size == 0) {
+		SPDK_ERRLOG("Cache line size should be non-zero.\n");
+		rc = -EINVAL;
+		goto error_free;
+	}
+	vbdev->cfg.device.cache_line_size = set_cache_line_size;
+	vbdev->cfg.cache.cache_line_size = set_cache_line_size;
+
 	vbdev->name = strdup(vbdev_name);
 	if (!vbdev->name) {
 		goto error_mem;
@@ -1240,9 +1260,10 @@ error_free:
 static int
 vbdev_ocf_init(void)
 {
-	const char *vbdev_name, *modename, *cache_name, *core_name;
+	const char *vbdev_name, *modename, *cache_line_size, *cache_name, *core_name;
 	struct spdk_conf_section *sp;
 	int status;
+	uint64_t cache_line_size_uint64;
 
 	status = vbdev_ocf_ctx_init();
 	if (status) {
@@ -1279,19 +1300,26 @@ vbdev_ocf_init(void)
 			continue;
 		}
 
-		cache_name = spdk_conf_section_get_nmval(sp, "OCF", i, 2);
+		cache_line_size = spdk_conf_section_get_nmval(sp, "OCF", i, 2);
+		if (!cache_line_size) {
+			SPDK_ERRLOG("No cache line size specified for OCF vbdev '%s'\n", vbdev_name);
+			continue;
+		}
+		cache_line_size_uint64 = strtoull(cache_line_size, NULL, 10);
+
+		cache_name = spdk_conf_section_get_nmval(sp, "OCF", i, 3);
 		if (!cache_name) {
 			SPDK_ERRLOG("No cache device specified for OCF vbdev '%s'\n", vbdev_name);
 			continue;
 		}
 
-		core_name = spdk_conf_section_get_nmval(sp, "OCF", i, 3);
+		core_name = spdk_conf_section_get_nmval(sp, "OCF", i, 4);
 		if (!core_name) {
 			SPDK_ERRLOG("No core devices specified for OCF vbdev '%s'\n", vbdev_name);
 			continue;
 		}
 
-		status = init_vbdev(vbdev_name, modename, cache_name, core_name, false);
+		status = init_vbdev(vbdev_name, modename, cache_line_size_uint64, cache_name, core_name, false);
 		if (status) {
 			SPDK_ERRLOG("Config initialization failed with code: %d\n", status);
 		}
@@ -1425,6 +1453,7 @@ attach_base_bdevs(struct vbdev_ocf *vbdev,
 void
 vbdev_ocf_construct(const char *vbdev_name,
 		    const char *cache_mode_name,
+		    const uint64_t cache_line_size,
 		    const char *cache_name,
 		    const char *core_name,
 		    bool loadq,
@@ -1436,7 +1465,7 @@ vbdev_ocf_construct(const char *vbdev_name,
 	struct spdk_bdev *core_bdev = spdk_bdev_get_by_name(core_name);
 	struct vbdev_ocf *vbdev;
 
-	rc = init_vbdev(vbdev_name, cache_mode_name, cache_name, core_name, loadq);
+	rc = init_vbdev(vbdev_name, cache_mode_name, cache_line_size, cache_name, core_name, loadq);
 	if (rc) {
 		cb(rc, NULL, cb_arg);
 		return;
@@ -1590,7 +1619,7 @@ metadata_probe_cores_construct(void *priv, int error, unsigned int num_cores)
 		}
 
 		ctx->refcnt++;
-		vbdev_ocf_construct(vbdev_name, NULL, cache_name, core_name, true,
+		vbdev_ocf_construct(vbdev_name, NULL, 0, cache_name, core_name, true,
 				    metadata_probe_construct_cb, ctx);
 	}
 

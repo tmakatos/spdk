@@ -486,11 +486,17 @@ static void
 nvmf_tgt_subsystem_stop_next(struct spdk_nvmf_subsystem *subsystem,
 			     void *cb_arg, int status)
 {
+	int rc;
+
 	subsystem = spdk_nvmf_subsystem_get_next(subsystem);
 	if (subsystem) {
-		spdk_nvmf_subsystem_stop(subsystem,
-					 nvmf_tgt_subsystem_stop_next,
-					 cb_arg);
+		rc = spdk_nvmf_subsystem_stop(subsystem,
+					      nvmf_tgt_subsystem_stop_next,
+					      cb_arg);
+		if (rc) {
+			nvmf_tgt_subsystem_stop_next(subsystem, cb_arg, 0);
+			fprintf(stderr, "Unable to stop NVMe-oF subsystem. Trying others.\n");
+		}
 		return;
 	}
 
@@ -504,12 +510,17 @@ static void
 nvmf_tgt_stop_subsystems(struct nvmf_target *nvmf_tgt)
 {
 	struct spdk_nvmf_subsystem *subsystem;
+	int rc;
 
 	subsystem = spdk_nvmf_subsystem_get_first(nvmf_tgt->tgt);
 	if (spdk_likely(subsystem)) {
-		spdk_nvmf_subsystem_stop(subsystem,
-					 nvmf_tgt_subsystem_stop_next,
-					 NULL);
+		rc = spdk_nvmf_subsystem_stop(subsystem,
+					      nvmf_tgt_subsystem_stop_next,
+					      NULL);
+		if (rc) {
+			nvmf_tgt_subsystem_stop_next(subsystem, NULL, 0);
+			fprintf(stderr, "Unable to stop NVMe-oF subsystem. Trying others.\n");
+		}
 	} else {
 		g_target_state = NVMF_FINI_POLL_GROUPS;
 	}
@@ -519,10 +530,17 @@ static void
 nvmf_tgt_subsystem_start_next(struct spdk_nvmf_subsystem *subsystem,
 			      void *cb_arg, int status)
 {
+	int rc;
+
 	subsystem = spdk_nvmf_subsystem_get_next(subsystem);
 	if (subsystem) {
-		spdk_nvmf_subsystem_start(subsystem, nvmf_tgt_subsystem_start_next,
-					  cb_arg);
+		rc = spdk_nvmf_subsystem_start(subsystem, nvmf_tgt_subsystem_start_next,
+					       cb_arg);
+		if (rc) {
+			g_target_state = NVMF_FINI_STOP_SUBSYSTEMS;
+			fprintf(stderr, "Unable to start NVMe-oF subsystem. shutting down app.\n");
+			nvmf_target_advance_state();
+		}
 		return;
 	}
 
@@ -536,6 +554,7 @@ static void
 nvmf_tgt_start_subsystems(struct nvmf_target *nvmf_tgt)
 {
 	struct spdk_nvmf_subsystem *subsystem;
+	int rc;
 
 	/* Subsystem is the NVM subsystem which is a combine of namespaces
 	 * except the discovery subsystem which is used for discovery service.
@@ -548,9 +567,13 @@ nvmf_tgt_start_subsystems(struct nvmf_target *nvmf_tgt)
 		 * Start subsystem means make it from inactive to active that means
 		 * subsystem start to work or it can be accessed.
 		 */
-		spdk_nvmf_subsystem_start(subsystem,
-					  nvmf_tgt_subsystem_start_next,
-					  NULL);
+		rc = spdk_nvmf_subsystem_start(subsystem,
+					       nvmf_tgt_subsystem_start_next,
+					       NULL);
+		if (rc) {
+			fprintf(stderr, "Unable to start NVMe-oF subsystem. shutting down app.\n");
+			g_target_state = NVMF_FINI_STOP_SUBSYSTEMS;
+		}
 	} else {
 		g_target_state = NVMF_RUNNING;
 	}

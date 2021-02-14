@@ -100,12 +100,12 @@ nvmf_poll_group_poll(void *ctx)
 	TAILQ_FOREACH(tgroup, &group->tgroups, link) {
 		rc = nvmf_transport_poll_group_poll(tgroup);
 		if (rc < 0) {
-			return -1;
+			return SPDK_POLLER_BUSY;
 		}
 		count += rc;
 	}
 
-	return count;
+	return count > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 static int
@@ -186,6 +186,8 @@ nvmf_tgt_destroy_poll_group(void *io_device, void *ctx_buf)
 
 	free(group->sgroups);
 
+	spdk_poller_unregister(&group->poller);
+
 	if (group->destroy_cb_fn) {
 		group->destroy_cb_fn(group->destroy_cb_arg, 0);
 	}
@@ -225,8 +227,6 @@ nvmf_tgt_destroy_poll_group_qpairs(struct spdk_nvmf_poll_group *group)
 		SPDK_ERRLOG("Failed to allocate memory for destroy poll group ctx\n");
 		return;
 	}
-
-	spdk_poller_unregister(&group->poller);
 
 	ctx->group = group;
 	_nvmf_tgt_disconnect_next_qpair(ctx);
@@ -577,6 +577,7 @@ spdk_nvmf_tgt_write_config_json(struct spdk_json_write_ctx *w, struct spdk_nvmf_
 		if (transport->ops->type == SPDK_NVME_TRANSPORT_RDMA) {
 			spdk_json_write_named_uint32(w, "max_srq_depth", transport->opts.max_srq_depth);
 		}
+		spdk_json_write_named_uint32(w, "abort_timeout_sec", transport->opts.abort_timeout_sec);
 		spdk_json_write_object_end(w);
 
 		spdk_json_write_object_end(w);
@@ -857,8 +858,8 @@ spdk_nvmf_poll_group_add(struct spdk_nvmf_poll_group *group,
 	return rc;
 }
 
-static
-void _nvmf_ctrlr_destruct(void *ctx)
+static void
+_nvmf_ctrlr_destruct(void *ctx)
 {
 	struct spdk_nvmf_ctrlr *ctrlr = ctx;
 
@@ -883,8 +884,7 @@ _nvmf_ctrlr_free_from_qpair(void *ctx)
 	spdk_bit_array_clear(ctrlr->qpair_mask, qpair_ctx->qid);
 	count = spdk_bit_array_count_set(ctrlr->qpair_mask);
 	if (count == 0) {
-		spdk_bit_array_free(&ctrlr->qpair_mask);
-
+		ctrlr->in_destruct = true;
 		spdk_thread_send_msg(ctrlr->subsys->thread, _nvmf_ctrlr_destruct, ctrlr);
 	}
 
@@ -931,6 +931,7 @@ spdk_nvmf_poll_group_remove(struct spdk_nvmf_qpair *qpair)
 	}
 
 	TAILQ_REMOVE(&qpair->group->qpairs, qpair, link);
+	qpair->group = NULL;
 }
 
 static void
@@ -958,10 +959,26 @@ _nvmf_qpair_destroy(void *ctx, int status)
 	spdk_thread_send_msg(ctrlr->thread, _nvmf_ctrlr_free_from_qpair, qpair_ctx);
 }
 
+static void
+_nvmf_qpair_disconnect_msg(void *ctx)
+{
+	struct nvmf_qpair_disconnect_ctx *qpair_ctx = ctx;
+
+	spdk_nvmf_qpair_disconnect(qpair_ctx->qpair, qpair_ctx->cb_fn, qpair_ctx->ctx);
+	free(ctx);
+}
+
 int
 spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair, nvmf_qpair_disconnect_cb cb_fn, void *ctx)
 {
 	struct nvmf_qpair_disconnect_ctx *qpair_ctx;
+
+	if (__atomic_test_and_set(&qpair->disconnect_started, __ATOMIC_RELAXED)) {
+		if (cb_fn) {
+			cb_fn(ctx);
+		}
+		return 0;
+	}
 
 	/* If we get a qpair in the uninitialized state, we can just destroy it immediately */
 	if (qpair->state == SPDK_NVMF_QPAIR_UNINITIALIZED) {
@@ -972,19 +989,20 @@ spdk_nvmf_qpair_disconnect(struct spdk_nvmf_qpair *qpair, nvmf_qpair_disconnect_
 		return 0;
 	}
 
-	/* The queue pair must be disconnected from the thread that owns it */
-	assert(qpair->group->thread == spdk_get_thread());
-
-	if (qpair->state != SPDK_NVMF_QPAIR_ACTIVE) {
-		/* This can occur if the connection is killed by the target,
-		 * which results in a notification that the connection
-		 * died. Send a message to defer the processing of this
-		 * callback. This allows the stack to unwind in the case
-		 * where a bunch of connections are disconnected in
-		 * a loop. */
-		if (cb_fn) {
-			spdk_thread_send_msg(qpair->group->thread, cb_fn, ctx);
+	assert(qpair->group != NULL);
+	if (spdk_get_thread() != qpair->group->thread) {
+		/* clear the atomic so we can set it on the next call on the proper thread. */
+		__atomic_clear(&qpair->disconnect_started, __ATOMIC_RELAXED);
+		qpair_ctx = calloc(1, sizeof(struct nvmf_qpair_disconnect_ctx));
+		if (!qpair_ctx) {
+			SPDK_ERRLOG("Unable to allocate context for nvmf_qpair_disconnect\n");
+			return -ENOMEM;
 		}
+		qpair_ctx->qpair = qpair;
+		qpair_ctx->cb_fn = cb_fn;
+		qpair_ctx->thread = qpair->group->thread;
+		qpair_ctx->ctx = ctx;
+		spdk_thread_send_msg(qpair->group->thread, _nvmf_qpair_disconnect_msg, qpair_ctx);
 		return 0;
 	}
 
@@ -1355,7 +1373,7 @@ nvmf_poll_group_remove_subsystem(struct spdk_nvmf_poll_group *group,
 		_nvmf_poll_group_remove_subsystem_cb(ctx, 0);
 	}
 
-	if (rc != 0) {
+	if (rc != 0 && rc != -EINPROGRESS) {
 		free(ctx);
 		goto fini;
 	}
@@ -1386,7 +1404,9 @@ nvmf_poll_group_pause_subsystem(struct spdk_nvmf_poll_group *group,
 		goto fini;
 	}
 
-	assert(sgroup->state == SPDK_NVMF_SUBSYSTEM_ACTIVE);
+	if (sgroup->state == SPDK_NVMF_SUBSYSTEM_PAUSED) {
+		goto fini;
+	}
 	sgroup->state = SPDK_NVMF_SUBSYSTEM_PAUSING;
 
 	if (sgroup->io_outstanding > 0) {
@@ -1419,7 +1439,9 @@ nvmf_poll_group_resume_subsystem(struct spdk_nvmf_poll_group *group,
 
 	sgroup = &group->sgroups[subsystem->id];
 
-	assert(sgroup->state == SPDK_NVMF_SUBSYSTEM_PAUSED);
+	if (sgroup->state == SPDK_NVMF_SUBSYSTEM_ACTIVE) {
+		goto fini;
+	}
 
 	rc = poll_group_update_subsystem(group, subsystem);
 	if (rc) {

@@ -47,15 +47,9 @@
 #include "spdk/util.h"
 #include "spdk/json.h"
 
-/* Undefine this to require an RPC to enable IDXD. */
-#undef DEVELOPER_DEBUG_MODE
+#define ALIGN_4K 0x1000
 
-#ifdef DEVELOPER_DEBUG_MODE
-static bool g_idxd_enable = true;
-#else
 static bool g_idxd_enable = false;
-#endif
-
 uint32_t g_config_number;
 
 enum channel_state {
@@ -94,6 +88,7 @@ struct idxd_op {
 	uint64_t			fill_pattern;
 	uint32_t			op_code;
 	uint64_t			nbytes;
+	struct idxd_batch		*batch;
 	TAILQ_ENTRY(idxd_op)		link;
 };
 
@@ -110,7 +105,7 @@ struct idxd_task {
 	spdk_accel_completion_cb	cb;
 };
 
-pthread_mutex_t g_num_channels_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t g_configuration_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct spdk_io_channel *idxd_get_io_channel(void);
 
@@ -121,6 +116,7 @@ idxd_select_device(void)
 	 * We allow channels to share underlying devices,
 	 * selection is round-robin based.
 	 */
+
 	g_next_dev = TAILQ_NEXT(g_next_dev, tailq);
 	if (g_next_dev == NULL) {
 		g_next_dev = TAILQ_FIRST(&g_idxd_devices);
@@ -144,7 +140,6 @@ idxd_poll(void *arg)
 
 	while (!TAILQ_EMPTY(&chan->queued_ops)) {
 		op = TAILQ_FIRST(&chan->queued_ops);
-		TAILQ_REMOVE(&chan->queued_ops, op, link);
 
 		switch (op->op_code) {
 		case IDXD_OPCODE_MEMMOVE:
@@ -167,16 +162,19 @@ idxd_poll(void *arg)
 			rc = spdk_idxd_submit_crc32c(op->chan, op->dst, op->src, op->seed, op->nbytes,
 						     op->cb_fn, op->cb_arg);
 			break;
+		case IDXD_OPCODE_BATCH:
+			rc = spdk_idxd_batch_submit(op->chan, op->batch, op->cb_fn, op->cb_arg);
+			break;
 		default:
 			/* Should never get here */
 			assert(false);
 			break;
 		}
 		if (rc == 0) {
+			TAILQ_REMOVE(&chan->queued_ops, op, link);
 			free(op);
 		} else {
 			/* Busy, resubmit to try again later */
-			TAILQ_INSERT_HEAD(&chan->queued_ops, op, link);
 			break;
 		}
 	}
@@ -193,13 +191,13 @@ accel_engine_idxd_get_ctx_size(void)
 static void
 idxd_done(void *cb_arg, int status)
 {
-	struct spdk_accel_task *accel_req;
+	struct spdk_accel_task *accel_task;
 	struct idxd_task *idxd_task = cb_arg;
 
-	accel_req = SPDK_CONTAINEROF(idxd_task, struct spdk_accel_task,
-				     offload_ctx);
+	accel_task = SPDK_CONTAINEROF(idxd_task, struct spdk_accel_task,
+				      offload_ctx);
 
-	idxd_task->cb(accel_req, status);
+	idxd_task->cb(accel_task, status);
 }
 
 static struct idxd_op *
@@ -221,14 +219,14 @@ _prep_queue_command(struct idxd_io_channel *chan, spdk_accel_completion_cb cb_fn
 }
 
 static int
-idxd_submit_copy(void *cb_arg, struct spdk_io_channel *ch, void *dst, void *src, uint64_t nbytes,
-		 spdk_accel_completion_cb cb)
+idxd_submit_copy(struct spdk_io_channel *ch, void *dst, void *src, uint64_t nbytes,
+		 spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
 	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
 	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
 	int rc = 0;
 
-	idxd_task->cb = cb;
+	idxd_task->cb = cb_fn;
 
 	if (chan->state == IDXD_CHANNEL_ACTIVE) {
 		rc = spdk_idxd_submit_copy(chan->chan, dst, src, nbytes, idxd_done, idxd_task);
@@ -261,15 +259,14 @@ idxd_submit_copy(void *cb_arg, struct spdk_io_channel *ch, void *dst, void *src,
 }
 
 static int
-idxd_submit_dualcast(void *cb_arg, struct spdk_io_channel *ch, void *dst1, void *dst2, void *src,
-		     uint64_t nbytes,
-		     spdk_accel_completion_cb cb)
+idxd_submit_dualcast(struct spdk_io_channel *ch, void *dst1, void *dst2, void *src,
+		     uint64_t nbytes, spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
 	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
 	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
 	int rc = 0;
 
-	idxd_task->cb = cb;
+	idxd_task->cb = cb_fn;
 
 	if (chan->state == IDXD_CHANNEL_ACTIVE) {
 		rc = spdk_idxd_submit_dualcast(chan->chan, dst1, dst2, src, nbytes, idxd_done, idxd_task);
@@ -303,15 +300,14 @@ idxd_submit_dualcast(void *cb_arg, struct spdk_io_channel *ch, void *dst1, void 
 }
 
 static int
-idxd_submit_compare(void *cb_arg, struct spdk_io_channel *ch, void *src1, void *src2,
-		    uint64_t nbytes,
-		    spdk_accel_completion_cb cb)
+idxd_submit_compare(struct spdk_io_channel *ch, void *src1, void *src2,
+		    uint64_t nbytes, spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
 	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
 	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
 	int rc = 0;
 
-	idxd_task->cb = cb;
+	idxd_task->cb = cb_fn;
 
 	if (chan->state == IDXD_CHANNEL_ACTIVE) {
 		rc = spdk_idxd_submit_compare(chan->chan, src1, src2, nbytes, idxd_done, idxd_task);
@@ -344,15 +340,15 @@ idxd_submit_compare(void *cb_arg, struct spdk_io_channel *ch, void *src1, void *
 }
 
 static int
-idxd_submit_fill(void *cb_arg, struct spdk_io_channel *ch, void *dst, uint8_t fill,
-		 uint64_t nbytes, spdk_accel_completion_cb cb)
+idxd_submit_fill(struct spdk_io_channel *ch, void *dst, uint8_t fill,
+		 uint64_t nbytes, spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
 	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
 	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
 	int rc = 0;
 	uint64_t fill_pattern;
 
-	idxd_task->cb = cb;
+	idxd_task->cb = cb_fn;
 	memset(&fill_pattern, fill, sizeof(uint64_t));
 
 	if (chan->state == IDXD_CHANNEL_ACTIVE) {
@@ -386,14 +382,14 @@ idxd_submit_fill(void *cb_arg, struct spdk_io_channel *ch, void *dst, uint8_t fi
 }
 
 static int
-idxd_submit_crc32c(void *cb_arg, struct spdk_io_channel *ch, uint32_t *dst, void *src,
-		   uint32_t seed, uint64_t nbytes, spdk_accel_completion_cb cb)
+idxd_submit_crc32c(struct spdk_io_channel *ch, uint32_t *dst, void *src,
+		   uint32_t seed, uint64_t nbytes, spdk_accel_completion_cb cb_fn, void *cb_arg)
 {
 	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
 	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
 	int rc = 0;
 
-	idxd_task->cb = cb;
+	idxd_task->cb = cb_fn;
 
 	if (chan->state == IDXD_CHANNEL_ACTIVE) {
 		rc = spdk_idxd_submit_crc32c(chan->chan, dst, src, seed, nbytes, idxd_done, idxd_task);
@@ -430,12 +426,157 @@ static uint64_t
 idxd_get_capabilities(void)
 {
 	return ACCEL_COPY | ACCEL_FILL | ACCEL_CRC32C | ACCEL_COMPARE |
-	       ACCEL_DUALCAST;
+	       ACCEL_DUALCAST | ACCEL_BATCH;
+}
+
+static uint32_t
+idxd_batch_get_max(void)
+{
+	return spdk_idxd_batch_get_max();
+}
+
+static struct spdk_accel_batch *
+idxd_batch_start(struct spdk_io_channel *ch)
+{
+	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
+
+	return (struct spdk_accel_batch *)spdk_idxd_batch_create(chan->chan);
+}
+
+static int
+idxd_batch_cancel(struct spdk_io_channel *ch, struct spdk_accel_batch *_batch)
+{
+	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
+	struct idxd_batch *batch = (struct idxd_batch *)_batch;
+
+	return spdk_idxd_batch_cancel(chan->chan, batch);
+}
+
+static int
+idxd_batch_submit(struct spdk_io_channel *ch, struct spdk_accel_batch *_batch,
+		  spdk_accel_completion_cb cb_fn, void *cb_arg)
+{
+	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
+	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
+	struct idxd_batch *batch = (struct idxd_batch *)_batch;
+	int rc = 0;
+
+	idxd_task->cb = cb_fn;
+
+	if (chan->state == IDXD_CHANNEL_ACTIVE) {
+		rc = spdk_idxd_batch_submit(chan->chan, batch, idxd_done, idxd_task);
+	}
+
+	if (chan->state == IDXD_CHANNEL_PAUSED || rc == -EBUSY) {
+		struct idxd_op *op_to_queue;
+
+		/* Commpom prep. */
+		op_to_queue = _prep_queue_command(chan, idxd_done, idxd_task);
+		if (op_to_queue == NULL) {
+			return -ENOMEM;
+		}
+
+		/* Command specific. */
+		op_to_queue->batch = batch;
+		op_to_queue->op_code = IDXD_OPCODE_BATCH;
+
+		/* Queue the operation. */
+		TAILQ_INSERT_TAIL(&chan->queued_ops, op_to_queue, link);
+		return 0;
+
+	} else if (chan->state == IDXD_CHANNEL_ERROR) {
+		return -EINVAL;
+	}
+
+	return rc;
+}
+
+static int
+idxd_batch_prep_copy(struct spdk_io_channel *ch, struct spdk_accel_batch *_batch,
+		     void *dst, void *src, uint64_t nbytes, spdk_accel_completion_cb cb_fn, void *cb_arg)
+{
+	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
+	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
+	struct idxd_batch *batch = (struct idxd_batch *)_batch;
+
+	idxd_task->cb = cb_fn;
+
+	return spdk_idxd_batch_prep_copy(chan->chan, batch, dst, src, nbytes,
+					 idxd_done, idxd_task);
+}
+
+static int
+idxd_batch_prep_fill(struct spdk_io_channel *ch, struct spdk_accel_batch *_batch,
+		     void *dst, uint8_t fill, uint64_t nbytes, spdk_accel_completion_cb cb_fn, void *cb_arg)
+{
+	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
+	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
+	uint64_t fill_pattern;
+	struct idxd_batch *batch = (struct idxd_batch *)_batch;
+
+	idxd_task->cb = cb_fn;
+	memset(&fill_pattern, fill, sizeof(uint64_t));
+
+	return spdk_idxd_batch_prep_fill(chan->chan, batch, dst, fill_pattern, nbytes, idxd_done,
+					 idxd_task);
+}
+
+static int
+idxd_batch_prep_dualcast(struct spdk_io_channel *ch, struct spdk_accel_batch *_batch,
+			 void *dst1, void *dst2, void *src, uint64_t nbytes,
+			 spdk_accel_completion_cb cb_fn, void *cb_arg)
+{
+	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
+	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
+	struct idxd_batch *batch = (struct idxd_batch *)_batch;
+
+	idxd_task->cb = cb_fn;
+
+	return spdk_idxd_batch_prep_dualcast(chan->chan, batch, dst1, dst2, src, nbytes, idxd_done,
+					     idxd_task);
+}
+
+static int
+idxd_batch_prep_crc32c(struct spdk_io_channel *ch, struct spdk_accel_batch *_batch,
+		       uint32_t *dst, void *src, uint32_t seed, uint64_t nbytes,
+		       spdk_accel_completion_cb cb_fn, void *cb_arg)
+{
+	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
+	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
+	struct idxd_batch *batch = (struct idxd_batch *)_batch;
+
+	idxd_task->cb = cb_fn;
+
+	return spdk_idxd_batch_prep_crc32c(chan->chan, batch, dst, src, seed, nbytes, idxd_done,
+					   idxd_task);
+}
+
+static int
+idxd_batch_prep_compare(struct spdk_io_channel *ch, struct spdk_accel_batch *_batch,
+			void *src1, void *src2, uint64_t nbytes, spdk_accel_completion_cb cb_fn, void *cb_arg)
+{
+	struct idxd_task *idxd_task = (struct idxd_task *)cb_arg;
+	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
+	struct idxd_batch *batch = (struct idxd_batch *)_batch;
+
+	idxd_task->cb = cb_fn;
+
+	return spdk_idxd_batch_prep_compare(chan->chan, batch, src1, src2, nbytes, idxd_done,
+					    idxd_task);
 }
 
 static struct spdk_accel_engine idxd_accel_engine = {
 	.get_capabilities	= idxd_get_capabilities,
 	.copy			= idxd_submit_copy,
+	.batch_get_max		= idxd_batch_get_max,
+	.batch_create		= idxd_batch_start,
+	.batch_cancel		= idxd_batch_cancel,
+	.batch_prep_copy	= idxd_batch_prep_copy,
+	.batch_prep_fill	= idxd_batch_prep_fill,
+	.batch_prep_dualcast	= idxd_batch_prep_dualcast,
+	.batch_prep_crc32c	= idxd_batch_prep_crc32c,
+	.batch_prep_compare	= idxd_batch_prep_compare,
+	.batch_submit		= idxd_batch_submit,
 	.dualcast		= idxd_submit_dualcast,
 	.compare		= idxd_submit_compare,
 	.fill			= idxd_submit_fill,
@@ -458,9 +599,9 @@ _config_max_desc(struct spdk_io_channel_iter *i)
 	ch = spdk_io_channel_iter_get_channel(i);
 	chan = spdk_io_channel_get_ctx(ch);
 
-	pthread_mutex_lock(&g_num_channels_lock);
+	pthread_mutex_lock(&g_configuration_lock);
 	rc = spdk_idxd_reconfigure_chan(chan->chan, chan->dev->num_channels);
-	pthread_mutex_unlock(&g_num_channels_lock);
+	pthread_mutex_unlock(&g_configuration_lock);
 	if (rc == 0) {
 		chan->state = IDXD_CHANNEL_ACTIVE;
 	} else {
@@ -489,8 +630,7 @@ _pause_chan(struct spdk_io_channel_iter *i)
 static void
 _pause_chan_done(struct spdk_io_channel_iter *i, int status)
 {
-	spdk_for_each_channel(&idxd_accel_engine, _config_max_desc, NULL,
-			      NULL);
+	spdk_for_each_channel(&idxd_accel_engine, _config_max_desc, NULL, NULL);
 }
 
 static int
@@ -521,18 +661,19 @@ idxd_create_cb(void *io_device, void *ctx_buf)
 	 * channels. This enables dynamic load balancing for HW
 	 * flow control.
 	 */
+	pthread_mutex_lock(&g_configuration_lock);
 	rc = spdk_idxd_configure_chan(chan->chan);
 	if (rc) {
 		SPDK_ERRLOG("Failed to configure new channel rc = %d\n", rc);
 		chan->state = IDXD_CHANNEL_ERROR;
 		spdk_poller_unregister(&chan->poller);
+		pthread_mutex_unlock(&g_configuration_lock);
 		return rc;
 	}
 
 	chan->state = IDXD_CHANNEL_PAUSED;
-	pthread_mutex_lock(&g_num_channels_lock);
 	chan->dev->num_channels++;
-	pthread_mutex_unlock(&g_num_channels_lock);
+	pthread_mutex_unlock(&g_configuration_lock);
 
 	/*
 	 * Pause all channels so that we can set proper flow control
@@ -549,8 +690,7 @@ static void
 _pause_chan_destroy_done(struct spdk_io_channel_iter *i, int status)
 {
 	/* Rebalance the rings with the smaller number of remaining channels. */
-	spdk_for_each_channel(&idxd_accel_engine, _config_max_desc, NULL,
-			      NULL);
+	spdk_for_each_channel(&idxd_accel_engine, _config_max_desc, NULL, NULL);
 }
 
 static void
@@ -558,12 +698,12 @@ idxd_destroy_cb(void *io_device, void *ctx_buf)
 {
 	struct idxd_io_channel *chan = ctx_buf;
 
-	pthread_mutex_lock(&g_num_channels_lock);
+	pthread_mutex_lock(&g_configuration_lock);
 	assert(chan->dev->num_channels > 0);
 	chan->dev->num_channels--;
-	pthread_mutex_unlock(&g_num_channels_lock);
-
 	spdk_idxd_reconfigure_chan(chan->chan, 0);
+	pthread_mutex_unlock(&g_configuration_lock);
+
 	spdk_poller_unregister(&chan->poller);
 	spdk_idxd_put_channel(chan->chan);
 
@@ -604,10 +744,6 @@ probe_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
 	if (spdk_pci_device_claim(pci_dev) < 0) {
 		return false;
 	}
-
-#ifdef DEVELOPER_DEBUG_MODE
-	spdk_idxd_set_config(0);
-#endif
 
 	return true;
 }

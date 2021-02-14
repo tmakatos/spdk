@@ -1049,6 +1049,7 @@ function run_fio() {
 	local run_plugin_mode=false
 	local fio_start_cmd
 	local fio_output_format="normal"
+	local fio_gtod_reduce=false
 	local wait_for_fio=true
 
 	for arg in "$@"; do
@@ -1069,6 +1070,7 @@ function run_fio() {
 			--json) fio_output_format="json" ;;
 			--hide-results) hide_results=true ;;
 			--no-wait-for-fio) wait_for_fio=false ;;
+			--gtod-reduce) fio_gtod_reduce=true ;;
 			*)
 				error "Invalid argument '$arg'"
 				return 1
@@ -1103,6 +1105,11 @@ function run_fio() {
 		local vmdisks=${vm#*:}
 
 		sed "s@filename=@filename=$vmdisks@" $job_file | vm_exec $vm_num "cat > /root/$job_fname"
+
+		if $fio_gtod_reduce; then
+			vm_exec $vm_num "echo 'gtod_reduce=1' >> /root/$job_fname"
+		fi
+
 		vm_exec $vm_num cat /root/$job_fname
 
 		if $run_server_mode; then
@@ -1142,9 +1149,92 @@ function run_fio() {
 	$fio_start_cmd
 	sleep 1
 
+	if [[ "$fio_output_format" == "json" ]]; then
+		# Fio in client-server mode produces a lot of "trash" output
+		# preceding JSON structure, making it not possible to parse.
+		# Remove these lines from file.
+		# shellcheck disable=SC2005
+		echo "$(grep -vP '^[<\w]' "$out/$log_fname")" > "$out/$log_fname"
+	fi
+
 	if [[ ! $hide_results ]]; then
 		cat $out/$log_fname
 	fi
+}
+
+# Parsing fio results for json output and client-server mode only!
+function parse_fio_results() {
+	local fio_log_dir=$1
+	local fio_log_filename=$2
+	local fio_csv_filename
+
+	# Variables used in parsing loop
+	local log_file
+	local rwmode mixread mixwrite
+	local lat_key lat_divisor
+	local client_stats iops bw
+	local read_avg_lat read_min_lat read_max_lat
+	local write_avg_lat write_min_lat write_min_lat
+
+	declare -A results
+	results["iops"]=0
+	results["bw"]=0
+	results["avg_lat"]=0
+	results["min_lat"]=0
+	results["max_lat"]=0
+
+	# Loop using the log filename to see if there are any other
+	# matching files. This is in case we ran fio test multiple times.
+	log_files=("$fio_log_dir/$fio_log_filename"*)
+	for log_file in "${log_files[@]}"; do
+		rwmode=$(jq -r '.["client_stats"][0]["job options"]["rw"]' "$log_file")
+		mixread=1
+		mixwrite=1
+		if [[ $rwmode = *"rw"* ]]; then
+			mixread=$(jq -r '.["client_stats"][0]["job options"]["rwmixread"]' "$log_file")
+			mixread=$(bc -l <<< "scale=3; $mixread/100")
+			mixwrite=$(bc -l <<< "scale=3; 1-$mixread")
+		fi
+
+		client_stats=$(jq -r '.["client_stats"][] | select(.jobname == "All clients")' "$log_file")
+
+		# Check latency unit and later normalize to microseconds
+		lat_key="lat_us"
+		lat_divisor=1
+		if jq -er '.read["lat_ns"]' &> /dev/null <<< $client_stats; then
+			lat_key="lat_ns"
+			lat_divisor=1000
+		fi
+
+		# Horrific bash float point arithmetic oprations below.
+		# Viewer discretion is advised.
+		iops=$(jq -r '[.read["iops"],.write["iops"]] | add' <<< $client_stats)
+		bw=$(jq -r '[.read["bw"],.write["bw"]] | add' <<< $client_stats)
+		read_avg_lat=$(jq -r --arg lat_key $lat_key '.read[$lat_key]["mean"]' <<< $client_stats)
+		read_min_lat=$(jq -r --arg lat_key $lat_key '.read[$lat_key]["min"]' <<< $client_stats)
+		read_max_lat=$(jq -r --arg lat_key $lat_key '.read[$lat_key]["max"]' <<< $client_stats)
+		write_avg_lat=$(jq -r --arg lat_key $lat_key '.write[$lat_key]["mean"]' <<< $client_stats)
+		write_min_lat=$(jq -r --arg lat_key $lat_key '.write[$lat_key]["min"]' <<< $client_stats)
+		write_max_lat=$(jq -r --arg lat_key $lat_key '.write[$lat_key]["max"]' <<< $client_stats)
+
+		results["iops"]=$(bc -l <<< "${results[iops]} + $iops")
+		results["bw"]=$(bc -l <<< "${results[bw]} + $bw")
+		results["avg_lat"]=$(bc -l <<< "${results[avg_lat]} + ($mixread*$read_avg_lat + $mixwrite*$write_avg_lat)/$lat_divisor")
+		results["min_lat"]=$(bc -l <<< "${results[min_lat]} + ($mixread*$read_min_lat + $mixwrite*$write_min_lat)/$lat_divisor")
+		results["max_lat"]=$(bc -l <<< "${results[max_lat]} + ($mixread*$read_max_lat + $mixwrite*$write_max_lat)/$lat_divisor")
+	done
+
+	results["iops"]=$(bc -l <<< "scale=3; ${results[iops]} / ${#log_files[@]}")
+	results["bw"]=$(bc -l <<< "scale=3; ${results[bw]} / ${#log_files[@]}")
+	results["avg_lat"]=$(bc -l <<< "scale=3; ${results[avg_lat]} / ${#log_files[@]}")
+	results["min_lat"]=$(bc -l <<< "scale=3; ${results[min_lat]} / ${#log_files[@]}")
+	results["max_lat"]=$(bc -l <<< "scale=3; ${results[max_lat]} / ${#log_files[@]}")
+
+	fio_csv_filename="${fio_log_filename%%.*}.csv"
+	cat <<- EOF > "$fio_log_dir/$fio_csv_filename"
+		iops,bw,avg_lat,min_lat,max_lat
+		${results["iops"]},${results["bw"]},${results["avg_lat"]},${results["min_lat"]},${results["max_lat"]}
+	EOF
 }
 
 # Shutdown or kill any running VM and SPDK APP.

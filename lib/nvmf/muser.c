@@ -860,6 +860,7 @@ init_qp(struct muser_ctrlr *ctrlr, struct spdk_nvmf_transport *transport,
 	qpair->qpair.transport = transport;
 	qpair->ctrlr = ctrlr;
 	qpair->qsize = qsize;
+	qpair->state = MUSER_QPAIR_INACTIVE;
 
 	TAILQ_INIT(&qpair->reqs);
 
@@ -1338,13 +1339,75 @@ handle_dbl_access(struct muser_ctrlr *ctrlr, uint32_t *buf,
 	return 0;
 }
 
+static int
+destroy_ctrlr(struct muser_ctrlr *ctrlr)
+{
+	int i;
+
+	if (ctrlr == NULL) {
+		return 0;
+	}
+
+	for (i = 0; i < MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		destroy_qp(ctrlr, i);
+	}
+
+	if (ctrlr->endpoint) {
+		ctrlr->endpoint->ctrlr = NULL;
+	}
+
+	free(ctrlr);
+	return 0;
+}
+
+static int
+handle_admin_queue_connect_rsp(struct muser_req *connect_req, void *cb_arg)
+{
+	struct muser_poll_group *muser_group;
+	struct muser_req *req = cb_arg;
+	struct muser_qpair *qpair = cb_arg;
+	struct muser_ctrlr *ctrlr;
+
+	assert(qpair != NULL);
+	assert(connect_req != NULL);
+
+	muser_group = SPDK_CONTAINEROF(qpair->group, struct muser_poll_group, group);
+	TAILQ_INSERT_TAIL(&muser_group->qps, qpair, link);
+	qpair->state = MUSER_QPAIR_ACTIVE;
+
+	ctrlr = qpair->ctrlr;
+	assert(ctrlr != NULL);
+
+	if (spdk_nvme_cpl_is_error(&connect_req->req.rsp->nvme_cpl)) {
+		muser_req_free(&req->req);
+		destroy_qp(ctrlr, qpair->qpair.qid);
+		destroy_ctrlr(ctrlr);
+		return -1;
+	}
+
+	if (nvmf_qpair_is_admin_queue(&qpair->qpair)) {
+		ctrlr->cntlid = qpair->qpair.ctrlr->cntlid;
+		ctrlr->ready = true;
+	}
+
+	free(connect_req->req.data);
+	connect_req->req.data = NULL;
+
+	/* Submit the property get/set that triggered this connect */
+	spdk_nvmf_request_exec(&req->req);
+
+	return 0;
+}
+
 static ssize_t
 access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 	       bool is_write)
 {
 	struct muser_endpoint *muser_ep = pvt;
 	struct muser_ctrlr *ctrlr;
-	struct muser_req *req;
+	struct muser_req *req, *connect_req;
+	struct muser_qpair *qpair;
+	struct spdk_nvmf_fabric_connect_data *data;
 	int ret;
 
 	ctrlr = muser_ep->ctrlr;
@@ -1369,6 +1432,11 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 		assert(ret < 0);
 		return ret;
 	}
+
+	qpair = ctrlr->qp[0];
+
+	/* Mark the controller as busy to limit the queue depth for fabric get/set to 1 */
+	ctrlr->ready = false;
 
 	/* Construct a Fabric Property Get/Set command and send it */
 
@@ -1397,10 +1465,46 @@ access_bar0_fn(void *pvt, char *buf, size_t count, loff_t pos,
 	req->req.length = count;
 	req->req.data = buf;
 
-	/* Mark the controller as busy to limit the queue depth for fabric get/set to 1 */
-	ctrlr->ready = false;
+	if (qpair->state != MUSER_QPAIR_ACTIVE) {
+		/* The fabric CONNECT command is sent when the first register write occurs.
+		 * Send this first, then send the property get/set request. */
 
-	spdk_nvmf_request_exec_fabrics(&req->req);
+		connect_req = get_muser_req(ctrlr->qp[0]);
+		if (connect_req == NULL) {
+			return -1;
+		}
+
+		connect_req->cb_fn = handle_admin_queue_connect_rsp;
+		connect_req->cb_arg = req;
+
+		connect_req->req.cmd->connect_cmd.opcode = SPDK_NVME_OPC_FABRIC;
+		connect_req->req.cmd->connect_cmd.cid = connect_req->cid;
+		connect_req->req.cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
+		connect_req->req.cmd->connect_cmd.recfmt = 0;
+		connect_req->req.cmd->connect_cmd.sqsize = qpair->qsize - 1;
+		connect_req->req.cmd->connect_cmd.qid = 0;
+
+		connect_req->req.length = sizeof(struct spdk_nvmf_fabric_connect_data);
+		connect_req->req.data = calloc(1, connect_req->req.length);
+		if (connect_req->req.data == NULL) {
+			muser_req_free(&req->req);
+			muser_req_free(&connect_req->req);
+			return -ENOMEM;
+		}
+
+		data = (struct spdk_nvmf_fabric_connect_data *)connect_req->req.data;
+		data->cntlid = 0xFFFF;
+		snprintf(data->subnqn, sizeof(data->subnqn), "%s",
+			 spdk_nvmf_subsystem_get_nqn(ctrlr->endpoint->subsystem));
+
+		SPDK_DEBUGLOG(SPDK_LOG_MUSER,
+			      "%s: sending connect fabrics command for QID=%#x cntlid=%#x\n",
+			      ctrlr_id(ctrlr), qpair->qpair.qid, data->cntlid);
+
+		spdk_nvmf_request_exec(&connect_req->req);
+	} else {
+		spdk_nvmf_request_exec(&req->req);
+	}
 
 	return count;
 }
@@ -1591,27 +1695,6 @@ init_pci_config_space(lm_pci_config_space_t *p)
 	p->hdr.intr.ipin = 0x1;
 }
 
-static int
-destroy_ctrlr(struct muser_ctrlr *ctrlr)
-{
-	int i;
-
-	if (ctrlr == NULL) {
-		return 0;
-	}
-
-	for (i = 0; i < MUSER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
-		destroy_qp(ctrlr, i);
-	}
-
-	if (ctrlr->endpoint) {
-		ctrlr->endpoint->ctrlr = NULL;
-	}
-
-	free(ctrlr);
-	return 0;
-}
-
 static void
 spdk_map_dma(void *pvt, uint64_t iova, uint64_t len)
 {
@@ -1789,6 +1872,7 @@ muser_listen(struct spdk_nvmf_transport *transport,
 		goto out;
 	}
 
+	unlink(path);
 	free(path);
 
 	err = ftruncate(fd, DOORBELLS + MUSER_DOORBELLS_SIZE);
@@ -1873,12 +1957,10 @@ muser_stop_listen(struct spdk_nvmf_transport *transport,
 	SPDK_DEBUGLOG(SPDK_LOG_MUSER, "%s: not found\n", trid->traddr);
 }
 
-static void
+static int
 muser_listen_associate(struct spdk_nvmf_transport *transport,
 		       const struct spdk_nvmf_subsystem *subsystem,
-		       const struct spdk_nvme_transport_id *trid,
-		       spdk_nvmf_tgt_subsystem_listen_done_fn cb_fn,
-		       void *cb_arg)
+		       const struct spdk_nvme_transport_id *trid)
 {
 	struct muser_transport *mtransport;
 	struct muser_endpoint *muser_ep;
@@ -1892,13 +1974,12 @@ muser_listen_associate(struct spdk_nvmf_transport *transport,
 	}
 
 	if (muser_ep == NULL) {
-		cb_fn(cb_arg, -ENOENT);
-		return;
+		return -ENOENT;
 	}
 
 	muser_ep->subsystem = subsystem;
 
-	cb_fn(cb_arg, 0);
+	return 0;
 }
 
 /*
@@ -2043,7 +2124,6 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	struct muser_ctrlr *muser_ctrlr;
 	struct spdk_nvmf_request *req;
 	struct spdk_nvmf_fabric_connect_data *data;
-	bool admin;
 
 	muser_group = SPDK_CONTAINEROF(group, struct muser_poll_group, group);
 	muser_qpair = SPDK_CONTAINEROF(qpair, struct muser_qpair, qpair);
@@ -2054,7 +2134,10 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 		      ctrlr_id(muser_ctrlr), muser_qpair->qpair.qid,
 		      muser_qpair, qpair, muser_group);
 
-	admin = nvmf_qpair_is_admin_queue(&muser_qpair->qpair);
+	if (nvmf_qpair_is_admin_queue(&muser_qpair->qpair)) {
+		/* Admin queue creation is deferred to the first register write */
+		return 0;
+	}
 
 	muser_req = get_muser_req(muser_qpair);
 	if (muser_req == NULL) {
@@ -2067,7 +2150,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	req->cmd->connect_cmd.fctype = SPDK_NVMF_FABRIC_COMMAND_CONNECT;
 	req->cmd->connect_cmd.recfmt = 0;
 	req->cmd->connect_cmd.sqsize = muser_qpair->qsize - 1;
-	req->cmd->connect_cmd.qid = admin ? 0 : qpair->qid;
+	req->cmd->connect_cmd.qid = qpair->qid;
 
 	req->length = sizeof(struct spdk_nvmf_fabric_connect_data);
 	req->data = calloc(1, req->length);
@@ -2077,7 +2160,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 	}
 
 	data = (struct spdk_nvmf_fabric_connect_data *)req->data;
-	data->cntlid = admin ? 0xFFFF : muser_ctrlr->cntlid;
+	data->cntlid = muser_ctrlr->cntlid;
 	snprintf(data->subnqn, sizeof(data->subnqn), "%s",
 		 spdk_nvmf_subsystem_get_nqn(muser_ctrlr->endpoint->subsystem));
 
@@ -2088,7 +2171,7 @@ muser_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 		      "%s: sending connect fabrics command for QID=%#x cntlid=%#x\n",
 		      ctrlr_id(muser_ctrlr), qpair->qid, data->cntlid);
 
-	spdk_nvmf_request_exec_fabrics(req);
+	spdk_nvmf_request_exec(req);
 	return 0;
 }
 

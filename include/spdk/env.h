@@ -41,6 +41,7 @@
 
 #include "spdk/stdinc.h"
 #include "spdk/queue.h"
+#include "spdk/pci_ids.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -84,6 +85,7 @@ struct spdk_env_opts {
 	const char		*hugedir;
 	struct spdk_pci_addr	*pci_blacklist;
 	struct spdk_pci_addr	*pci_whitelist;
+	const char		*iova_mode;
 	uint64_t		base_virtaddr;
 
 	/** Opaque context for use of the env implementation. */
@@ -158,8 +160,11 @@ void spdk_free(void *buf);
 void spdk_env_opts_init(struct spdk_env_opts *opts);
 
 /**
- * Initialize the environment library. This must be called prior to using
- * any other functions in this library.
+ * Initialize or reinitialize the environment library.
+ * For initialization, this must be called prior to using any other functions
+ * in this library. For reinitialization, the parameter `opts` must be set to
+ * NULL and this must be called after the environment library was finished by
+ * spdk_env_fini() within the same process.
  *
  * \param opts Environment initialization options.
  * \return 0 on success, or negative errno on failure.
@@ -167,10 +172,11 @@ void spdk_env_opts_init(struct spdk_env_opts *opts);
 int spdk_env_init(const struct spdk_env_opts *opts);
 
 /**
- * Release any resources of the environment library that were alllocated with
+ * Release any resources of the environment library that were allocated with
  * spdk_env_init(). After this call, no SPDK env function calls may be made.
  * It is expected that common usage of this function is to call it just before
- * terminating the process.
+ * terminating the process or before reinitializing the environment library
+ * within the same process.
  */
 void spdk_env_fini(void);
 
@@ -644,11 +650,19 @@ struct spdk_pci_addr {
 };
 
 struct spdk_pci_id {
-	uint16_t	vendor_id;
-	uint16_t	device_id;
-	uint16_t	subvendor_id;
-	uint16_t	subdevice_id;
+	uint32_t	class_id;	/**< Class ID or SPDK_PCI_CLASS_ANY_ID. */
+	uint16_t	vendor_id;	/**< Vendor ID or SPDK_PCI_ANY_ID. */
+	uint16_t	device_id;	/**< Device ID or SPDK_PCI_ANY_ID. */
+	uint16_t	subvendor_id;	/**< Subsystem vendor ID or SPDK_PCI_ANY_ID. */
+	uint16_t	subdevice_id;	/**< Subsystem device ID or SPDK_PCI_ANY_ID. */
 };
+
+/** Device needs PCI BAR mapping (done with either IGB_UIO or VFIO) */
+#define SPDK_PCI_DRIVER_NEED_MAPPING 0x0001
+/** Device needs PCI BAR mapping with enabled write combining (wc) */
+#define SPDK_PCI_DRIVER_WC_ACTIVATE 0x0002
+
+void spdk_pci_driver_register(const char *name, struct spdk_pci_id *id_table, uint32_t flags);
 
 struct spdk_pci_device {
 	struct spdk_pci_device		*parent;
@@ -666,7 +680,6 @@ struct spdk_pci_device {
 			uint32_t len, uint32_t offset);
 	int (*cfg_write)(struct spdk_pci_device *dev, void *value,
 			 uint32_t len, uint32_t offset);
-	void (*detach)(struct spdk_pci_device *dev);
 
 	struct _spdk_pci_device_internal {
 		struct spdk_pci_driver		*driver;
@@ -686,12 +699,18 @@ struct spdk_pci_device {
 
 typedef int (*spdk_pci_enum_cb)(void *enum_ctx, struct spdk_pci_device *pci_dev);
 
-/**
- * Get the NVMe PCI driver object.
- *
- * \return PCI driver.
- */
-struct spdk_pci_driver *spdk_pci_nvme_get_driver(void);
+#define SPDK_PCI_DEVICE(vend, dev)          \
+	.class_id = SPDK_PCI_CLASS_ANY_ID,      \
+	.vendor_id = (vend),                    \
+	.device_id = (dev),                     \
+	.subvendor_id = SPDK_PCI_ANY_ID,        \
+	.subdevice_id = SPDK_PCI_ANY_ID
+
+#define SPDK_PCI_DRIVER_REGISTER(name, id_table, flags) \
+__attribute__((constructor)) static void _spdk_pci_driver_register_##name(void) \
+{ \
+	spdk_pci_driver_register(#name, id_table, flags); \
+}
 
 /**
  * Get the VMD PCI driver object.
@@ -720,6 +739,18 @@ struct spdk_pci_driver *spdk_pci_idxd_get_driver(void);
  * \return PCI driver.
  */
 struct spdk_pci_driver *spdk_pci_virtio_get_driver(void);
+
+/**
+ * Get PCI driver by name (e.g. "nvme", "vmd", "ioat").
+ */
+struct spdk_pci_driver *spdk_pci_get_driver(const char *name);
+
+/**
+ * Get the NVMe PCI driver object.
+ *
+ * \return PCI driver.
+ */
+struct spdk_pci_driver *spdk_pci_nvme_get_driver(void);
 
 /**
  * Enumerate all PCI devices supported by the provided driver and try to

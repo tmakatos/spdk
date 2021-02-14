@@ -31,25 +31,17 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 
-SO_VER := 2
-SO_MINOR := 0
+APP = spdk_dd
 
-C_SRCS += vpp.c
-CFLAGS += -Wno-sign-compare -Wno-error=old-style-definition
-CFLAGS += -Wno-error=strict-prototypes -Wno-error=ignored-qualifiers
+C_SRCS := spdk_dd.c
 
-GCC_VERSION=$(shell $(CC) -dumpversion | cut -d. -f1)
+SPDK_LIB_LIST = $(ALL_MODULES_LIST)
+SPDK_LIB_LIST += event_sock event_bdev event_accel event_vmd
+SPDK_LIB_LIST += bdev accel event thread util conf trace \
+		log jsonrpc json rpc sock notify
 
-# disable packed member unalign warnings
-ifeq ($(shell test $(GCC_VERSION) -ge 9 && echo 1), 1)
-CFLAGS += -Wno-error=address-of-packed-member
-endif
-
-LIBNAME = sock_vpp
-
-SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
-
-include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.app.mk

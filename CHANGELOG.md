@@ -1,11 +1,11 @@
 # Changelog
 
-## v20.07: (Upcoming Release)
+## v20.10: (Upcoming Release)
 
-### nvmf
+### bdev
 
-The NVMe-oF target no longer supports connecting scheduling configuration and instead
-always uses what was previously called "transport" scheduling.
+A new API was added `bdev_examine_bdev` that allows users to examine a
+bdev explicitly. It can be used only if auto_examine is disabled.
 
 `spdk_nvmf_tgt_accept` no longer exists. The accept process now occurs automatically after
 the creation of an nvmf target and queue pairs are assigned to poll groups by the underlying
@@ -13,21 +13,28 @@ transport. Further, `spdk_nvmf_transport_ops` has changed such that the accept f
 pointer no longer takes a function pointer as an argument. Instead, transports should call
 `spdk_nvmf_tgt_new_qpair` whenever they previously would have called that callback.
 
-### nvme
+Updated DPDK submodule to DPDK 20.08.
 
-Add `opts_size` in `spdk_nvme_ctrlr_opts` structure in order to solve the compatiblity issue
-for different ABI version.
+### isa-l
 
-### RPC
+Updated ISA-L submodule to v2.29.0.
 
-Command line parameters `-r` and `--rpc-socket` will longer accept TCP ports. RPC server
-must now be started on a Unix domain socket. Exposing RPC on the network, as well as providing
-proper authentication (if needed) is now a responsibility of the user.
+### ocf
 
-### build
+Updated OCF submodule to v20.03.1
 
-The fio plugins now compile to `build/fio` and are named `spdk_bdev` and `spdk_nvme`.
-Existing fio configuration files will need to be updated.
+### sock
+
+The `enable_placement_id` field was added in the struct spdk_sock_impl_opts to
+make the placement_id feature configurable by users. The default setting is
+not enabled.
+
+### rpc
+
+A new optional parameter `enable_placement_id` was added to the `sock_impl_set_options`
+RPC.
+
+## v20.07: SPDK CSI driver, new accel_fw commands, I/O abort support
 
 ### accel
 
@@ -42,14 +49,86 @@ A new capability, compare, was added via `spdk_accel_submit_compare`.
 
 The software accel engine implemenation has added support for compare.
 
+Several APIs were added to `accel_engine.h` to support batched submission
+of operations.
+
+Several APIs were added to `accel_engine.h` to support dualcast operations.
+
+### accel_fw
+
+The accel_fw was updated to no longer require the app to allocate an
+accel_task on its behalf. All public APIs now take a callback arg as
+the parameter that used to be the accel_task.
+
+The accel_fw API `spdk_accel_task_size` was removed as it is no longer
+required.
+
+The accel_fw was updated to support compare, dualcast, crc32c.
+
+The accel_fw introduced batching support for all commands in all plug-ins.
+See docs for detailed information.
+
+### bdev
+
+A new API `spdk_bdev_abort` has been added to submit abort requests to abort all I/Os
+whose callback context match to the bdev on the given channel.
+
+### build
+
+The fio plugins now compile to `build/fio` and are named `spdk_bdev` and `spdk_nvme`.
+Existing fio configuration files will need to be updated.
+
 ### dpdk
 
-Updated DPDK submodule to DPDK 19.11.2, which includes fixes for DPDK vulnerabilities:
-CVE-2020-10722, CVE-2020-10723, CVE-2020-10724, CVE-2020-10725, CVE-2020-10724.
+Updated DPDK submodule to DPDK 20.05.
+
+### env
+
+Several new APIs have been added to provide greater flexibility in registering and
+accessing polled mode PCI drivers. See `env.h` for more details.
 
 ### idxd
 
+The idxd library and plug-in module for the accel_fw were updated to support
+all accel_fw commands as well as batching.  Batching is supported both
+through the library and the plug-in module.
+
 IDXD engine support for CRC-32C has been added.
+
+### ioat
+
+A new API `spdk_ioat_get_max_descriptors` was added.
+
+### nvme
+
+An `opts_size`element was added in the  `spdk_nvme_ctrlr_opts` structure
+to solve the ABI compatiblity issue between different SPDK version.
+
+A new API `spdk_nvme_ctrlr_cmd_abort_ext` has been added to abort previously submitted
+commands whose callback argument match.
+
+Convenience functions, `spdk_nvme_print_command` and `spdk_nvme-print_completion` were added
+to the public API.
+
+A new function, `spdk_nvmf_cuse_update_namespaces`, updates the cuse representation of an NVMe
+controller.
+
+A new function `qpair_iterate_requests` has been added to the nvme transport interface. ALl
+implementations of the transport interface will have to implement that function.
+
+### nvmf
+
+The NVMe-oF target no longer supports connecting scheduling configuration and instead
+always uses what was previously called "transport" scheduling.
+
+`spdk_nvmf_tgt_accept` no longer takes a function pointer as an argument. New connections
+are automatically assigned to poll groups by the underlying transport. Further,
+`spdk_nvmf_transport_ops` has changed such that the accept function pointer no longer
+takes a function pointer as an argument. Instead, transports should call
+`spdk_nvmf_tgt_new_qpair` whenever they previously would have called that callback.
+
+The NVMe-oF target now supports aborting any submitted NVM or Admin command. Previously,
+the NVMe-oF target could abort only Asynchronous Event Request commands.
 
 ### rdma
 
@@ -61,10 +140,19 @@ Using mlx5_dv requires libmlx5 installed on the system.
 ### rpc
 
 Parameter `-p` or `--max-qpairs-per-ctrlr` of `nvmf_create_transport` RPC command accepted by the
-rpc.py script is deprecated, new parameter `-m` or `--max-io-qpairs-per-ctrlr` is added.
+rpc.py script is deprecated, new parameter `-m` or `--max-io-qpairs-per-ctrlr` was added.
 
-Parameter `max_qpairs_per_ctrlr` of `nvmf_create_transport` RPC command accepted by the NVMF target
-is deprecated, new parameter `max_io_qpairs_per_ctrlr` is added.
+Added `sock_impl_get_options` and `sock_impl_set_options` RPC methods.
+
+Command line parameters `-r` and `--rpc-socket` will longer accept TCP ports. RPC server
+must now be started on a Unix domain socket. Exposing RPC on the network, as well as providing
+proper authentication (if needed) is now a responsibility of the user.
+
+The `bdev_set_options` RPC has a new option, `bdev_auto_examine` to control the auto examine function
+of bdev modules.
+
+New RPCs `sock_impl_get_options` and `sock_impl_set_options` been added to expose new socket features.
+See `sock` section for more details.
 
 ### sock
 
@@ -73,11 +161,26 @@ options. Options can be set independently for each implementation.
 
 Added `recv_buf_size` and 'send_buf_size' socket layer options. They are used only in posix implementation.
 
+Added `uring` based socket implementation, the code is located in module/sock/uring. This feature is only
+available in Linux which requires kernel version is greater than 5.4.3. Currently, our CI pool added the uring
+based socket tests for iSCSI target and also the tests for SPDK NVMe-oF tcp transport.
+
+Added `enable_recv_pipe` socket layer option to allow disabling of double buffering on receive.
+New option is used only in posix implementation.
+
+Added `enable_zerocopy_send` socket layer option to allow disabling of zero copy flow on send.
+New option is used only in posix implementation.
+
+### util
+
+Some previously exposed CRC32 functions have been removed from the public API -
+`spdk_crc32_update`, `spdk_crc32_table_init`, and the `spdk_crc32_table` struct.
+
 ### vhost
 
 The function `spdk_vhost_blk_get_dev` has been removed.
 
-## v20.04:
+## v20.04: SPDK Top, IDXD, NVMe qpair groups
 
 IDXD engine support for compare has been added.
 
@@ -280,7 +383,7 @@ Poll groups per session have been replaced by SPDK threads per vhost controller.
 A new function, `spdk_vmd_fini`, has been added. It releases all resources acquired by the VMD
 library through the `spdk_vmd_init` call.
 
-## v20.01
+## v20.01: Optimized thin provisioning, FTL bdev, VMD hot plug, FUSED support
 
 ### bdev
 
@@ -470,7 +573,7 @@ code for fused compare-and-write operation.
 
 Added spdk_bdev_get_acwu function for getting block device atomic compare and write unit size.
 
-## v19.10
+## v19.10: Zoned bdev API, Opal bdev, NVMe character devices
 
 ### rpc
 
@@ -700,7 +803,7 @@ New cache modes added to use via RPC, wi - write invalidate and wa - write aroun
 
 New version of OCF provides fully asynchronous management API.
 
-## v19.07
+## v19.07: NVMe-oF FC Transport, VMD, NVMe-oF Persistent reservations, Bdev I/O with separate metadata
 
 ### ftl
 
@@ -976,7 +1079,7 @@ with SPDK thread when necessary.
 Added spdk_thread_destroy() to allow framework polling the thread to
 release resources associated with that thread.
 
-## v19.04
+## v19.04: Compression bdev, Notification library, NVMe Opal support
 
 ### nvme
 
@@ -1197,7 +1300,7 @@ Added "reduce" block compression scheme based on using SSDs for storing
 compressed blocks of storage and presistent memory for metadata. Please see
 [compression](https://spdk.io/doc/bdev.html) for more details.
 
-## v19.01
+## v19.01: NVMe-oF TCP/IP Transport, Open Channel SSD Flash Translation Layer, Caching bdev based on OCF, ISA-L Support, DIF/DIX library
 
 ### ocf bdev
 
@@ -1452,7 +1555,7 @@ JSON RPC client is now running in non-blocking mode. Requests are sent and recei
 JSON RPC server can now recieve a callback on connection termination or server shutdown using `spdk_jsonrpc_conn_add_close_cb`
 and `spdk_jsonrpc_conn_del_close_cb`.
 
-## v18.10
+## v18.10: Dynamic memory allocation, Crypto Virtual Bdev, jsonrpc-client, SPDKCLI iSCSI and NVMe-oF support
 
 ### nvme
 
@@ -1649,7 +1752,7 @@ in QEMU.
 The SPDKCLI interactive command tool for managing SPDK is no longer considered experimental.
 Support for the iSCSI and NVMe-oF targets has been added.
 
-## v18.07
+## v18.07: Raid, Infrastructure Improvements, Bug Fixes
 
 ### bdev
 

@@ -50,8 +50,6 @@
 
 #define MAX_TMPBUF 1024
 #define PORTNUMLEN 32
-#define SO_RCVBUF_SIZE (2 * 1024 * 1024)
-#define SO_SNDBUF_SIZE (2 * 1024 * 1024)
 #define SPDK_SOCK_GROUP_QUEUE_DEPTH 4096
 #define IOV_BATCH_SIZE 64
 
@@ -99,6 +97,14 @@ struct spdk_uring_sock_group_impl {
 	uint32_t				io_queued;
 	uint32_t				io_avail;
 	TAILQ_HEAD(, spdk_uring_sock)		pending_recv;
+};
+
+static struct spdk_sock_impl_opts g_spdk_uring_sock_impl_opts = {
+	.recv_buf_size = MIN_SO_RCVBUF_SIZE,
+	.send_buf_size = MIN_SO_SNDBUF_SIZE,
+	.enable_recv_pipe = true,
+	.enable_quickack = false,
+	.enable_placement_id = false,
 };
 
 #define SPDK_URING_SOCK_REQUEST_IOV(req) ((struct iovec *)((uint8_t *)req + sizeof(struct spdk_sock_request)))
@@ -286,18 +292,16 @@ uring_sock_set_recvbuf(struct spdk_sock *_sock, int sz)
 
 	assert(sock != NULL);
 
-#ifndef __aarch64__
-	/* On ARM systems, this buffering does not help. Skip it. */
-	/* The size of the pipe is purely derived from benchmarks. It seems to work well. */
-	rc = uring_sock_alloc_pipe(sock, sz);
-	if (rc) {
-		SPDK_ERRLOG("unable to allocate sufficient recvbuf with sz=%d on sock=%p\n", sz, _sock);
-		return rc;
+	if (g_spdk_uring_sock_impl_opts.enable_recv_pipe) {
+		rc = uring_sock_alloc_pipe(sock, sz);
+		if (rc) {
+			SPDK_ERRLOG("unable to allocate sufficient recvbuf with sz=%d on sock=%p\n", sz, _sock);
+			return rc;
+		}
 	}
-#endif
 
-	if (sz < SO_RCVBUF_SIZE) {
-		sz = SO_RCVBUF_SIZE;
+	if (sz < MIN_SO_RCVBUF_SIZE) {
+		sz = MIN_SO_RCVBUF_SIZE;
 	}
 
 	rc = setsockopt(sock->fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
@@ -316,8 +320,8 @@ uring_sock_set_sendbuf(struct spdk_sock *_sock, int sz)
 
 	assert(sock != NULL);
 
-	if (sz < SO_SNDBUF_SIZE) {
-		sz = SO_SNDBUF_SIZE;
+	if (sz < MIN_SO_SNDBUF_SIZE) {
+		sz = MIN_SO_SNDBUF_SIZE;
 	}
 
 	rc = setsockopt(sock->fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
@@ -332,6 +336,10 @@ static struct spdk_uring_sock *
 uring_sock_alloc(int fd)
 {
 	struct spdk_uring_sock *sock;
+#if defined(__linux__)
+	int flag;
+	int rc;
+#endif
 
 	sock = calloc(1, sizeof(*sock));
 	if (sock == NULL) {
@@ -340,6 +348,17 @@ uring_sock_alloc(int fd)
 	}
 
 	sock->fd = fd;
+
+#if defined(__linux__)
+	flag = 1;
+
+	if (g_spdk_uring_sock_impl_opts.enable_quickack) {
+		rc = setsockopt(sock->fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag));
+		if (rc != 0) {
+			SPDK_ERRLOG("quickack was failed to set\n");
+		}
+	}
+#endif
 	return sock;
 }
 
@@ -392,13 +411,13 @@ retry:
 			continue;
 		}
 
-		val = SO_RCVBUF_SIZE;
+		val = g_spdk_uring_sock_impl_opts.recv_buf_size;
 		rc = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &val, sizeof val);
 		if (rc) {
 			/* Not fatal */
 		}
 
-		val = SO_SNDBUF_SIZE;
+		val = g_spdk_uring_sock_impl_opts.send_buf_size;
 		rc = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &val, sizeof val);
 		if (rc) {
 			/* Not fatal */
@@ -925,8 +944,6 @@ sock_uring_group_reap(struct spdk_uring_sock_group_impl *group, int max, int max
 					sock->pending_recv = true;
 					TAILQ_INSERT_TAIL(&group->pending_recv, sock, link);
 				}
-			} else {
-				SPDK_UNREACHABLE();
 			}
 			break;
 		case SPDK_SOCK_TASK_WRITE:
@@ -1124,6 +1141,10 @@ uring_sock_get_placement_id(struct spdk_sock *_sock, int *placement_id)
 {
 	int rc = -1;
 
+	if (!g_spdk_uring_sock_impl_opts.enable_placement_id) {
+		return rc;
+	}
+
 #if defined(SO_INCOMING_NAPI_ID)
 	struct spdk_uring_sock *sock = __uring_sock(_sock);
 	socklen_t salen = sizeof(int);
@@ -1199,13 +1220,15 @@ uring_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 	struct spdk_sock *_sock, *tmp;
 	struct spdk_uring_sock *sock;
 
-	TAILQ_FOREACH_SAFE(_sock, &group->base.socks, link, tmp) {
-		sock = __uring_sock(_sock);
-		if (spdk_unlikely(sock->connection_status)) {
-			continue;
+	if (spdk_likely(socks)) {
+		TAILQ_FOREACH_SAFE(_sock, &group->base.socks, link, tmp) {
+			sock = __uring_sock(_sock);
+			if (spdk_unlikely(sock->connection_status)) {
+				continue;
+			}
+			_sock_flush(_sock);
+			_sock_prep_pollin(_sock);
 		}
-		_sock_flush(_sock);
-		_sock_prep_pollin(_sock);
 	}
 
 	to_submit = group->io_queued;
@@ -1281,10 +1304,66 @@ uring_sock_group_impl_close(struct spdk_sock_group_impl *_group)
 	assert(group->io_inflight == 0);
 	assert(group->io_avail == SPDK_SOCK_GROUP_QUEUE_DEPTH);
 
-	close(group->uring.ring_fd);
 	io_uring_queue_exit(&group->uring);
 
 	free(group);
+	return 0;
+}
+
+static int
+uring_sock_impl_get_opts(struct spdk_sock_impl_opts *opts, size_t *len)
+{
+	if (!opts || !len) {
+		errno = EINVAL;
+		return -1;
+	}
+
+#define FIELD_OK(field) \
+	offsetof(struct spdk_sock_impl_opts, field) + sizeof(opts->field) <= *len
+
+#define GET_FIELD(field) \
+	if (FIELD_OK(field)) { \
+		opts->field = g_spdk_uring_sock_impl_opts.field; \
+	}
+
+	GET_FIELD(recv_buf_size);
+	GET_FIELD(send_buf_size);
+	GET_FIELD(enable_recv_pipe);
+	GET_FIELD(enable_quickack);
+	GET_FIELD(enable_placement_id);
+
+#undef GET_FIELD
+#undef FIELD_OK
+
+	*len = spdk_min(*len, sizeof(g_spdk_uring_sock_impl_opts));
+	return 0;
+}
+
+static int
+uring_sock_impl_set_opts(const struct spdk_sock_impl_opts *opts, size_t len)
+{
+	if (!opts) {
+		errno = EINVAL;
+		return -1;
+	}
+
+#define FIELD_OK(field) \
+	offsetof(struct spdk_sock_impl_opts, field) + sizeof(opts->field) <= len
+
+#define SET_FIELD(field) \
+	if (FIELD_OK(field)) { \
+		g_spdk_uring_sock_impl_opts.field = opts->field; \
+	}
+
+	SET_FIELD(recv_buf_size);
+	SET_FIELD(send_buf_size);
+	SET_FIELD(enable_recv_pipe);
+	SET_FIELD(enable_quickack);
+	SET_FIELD(enable_placement_id);
+
+#undef SET_FIELD
+#undef FIELD_OK
+
 	return 0;
 }
 
@@ -1324,6 +1403,8 @@ static struct spdk_net_impl g_uring_net_impl = {
 	.group_impl_remove_sock = uring_sock_group_impl_remove_sock,
 	.group_impl_poll	= uring_sock_group_impl_poll,
 	.group_impl_close	= uring_sock_group_impl_close,
+	.get_opts		= uring_sock_impl_get_opts,
+	.set_opts		= uring_sock_impl_set_opts,
 };
 
 SPDK_NET_IMPL_REGISTER(uring, &g_uring_net_impl, DEFAULT_SOCK_PRIORITY + 1);
