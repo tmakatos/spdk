@@ -34,15 +34,22 @@ ExclusiveArch: x86_64
 BuildRequires: gcc gcc-c++ make python3
 BuildRequires: dpdk-devel, numactl-devel
 #BuildRequires: libiscsi-devel
-#BuildRequires: libaio-devel, openssl-devel, libuuid-devel
+#BuildRequires: libaio-devel, openssl-devel
+BuildRequires: libaio-devel
+BuildRequires: libuuid-devel
 #BuildRequires: libibverbs-devel, librdmacm-devel
-#BuildRequires: ncurses-devel
+BuildRequires: ncurses-devel
 %if %{with doc}
 BuildRequires: doxygen mscgen graphviz
 %endif
 
-BuildRequires: libvfio-user
-BuildRequires: autoconf automake libtool
+# FIXME Not really required yet since SPDK builds libvfio-user internally
+#BuildRequires: libvfio-user
+
+# FIXME required for the above reasou
+BuildRequires: cmake gcc gcc-c++ json-c-devel libcmocka-devel openssl-devel
+
+BuildRequires: autoconf automake libtool meson
 
 # Install dependencies
 
@@ -54,9 +61,12 @@ BuildRequires: autoconf automake libtool
 # FIXME not required if not built with libiscsi
 #Requires: libiscsi
 
-#Requires: libaio, libuuid
+Requires: libaio
+Requires: libuuid
+
 # NVMe over Fabrics
 #Requires: librdmacm, librdmacm
+
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
 
