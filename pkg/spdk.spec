@@ -3,7 +3,7 @@
 %bcond_with rdma
 
 # no dashes
-%global git_branch vfio_over_socket
+%global git_branch ahv_vfio_user
 
 Name: spdk
 Version: %{git_branch}
