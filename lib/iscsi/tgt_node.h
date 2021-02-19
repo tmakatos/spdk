@@ -37,7 +37,7 @@
 
 #include "spdk/stdinc.h"
 
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 
 struct spdk_iscsi_conn;
 struct spdk_iscsi_init_grp;
