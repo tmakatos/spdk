@@ -569,13 +569,6 @@ handle_identify_ctrlr_rsp(struct spdk_nvme_ctrlr_data *data)
 	assert(data != NULL);
 
 	data->sgls.supported = SPDK_NVME_SGLS_NOT_SUPPORTED;
-
-	/*
-	 * Intentionally disabled, otherwise we get a
-	 * SPDK_NVME_OPC_DATASET_MANAGEMENT command we don't know how to
-	 * properly handle.
-	 */
-	data->oncs.dsm = 0;
 }
 
 /*
