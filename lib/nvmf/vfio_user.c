@@ -2064,20 +2064,25 @@ get_nvmf_req(struct nvmf_vfio_user_qpair *qpair)
 static int
 get_nvmf_io_req_length(struct spdk_nvmf_request *req)
 {
-	uint16_t nlb;
+	uint16_t nlb, nr;
 	uint32_t nsid;
 	struct spdk_nvme_cmd *cmd = &req->cmd->nvme_cmd;
 	struct spdk_nvmf_ctrlr *ctrlr = req->qpair->ctrlr;
 	struct spdk_nvmf_ns *ns;
 
 	nsid = cmd->nsid;
-	nlb = (cmd->cdw12 & 0x0000ffffu) + 1;
 	ns = _nvmf_subsystem_get_ns(ctrlr->subsys, nsid);
 	if (ns == NULL || ns->bdev == NULL) {
 		SPDK_ERRLOG("unsuccessful query for nsid %u\n", cmd->nsid);
 		return -EINVAL;
 	}
 
+	if (cmd->opc == SPDK_NVME_OPC_DATASET_MANAGEMENT) {
+		nr = cmd->cdw10_bits.dsm.nr + 1;
+		return nr * sizeof(struct spdk_nvme_dsm_range);
+	}
+
+	nlb = (cmd->cdw12 & 0x0000ffffu) + 1;
 	return nlb * spdk_bdev_get_block_size(ns->bdev);
 }
 
@@ -2128,30 +2133,19 @@ static int
 map_io_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvmf_request *req)
 {
 	int err = 0;
+	struct spdk_nvme_cmd *cmd;
 	bool remap = true;
 
 	assert(ctrlr != NULL);
 	assert(req != NULL);
 
-	switch (req->cmd->nvme_cmd.opc) {
-	case SPDK_NVME_OPC_FLUSH:
-		req->xfer = SPDK_NVME_DATA_NONE;
+	cmd = &req->cmd->nvme_cmd;
+	req->xfer = cmd->opc & 0x3;
+
+	if (spdk_unlikely(req->xfer == SPDK_NVME_DATA_NONE)) {
 		remap = false;
-		break;
-	case SPDK_NVME_OPC_READ:
-		req->xfer = SPDK_NVME_DATA_CONTROLLER_TO_HOST;
-		break;
-	case SPDK_NVME_OPC_WRITE:
-		req->xfer = SPDK_NVME_DATA_HOST_TO_CONTROLLER;
-		break;
-	default:
-		SPDK_ERRLOG("%s: SQ%d invalid I/O request type 0x%x\n",
-			    ctrlr_id(ctrlr), req->qpair->qid,
-			    req->cmd->nvme_cmd.opc);
-		return -EINVAL;
 	}
 
-	req->data = NULL;
 	if (remap) {
 		assert(req->cmd->nvme_cmd.psdt == 0);
 		err = get_nvmf_io_req_length(req);
@@ -2166,6 +2160,11 @@ map_io_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvmf_request *req
 			SPDK_ERRLOG("%s: failed to map PRP: %d\n",
 				    ctrlr_id(ctrlr), err);
 			return -EFAULT;
+		}
+
+		/* DSM command uses req->data for data buffer */
+		if (err == 1) {
+			req->data = req->iov[0].iov_base;
 		}
 		req->iovcnt = err;
 	}
