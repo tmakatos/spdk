@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -x
+
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
 source $rootdir/test/common/autotest_common.sh
@@ -21,11 +23,11 @@ mkdir -p /var/run/muser/domain/muser0/8
 mkdir -p /dev/shm/muser/muser0
 
 # Start the target
-"${NVMF_APP[@]}" -m 0x1 &
+("${NVMF_APP[@]}" -m 0x1 -L vfio_user -L nvmf_vfio -L nvmf_vfio |& tee spdk.log) &
 nvmfpid=$!
 echo "Process pid: $nvmfpid"
 
-trap 'killprocess $nvmfpid; exit 1' SIGINT SIGTERM EXIT
+#trap 'killprocess $nvmfpid; exit 1' SIGINT SIGTERM EXIT
 waitforlisten $nvmfpid
 
 sleep 1
@@ -41,12 +43,14 @@ ln -s /var/run/muser/domain/muser0/8 /var/run/muser/domain/muser0/8/iommu_group
 ln -s /var/run/muser/domain/muser0/8 /var/run/muser/iommu_group/8
 ln -s /var/run/muser/domain/muser0/8/bar0 /dev/shm/muser/muser0/bar0
 
-$SPDK_EXAMPLE_DIR/identify -r 'trtype:VFIOUSER traddr:/var/run/muser/domain/muser0/8' -g -L nvme -L nvme_vfio -L vfio_pci
+exit
+
+$SPDK_EXAMPLE_DIR/identify -r 'trtype:VFIOUSER traddr:/var/run/muser/domain/muser0/8' -g -L nvme -L nvme_vfio -L vfio_pci -L nvmf_vfio -L muser
 sleep 1
 $SPDK_EXAMPLE_DIR/perf -r 'trtype:VFIOUSER traddr:/var/run/muser/domain/muser0/8' -s 256 -g -q 128 -o 4096 -w read -t 10 -c 0x2
 sleep 1
 $SPDK_EXAMPLE_DIR/perf -r 'trtype:VFIOUSER traddr:/var/run/muser/domain/muser0/8' -s 256 -g -q 128 -o 4096 -w write -t 10 -c 0x2
-sleep 1
+
 $SPDK_EXAMPLE_DIR/reconnect -r 'trtype:VFIOUSER traddr:/var/run/muser/domain/muser0/8' -g -q 32 -o 4096 -w randrw -M 50 -t 10 -c 0xE
 sleep 1
 
