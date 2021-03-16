@@ -38,7 +38,6 @@
 
 #include "spdk/log.h"
 
-#include "iscsi/iscsi.h"
 #include "iscsi/init_grp.h"
 #include "iscsi/spdk_iscsi.h"
 

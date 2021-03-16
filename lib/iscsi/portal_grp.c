@@ -39,7 +39,7 @@
 
 #include "spdk/log.h"
 
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 #include "iscsi/conn.h"
 #include "iscsi/portal_grp.h"
 #include "iscsi/tgt_node.h"

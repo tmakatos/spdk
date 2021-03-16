@@ -38,7 +38,7 @@
 #include "spdk/sock.h"
 #include "spdk/likely.h"
 
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 #include "iscsi/init_grp.h"
 #include "iscsi/portal_grp.h"
 #include "iscsi/conn.h"

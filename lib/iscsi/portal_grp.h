@@ -37,7 +37,7 @@
 
 #include "spdk/conf.h"
 #include "spdk/cpuset.h"
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 
 struct spdk_json_write_ctx;
 

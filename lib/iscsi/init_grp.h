@@ -35,7 +35,7 @@
 #ifndef SPDK_INIT_GRP_H
 #define SPDK_INIT_GRP_H
 
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 #include "iscsi/conn.h"
 
 struct spdk_iscsi_initiator_name {

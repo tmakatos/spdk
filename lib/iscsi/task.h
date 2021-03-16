@@ -35,7 +35,7 @@
 #ifndef SPDK_ISCSI_TASK_H
 #define SPDK_ISCSI_TASK_H
 
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 #include "spdk/scsi.h"
 #include "spdk/util.h"
 

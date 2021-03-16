@@ -32,7 +32,7 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 #include "iscsi/conn.h"
 #include "iscsi/tgt_node.h"
 #include "iscsi/portal_grp.h"

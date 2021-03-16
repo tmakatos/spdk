@@ -37,7 +37,6 @@
 
 #include "spdk/stdinc.h"
 
-#include "iscsi/iscsi.h"
 #include "iscsi/spdk_iscsi.h"
 #include "spdk/queue.h"
 #include "spdk/cpuset.h"

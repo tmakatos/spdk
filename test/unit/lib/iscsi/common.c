@@ -1,5 +1,5 @@
 #include "iscsi/task.h"
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 #include "iscsi/conn.h"
 
 #include "spdk/env.h"

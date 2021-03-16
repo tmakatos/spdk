@@ -35,7 +35,7 @@
 #include "spdk/stdinc.h"
 
 #include "spdk/string.h"
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 #include "iscsi/param.h"
 #include "iscsi/conn.h"
 #include "spdk/string.h"

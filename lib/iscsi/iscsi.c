@@ -46,7 +46,7 @@
 #include "spdk/net.h"
 
 #include "iscsi/md5.h"
-#include "iscsi/iscsi.h"
+#include "iscsi/spdk_iscsi.h"
 #include "iscsi/param.h"
 #include "iscsi/tgt_node.h"
 #include "iscsi/task.h"
