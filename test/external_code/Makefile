@@ -31,7 +31,7 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-ALL_DEPDIRS+= hello_world passthru
+ALL_DEPDIRS+= hello_world passthru nvme
 
 ifneq ($(SPDK_HEADER_DIR),)
 COMMON_CFLAGS+=-I$(SPDK_HEADER_DIR)
@@ -51,9 +51,9 @@ endif
 export
 .PHONY: all
 
-all: hello_world_bdev_shared_combo
+all: hello_world_bdev_shared_combo nvme_shared
 
-static: hello_world_bdev_static
+static: hello_world_bdev_static nvme_static
 
 hello_world_bdev_shared_combo: passthru_shared
 	$(MAKE) --directory=hello_world bdev_shared_combo
@@ -79,6 +79,13 @@ passthru_shared:
 passthru_static:
 	$(MAKE) --directory=passthru static
 
+nvme_shared:
+	$(MAKE) --directory=nvme shared
+
+nvme_static:
+	$(MAKE) --directory=nvme static
+
 clean:
 	rm -f ./hello_world/hello_bdev
 	rm -f ./passthru/libpassthru_external.*
+	rm -f ./nvme/*.{so,o} ./nvme/identify

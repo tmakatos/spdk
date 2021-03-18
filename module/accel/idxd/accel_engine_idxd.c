@@ -66,7 +66,6 @@ static TAILQ_HEAD(, pci_device) g_pci_devices = TAILQ_HEAD_INITIALIZER(g_pci_dev
 
 struct idxd_device {
 	struct				spdk_idxd_device *idxd;
-	int				num_channels;
 	TAILQ_ENTRY(idxd_device)	tailq;
 };
 static TAILQ_HEAD(, idxd_device) g_idxd_devices = TAILQ_HEAD_INITIALIZER(g_idxd_devices);
@@ -74,14 +73,11 @@ static struct idxd_device *g_next_dev = NULL;
 
 struct idxd_io_channel {
 	struct spdk_idxd_io_channel	*chan;
-	struct spdk_idxd_device		*idxd;
 	struct idxd_device		*dev;
 	enum channel_state		state;
 	struct spdk_poller		*poller;
 	TAILQ_HEAD(, spdk_accel_task)	queued_tasks;
 };
-
-pthread_mutex_t g_configuration_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct spdk_io_channel *idxd_get_io_channel(void);
 
@@ -148,12 +144,8 @@ static int
 idxd_submit_tasks(struct spdk_io_channel *ch, struct spdk_accel_task *first_task)
 {
 	struct idxd_io_channel *chan = spdk_io_channel_get_ctx(ch);
-	struct spdk_accel_task *task, *tmp, *batch_task;
-	struct idxd_batch *idxd_batch;
-	uint8_t fill_pattern;
-	TAILQ_HEAD(, spdk_accel_task) batch_tasks;
+	struct spdk_accel_task *task, *tmp;
 	int rc = 0;
-	uint32_t task_count = 0;
 
 	task = first_task;
 
@@ -168,8 +160,14 @@ idxd_submit_tasks(struct spdk_io_channel *ch, struct spdk_accel_task *first_task
 		return 0;
 	}
 
-	/* If this is just a single task handle it here. */
-	if (!TAILQ_NEXT(task, link)) {
+	/* The caller will either submit a single task or a group of tasks that are
+	 * linked together but they cannot be on a list. For example, see idxd_poll()
+	 * where a list of queued tasks is being resubmitted, the list they are on
+	 * is initialized after saving off the first task from the list which is then
+	 * passed in here.  Similar thing is done in the accel framework.
+	 */
+	while (task) {
+		tmp = TAILQ_NEXT(task, link);
 		rc = _process_single_task(ch, task);
 
 		if (rc == -EBUSY) {
@@ -177,92 +175,8 @@ idxd_submit_tasks(struct spdk_io_channel *ch, struct spdk_accel_task *first_task
 		} else if (rc) {
 			spdk_accel_task_complete(task, rc);
 		}
-
-		return 0;
+		task = tmp;
 	}
-
-	/* TODO: The DSA batch interface has performance tradeoffs that we need to measure with real
-	 * silicon.  It's unclear which workloads will benefit from batching and with what sizes. Or
-	 * if there are some cases where batching is more beneficial on the completion side by turning
-	 * off completion notifications for elements within the batch. Need to run some experiments where
-	 * we use the batching interface versus not to help provide guidance on how to use these batching
-	 * API.  Here below is one such place, currently those batching using the framework will end up
-	 * also using the DSA batch interface.  We could send each of these operations as single commands
-	 * to the low level library.
-	 */
-
-	/* More than one task, create IDXD batch(es). */
-	do {
-		idxd_batch = spdk_idxd_batch_create(chan->chan);
-		if (idxd_batch == NULL) {
-			/* Queue them all and try again later */
-			goto queue_tasks;
-		}
-
-		task_count = 0;
-
-		/* Keep track of each batch's tasks in case we need to cancel. */
-		TAILQ_INIT(&batch_tasks);
-		do {
-			switch (task->op_code) {
-			case ACCEL_OPCODE_MEMMOVE:
-				rc = spdk_idxd_batch_prep_copy(chan->chan, idxd_batch, task->dst, task->src, task->nbytes,
-							       idxd_done, task);
-				break;
-			case ACCEL_OPCODE_DUALCAST:
-				rc = spdk_idxd_batch_prep_dualcast(chan->chan, idxd_batch, task->dst, task->dst2,
-								   task->src, task->nbytes, idxd_done, task);
-				break;
-			case ACCEL_OPCODE_COMPARE:
-				rc = spdk_idxd_batch_prep_compare(chan->chan, idxd_batch, task->src, task->src2,
-								  task->nbytes, idxd_done, task);
-				break;
-			case ACCEL_OPCODE_MEMFILL:
-				fill_pattern = (uint8_t)task->fill_pattern;
-				memset(&task->fill_pattern, fill_pattern, sizeof(uint64_t));
-				rc = spdk_idxd_batch_prep_fill(chan->chan, idxd_batch, task->dst, task->fill_pattern,
-							       task->nbytes, idxd_done, task);
-				break;
-			case ACCEL_OPCODE_CRC32C:
-				rc = spdk_idxd_batch_prep_crc32c(chan->chan, idxd_batch, task->dst, task->src,
-								 task->seed, task->nbytes, idxd_done, task);
-				break;
-			default:
-				assert(false);
-				break;
-			}
-
-			tmp = TAILQ_NEXT(task, link);
-
-			if (rc == 0) {
-				TAILQ_INSERT_TAIL(&batch_tasks, task, link);
-			} else {
-				assert(rc != -EBUSY);
-				spdk_accel_task_complete(task, rc);
-			}
-
-			task_count++;
-			task = tmp;
-		} while (task && task_count < g_batch_max);
-
-		if (!TAILQ_EMPTY(&batch_tasks)) {
-			rc = spdk_idxd_batch_submit(chan->chan, idxd_batch, NULL, NULL);
-
-			if (rc) {
-				/* Cancel the batch, requeue the items in the batch adn then
-				 * any tasks that still hadn't been processed yet.
-				 */
-				spdk_idxd_batch_cancel(chan->chan, idxd_batch);
-
-				while (!TAILQ_EMPTY(&batch_tasks)) {
-					batch_task = TAILQ_FIRST(&batch_tasks);
-					TAILQ_REMOVE(&batch_tasks, batch_task, link);
-					TAILQ_INSERT_TAIL(&chan->queued_tasks, batch_task, link);
-				}
-				goto queue_tasks;
-			}
-		}
-	} while (task);
 
 	return 0;
 
@@ -280,24 +194,23 @@ idxd_poll(void *arg)
 {
 	struct idxd_io_channel *chan = arg;
 	struct spdk_accel_task *task = NULL;
+	int count;
 
-	spdk_idxd_process_events(chan->chan);
+	count = spdk_idxd_process_events(chan->chan);
 
 	/* Check if there are any pending ops to process if the channel is active */
-	if (chan->state != IDXD_CHANNEL_ACTIVE) {
-		return -1;
+	if (chan->state == IDXD_CHANNEL_ACTIVE) {
+		/* Submit queued tasks */
+		if (!TAILQ_EMPTY(&chan->queued_tasks)) {
+			task = TAILQ_FIRST(&chan->queued_tasks);
+
+			TAILQ_INIT(&chan->queued_tasks);
+
+			idxd_submit_tasks(task->accel_ch->engine_ch, task);
+		}
 	}
 
-	/* Submit queued tasks */
-	if (!TAILQ_EMPTY(&chan->queued_tasks)) {
-		task = TAILQ_FIRST(&chan->queued_tasks);
-
-		TAILQ_INIT(&chan->queued_tasks);
-
-		idxd_submit_tasks(task->accel_ch->engine_ch, task);
-	}
-
-	return -1;
+	return count > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 static size_t
@@ -336,18 +249,23 @@ _config_max_desc(struct spdk_io_channel_iter *i)
 {
 	struct idxd_io_channel *chan;
 	struct spdk_io_channel *ch;
+	struct spdk_idxd_device *idxd;
 	int rc;
 
 	ch = spdk_io_channel_iter_get_channel(i);
 	chan = spdk_io_channel_get_ctx(ch);
+	idxd = spdk_io_channel_iter_get_ctx(i);
 
-	pthread_mutex_lock(&g_configuration_lock);
-	rc = spdk_idxd_reconfigure_chan(chan->chan, chan->dev->num_channels);
-	pthread_mutex_unlock(&g_configuration_lock);
-	if (rc == 0) {
-		chan->state = IDXD_CHANNEL_ACTIVE;
-	} else {
-		chan->state = IDXD_CHANNEL_ERROR;
+	/* reconfigure channel only if this channel is on the same idxd
+	 * device that initiated the rebalance.
+	 */
+	if (chan->dev->idxd == idxd) {
+		rc = spdk_idxd_reconfigure_chan(chan->chan);
+		if (rc == 0) {
+			chan->state = IDXD_CHANNEL_ACTIVE;
+		} else {
+			chan->state = IDXD_CHANNEL_ERROR;
+		}
 	}
 
 	spdk_for_each_channel_continue(i, 0);
@@ -359,12 +277,18 @@ _pause_chan(struct spdk_io_channel_iter *i)
 {
 	struct idxd_io_channel *chan;
 	struct spdk_io_channel *ch;
+	struct spdk_idxd_device *idxd;
 
 	ch = spdk_io_channel_iter_get_channel(i);
 	chan = spdk_io_channel_get_ctx(ch);
+	idxd = spdk_io_channel_iter_get_ctx(i);
 
-	/* start queueing up new requests. */
-	chan->state = IDXD_CHANNEL_PAUSED;
+	/* start queueing up new requests if this channel is on the same idxd
+	 * device that initiated the rebalance.
+	 */
+	if (chan->dev->idxd == idxd) {
+		chan->state = IDXD_CHANNEL_PAUSED;
+	}
 
 	spdk_for_each_channel_continue(i, 0);
 }
@@ -372,7 +296,11 @@ _pause_chan(struct spdk_io_channel_iter *i)
 static void
 _pause_chan_done(struct spdk_io_channel_iter *i, int status)
 {
-	spdk_for_each_channel(&idxd_accel_engine, _config_max_desc, NULL, NULL);
+	struct spdk_idxd_device *idxd;
+
+	idxd = spdk_io_channel_iter_get_ctx(i);
+
+	spdk_for_each_channel(&idxd_accel_engine, _config_max_desc, idxd, NULL);
 }
 
 static int
@@ -394,35 +322,37 @@ idxd_create_cb(void *io_device, void *ctx_buf)
 	}
 
 	chan->dev = dev;
-	chan->poller = spdk_poller_register(idxd_poll, chan, 0);
+	chan->poller = SPDK_POLLER_REGISTER(idxd_poll, chan, 0);
 	TAILQ_INIT(&chan->queued_tasks);
 
 	/*
 	 * Configure the channel but leave paused until all others
 	 * are paused and re-configured based on the new number of
 	 * channels. This enables dynamic load balancing for HW
-	 * flow control.
+	 * flow control. The idxd device will tell us if rebalance is
+	 * needed based on how many channels are using it.
 	 */
-	pthread_mutex_lock(&g_configuration_lock);
 	rc = spdk_idxd_configure_chan(chan->chan);
 	if (rc) {
 		SPDK_ERRLOG("Failed to configure new channel rc = %d\n", rc);
 		chan->state = IDXD_CHANNEL_ERROR;
 		spdk_poller_unregister(&chan->poller);
-		pthread_mutex_unlock(&g_configuration_lock);
 		return rc;
 	}
 
+	if (spdk_idxd_device_needs_rebalance(chan->dev->idxd) == false) {
+		chan->state = IDXD_CHANNEL_ACTIVE;
+		return 0;
+	}
+
 	chan->state = IDXD_CHANNEL_PAUSED;
-	chan->dev->num_channels++;
-	pthread_mutex_unlock(&g_configuration_lock);
 
 	/*
 	 * Pause all channels so that we can set proper flow control
 	 * per channel. When all are paused, we'll update the max
 	 * number of descriptors allowed per channel.
 	 */
-	spdk_for_each_channel(&idxd_accel_engine, _pause_chan, NULL,
+	spdk_for_each_channel(&idxd_accel_engine, _pause_chan, chan->dev->idxd,
 			      _pause_chan_done);
 
 	return 0;
@@ -431,27 +361,31 @@ idxd_create_cb(void *io_device, void *ctx_buf)
 static void
 _pause_chan_destroy_done(struct spdk_io_channel_iter *i, int status)
 {
-	/* Rebalance the rings with the smaller number of remaining channels. */
-	spdk_for_each_channel(&idxd_accel_engine, _config_max_desc, NULL, NULL);
+	struct spdk_idxd_device *idxd;
+
+	idxd = spdk_io_channel_iter_get_ctx(i);
+
+	/* Rebalance the rings with the smaller number of remaining channels, but
+	 * pass the idxd device along so its only done on shared channels.
+	 */
+	spdk_for_each_channel(&idxd_accel_engine, _config_max_desc, idxd, NULL);
 }
 
 static void
 idxd_destroy_cb(void *io_device, void *ctx_buf)
 {
 	struct idxd_io_channel *chan = ctx_buf;
-
-	pthread_mutex_lock(&g_configuration_lock);
-	assert(chan->dev->num_channels > 0);
-	chan->dev->num_channels--;
-	spdk_idxd_reconfigure_chan(chan->chan, 0);
-	pthread_mutex_unlock(&g_configuration_lock);
+	bool rebalance;
 
 	spdk_poller_unregister(&chan->poller);
-	spdk_idxd_put_channel(chan->chan);
+	rebalance = spdk_idxd_put_channel(chan->chan);
 
-	/* Pause each channel then rebalance the max number of ring slots. */
-	spdk_for_each_channel(&idxd_accel_engine, _pause_chan, NULL,
-			      _pause_chan_destroy_done);
+	/* Only rebalance if there are still other channels on this device */
+	if (rebalance == true) {
+		/* Pause each channel then rebalance the max number of ring slots. */
+		spdk_for_each_channel(&idxd_accel_engine, _pause_chan, chan->dev->idxd,
+				      _pause_chan_destroy_done);
+	}
 }
 
 static struct spdk_io_channel *

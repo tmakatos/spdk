@@ -7,8 +7,7 @@ trap 'echo -e "\n\nConfiguration failed\n\n" >&2' ERR
 rootdir=$(readlink -f $(dirname $0))
 source "$rootdir/scripts/common.sh"
 
-function usage()
-{
+function usage() {
 	echo "'configure' configures SPDK to compile on supported platforms."
 	echo ""
 	echo "Usage: ./configure [OPTION]..."
@@ -97,6 +96,8 @@ function usage()
 	echo "                           No path required."
 	echo " raid5                     Build with bdev_raid module RAID5 support."
 	echo "                           No path required."
+	echo " wpdk                      Build using WPDK to provide support for Windows (experimental)."
+	echo "                           The argument must be a directory containing lib and include."
 	echo ""
 	echo "Environment variables:"
 	echo ""
@@ -132,13 +133,17 @@ for i in "$@"; do
 done
 
 # Detect the compiler toolchain
-$rootdir/scripts/detect_cc.sh --cc="$CC" --cxx="$CXX" --lto="${CONFIG[LTO]}" --ld="$LD" --cross-prefix="${CONFIG[CROSS_PREFIX]}"  > $rootdir/mk/cc.mk
+$rootdir/scripts/detect_cc.sh --cc="$CC" --cxx="$CXX" --lto="${CONFIG[LTO]}" --ld="$LD" --cross-prefix="${CONFIG[CROSS_PREFIX]}" > $rootdir/mk/cc.mk
 
-CC=$(cat $rootdir/mk/cc.mk | grep "DEFAULT_CC=" | sed s/DEFAULT_CC=//)
-CC_TYPE=$(cat $rootdir/mk/cc.mk | grep "CC_TYPE=" | cut -d "=" -f 2)
+CC=$(grep "DEFAULT_CC=" "$rootdir/mk/cc.mk" | sed s/DEFAULT_CC=//)
+CC_TYPE=$(grep "CC_TYPE=" "$rootdir/mk/cc.mk" | cut -d "=" -f 2)
 
 arch=$($CC -dumpmachine)
 sys_name=$(uname -s)
+
+if [[ $arch == *mingw* ]] || [[ $arch == *windows* ]]; then
+	sys_name=Windows
+fi
 
 # Sanitize default configuration. All parameters set by user explicit should fail
 # Force no ISA-L if non-x86 or non-aarch64 architecture
@@ -149,7 +154,7 @@ if [[ "${CONFIG[ISAL]}" = "y" ]]; then
 	fi
 fi
 
-if [[ $sys_name == "FreeBSD" ]]; then
+if [[ $sys_name != "Linux" ]]; then
 	# Vhost, rte_vhost library and virtio are only supported on Linux.
 	CONFIG[VHOST]="n"
 	CONFIG[VIRTIO]="n"
@@ -158,7 +163,7 @@ fi
 
 #check nasm only on x86
 if [[ $arch == x86_64* ]]; then
-	ver=$(nasm -v 2>/dev/null | awk '{print $3}')
+	ver=$(nasm -v 2> /dev/null | awk '{print $3}')
 	if lt "$ver" 2.14; then
 		# ISA-L, compression & crypto require NASM version 2.14 or newer.
 		CONFIG[ISAL]=n
@@ -183,7 +188,7 @@ function check_dir() {
 
 for i in "$@"; do
 	case "$i" in
-		-h|--help)
+		-h | --help)
 			usage
 			exit 0
 			;;
@@ -276,6 +281,10 @@ for i in "$@"; do
 			;;
 		--without-dpdk)
 			CONFIG[DPDK_DIR]=
+			;;
+		--with-wpdk=*)
+			check_dir "$i"
+			CONFIG[WPDK_DIR]=$(readlink -f ${i#*=})
 			;;
 		--with-env=*)
 			CONFIG[ENV]="${i#*=}"
@@ -450,13 +459,14 @@ for i in "$@"; do
 			echo "Unrecognized option $i"
 			usage
 			exit 1
+			;;
 	esac
 done
 
 if [[ $arch == x86_64* ]]; then
-	BUILD_CMD=($CC -o /dev/null -x c $CPPFLAGS $CFLAGS $LDFLAGS -march=native)
+	BUILD_CMD=("$CC" -o /dev/null -x c $CPPFLAGS $CFLAGS $LDFLAGS "-march=native")
 else
-	BUILD_CMD=($CC -o /dev/null -x c $CPPFLAGS $CFLAGS $LDFLAGS)
+	BUILD_CMD=("$CC" -o /dev/null -x c $CPPFLAGS $CFLAGS $LDFLAGS)
 fi
 BUILD_CMD+=(-I/usr/local/include -L/usr/local/lib)
 
@@ -486,7 +496,7 @@ if [[ "${CONFIG[IDXD]}" = "y" ]]; then
 		cpu_vendor=$(sysctl -a | grep hw.model | cut -c 1-15)
 	else
 		intel="GenuineIntel"
-		cpu_vendor=$(grep -i 'vendor' /proc/cpuinfo  --max-count=1)
+		cpu_vendor=$(grep -i 'vendor' /proc/cpuinfo --max-count=1)
 	fi
 	if [[ "$cpu_vendor" != *"$intel"* ]]; then
 		echo "ERROR: IDXD cannot be used due to CPU incompatiblity."
@@ -503,8 +513,8 @@ if [[ "${CONFIG[ISAL]}" = "y" ]]; then
 fi
 
 if [[ "${CONFIG[ISAL]}" = "n" ]] && [[ "${CONFIG[REDUCE]}" = "y" ]]; then
-		echo "ERROR Conflicting options: --with-reduce is not compatible with --without-isal."
-		exit 1
+	echo "ERROR Conflicting options: --with-reduce is not compatible with --without-isal."
+	exit 1
 fi
 
 if [ -z "${CONFIG[ENV]}" ]; then
@@ -539,6 +549,23 @@ else
 	CONFIG[VIRTIO]="n"
 fi
 
+if [[ $sys_name == "Windows" ]]; then
+	if [ -z "${CONFIG[WPDK_DIR]}" ]; then
+		if [ ! -f "$rootdir"/wpdk/Makefile ]; then
+			echo "WPDK not found; please specify --with-wpdk=<path>. See https://wpdk.github.io."
+			exit 1
+		else
+			CONFIG[WPDK_DIR]="${rootdir}/wpdk/build"
+			echo "Using default WPDK in ${CONFIG[WPDK_DIR]}"
+		fi
+	fi
+else
+	if [ -n "${CONFIG[WPDK_DIR]}" ]; then
+		echo "ERROR: --with-wpdk is only supported for Windows"
+		exit 1
+	fi
+fi
+
 if [ "${CONFIG[VTUNE]}" = "y" ]; then
 	if [ -z "${CONFIG[VTUNE_DIR]}" ]; then
 		echo "When VTune is enabled, you must specify the VTune directory using --with-vtune=path"
@@ -546,7 +573,7 @@ if [ "${CONFIG[VTUNE]}" = "y" ]; then
 	fi
 fi
 
-if [ "${CONFIG[ASAN]}" = "y" -a "${CONFIG[TSAN]}" = "y" ]; then
+if [[ "${CONFIG[ASAN]}" = "y" && "${CONFIG[TSAN]}" = "y" ]]; then
 	echo "ERROR: ASAN and TSAN cannot be enabled at the same time."
 	exit 1
 fi
@@ -559,7 +586,7 @@ if [[ $sys_name == "FreeBSD" ]]; then
 	fi
 fi
 
-if [[ $sys_name == "FreeBSD" ]]; then
+if [[ $sys_name != "Linux" ]]; then
 	if [[ "${CONFIG[VHOST]}" == "y" ]]; then
 		echo "Vhost is only supported on Linux."
 		exit 1
@@ -571,22 +598,22 @@ if [[ $sys_name == "FreeBSD" ]]; then
 fi
 
 if [ "${CONFIG[RDMA]}" = "y" ]; then
-  if [[ ! "${CONFIG[RDMA_PROV]}" == "verbs" ]] && [[ ! "${CONFIG[RDMA_PROV]}" == "mlx5_dv" ]]; then
-    echo "Invalid RDMA provider specified, must be \"verbs\" or \"mlx5_dv\""
-    exit 1
-  fi
+	if [[ ! "${CONFIG[RDMA_PROV]}" == "verbs" ]] && [[ ! "${CONFIG[RDMA_PROV]}" == "mlx5_dv" ]]; then
+		echo "Invalid RDMA provider specified, must be \"verbs\" or \"mlx5_dv\""
+		exit 1
+	fi
 
 	if ! echo -e '#include <infiniband/verbs.h>\n#include <rdma/rdma_verbs.h>\n' \
 		'int main(void) { return 0; }\n' \
-		| ${BUILD_CMD[@]} -libverbs -lrdmacm - 2>/dev/null; then
-		echo --with-rdma requires libverbs and librdmacm.
-		echo Please install then re-run this script.
+		| "${BUILD_CMD[@]}" -libverbs -lrdmacm - 2> /dev/null; then
+		echo "--with-rdma requires libverbs and librdmacm."
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 
 	if echo -e '#include <infiniband/verbs.h>\n' \
 		'int main(void) { return !!IBV_WR_SEND_WITH_INV; }\n' \
-		| ${BUILD_CMD[@]} -c - 2>/dev/null; then
+		| "${BUILD_CMD[@]}" -c - 2> /dev/null; then
 		CONFIG[RDMA_SEND_WITH_INVAL]="y"
 	else
 		CONFIG[RDMA_SEND_WITH_INVAL]="n"
@@ -608,7 +635,7 @@ than or equal to 4.14 will see significantly reduced performance.
 
 	if echo -e '#include <rdma/rdma_cma.h>\n' \
 		'int main(void) { return !!RDMA_OPTION_ID_ACK_TIMEOUT; }\n' \
-		| ${BUILD_CMD[@]} -c - 2>/dev/null; then
+		| "${BUILD_CMD[@]}" -c - 2> /dev/null; then
 		CONFIG[RDMA_SET_ACK_TIMEOUT]="y"
 	else
 		CONFIG[RDMA_SET_ACK_TIMEOUT]="n"
@@ -616,18 +643,18 @@ than or equal to 4.14 will see significantly reduced performance.
 	fi
 
 	if [ "${CONFIG[RDMA_PROV]}" == "mlx5_dv" ]; then
-	  if ! echo -e '#include <spdk/stdinc.h>\n' \
-	    '#include <infiniband/mlx5dv.h>\n' \
-	    '#include <rdma/rdma_cma.h>\n' \
-		  'int main(void) { return rdma_establish(NULL) || ' \
-		  '!!IBV_QP_INIT_ATTR_SEND_OPS_FLAGS || !!MLX5_OPCODE_RDMA_WRITE; }\n' \
-		  | ${BUILD_CMD[@]} -lmlx5 -I${rootdir}/include -c - 2>/dev/null; then
-      echo "mlx5_dv provider is not supported"
-		  exit 1
-	  fi
+		if ! echo -e '#include <spdk/stdinc.h>\n' \
+			'#include <infiniband/mlx5dv.h>\n' \
+			'#include <rdma/rdma_cma.h>\n' \
+			'int main(void) { return rdma_establish(NULL) || ' \
+			'!!IBV_QP_INIT_ATTR_SEND_OPS_FLAGS || !!MLX5_OPCODE_RDMA_WRITE; }\n' \
+			| "${BUILD_CMD[@]}" -lmlx5 -I${rootdir}/include -c - 2> /dev/null; then
+			echo "mlx5_dv provider is not supported"
+			exit 1
+		fi
 	fi
 
-	echo "Using "${CONFIG[RDMA_PROV]}" RDMA provider"
+	echo "Using '${CONFIG[RDMA_PROV]}' RDMA provider"
 fi
 
 if [[ "${CONFIG[FC]}" = "y" ]]; then
@@ -660,36 +687,41 @@ if [[ "${CONFIG[ISAL]}" = "y" ]]; then
 
 	cd $rootdir/isa-l
 	ISAL_LOG=$rootdir/isa-l/spdk-isal.log
+	if [[ -n "${CONFIG[CROSS_PREFIX]}" ]]; then
+		ISAL_OPTS=("--host=${CONFIG[CROSS_PREFIX]}")
+	else
+		ISAL_OPTS=()
+	fi
 	echo -n "Configuring ISA-L (logfile: $ISAL_LOG)..."
 	./autogen.sh &> $ISAL_LOG
-	./configure CFLAGS="-fPIC -g -O2" --enable-shared=no >> $ISAL_LOG 2>&1
+	./configure CFLAGS="-fPIC -g -O2" "${ISAL_OPTS[@]}" --enable-shared=no >> $ISAL_LOG 2>&1
 	echo "done."
 	cd $rootdir
 fi
 
 if [[ "${CONFIG[PMDK]}" = "y" ]]; then
 	if ! echo -e '#include <libpmemblk.h>\nint main(void) { return 0; }\n' \
-		| ${BUILD_CMD[@]} -lpmemblk - 2>/dev/null; then
-		echo --with-pmdk requires libpmemblk.
-		echo Please install then re-run this script.
+		| "${BUILD_CMD[@]}" -lpmemblk - 2> /dev/null; then
+		echo "--with-pmdk requires libpmemblk."
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 fi
 
 if [[ "${CONFIG[REDUCE]}" = "y" ]]; then
 	if ! echo -e '#include <libpmem.h>\nint main(void) { return 0; }\n' \
-		| ${BUILD_CMD[@]} -lpmem - 2>/dev/null; then
-		echo --with-reduce requires libpmem.
-		echo Please install then re-run this script.
+		| "${BUILD_CMD[@]}" -lpmem - 2> /dev/null; then
+		echo "--with-reduce requires libpmem."
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 fi
 
 if [[ "${CONFIG[NVME_CUSE]}" = "y" ]]; then
 	if ! echo -e '#define FUSE_USE_VERSION 31\n#include <fuse3/cuse_lowlevel.h>\n#include <fuse3/fuse_lowlevel.h>\n#include <fuse3/fuse_opt.h>\nint main(void) { return 0; }\n' \
-		| ${BUILD_CMD[@]} -lfuse3 -D_FILE_OFFSET_BITS=64 - 2>/dev/null; then
-		echo --with-cuse requires libfuse3.
-		echo Please install then re-run this script.
+		| "${BUILD_CMD[@]}" -lfuse3 -D_FILE_OFFSET_BITS=64 - 2> /dev/null; then
+		echo "--with-cuse requires libfuse3."
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 fi
@@ -697,9 +729,9 @@ fi
 if [[ "${CONFIG[RBD]}" = "y" ]]; then
 	if ! echo -e '#include <rbd/librbd.h>\n#include <rados/librados.h>\n' \
 		'int main(void) { return 0; }\n' \
-		| ${BUILD_CMD[@]} -lrados -lrbd - 2>/dev/null; then
-		echo --with-rbd requires librados and librbd.
-		echo Please install then re-run this script.
+		| "${BUILD_CMD[@]}" -lrados -lrbd - 2> /dev/null; then
+		echo "--with-rbd requires librados and librbd."
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 fi
@@ -708,39 +740,39 @@ if [[ "${CONFIG[ISCSI_INITIATOR]}" = "y" ]]; then
 	# Fedora installs libiscsi to /usr/lib64/iscsi for some reason.
 	if ! echo -e '#include <iscsi/iscsi.h>\n#include <iscsi/scsi-lowlevel.h>\n' \
 		'int main(void) { return 0; }\n' \
-		| ${BUILD_CMD[@]} -L/usr/lib64/iscsi -liscsi - 2>/dev/null; then
-		echo --with-iscsi-initiator requires libiscsi with
-		echo 'LIBISCSI_API_VERSION >= 20150621.'
-		echo Please install then re-run this script.
+		| "${BUILD_CMD[@]}" -L/usr/lib64/iscsi -liscsi - 2> /dev/null; then
+		echo "--with-iscsi-initiator requires libiscsi with"
+		echo "LIBISCSI_API_VERSION >= 20150621."
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 fi
 
 if [[ "${CONFIG[ASAN]}" = "y" ]]; then
 	if ! echo -e 'int main(void) { return 0; }\n' \
-		| ${BUILD_CMD[@]} -fsanitize=address - 2>/dev/null; then
-		echo --enable-asan requires libasan.
-		echo Please install then re-run this script.
+		| "${BUILD_CMD[@]}" -fsanitize=address - 2> /dev/null; then
+		echo "--enable-asan requires libasan."
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 fi
 
 if [[ "${CONFIG[UBSAN]}" = "y" ]]; then
 	if ! echo -e 'int main(void) { return 0; }\n' \
-		| ${BUILD_CMD[@]} -fsanitize=undefined - 2>/dev/null; then
-		echo --enable-ubsan requires libubsan.
-		echo Please install then re-run this script.
-		echo If installed, please check that the GCC version is at least 6.4 \
-		     and synchronize CC accordingly.
+		| "${BUILD_CMD[@]}" -fsanitize=undefined - 2> /dev/null; then
+		echo "--enable-ubsan requires libubsan."
+		echo "Please install then re-run this script."
+		echo "If installed, please check that the GCC version is at least 6.4"
+		echo "and synchronize CC accordingly."
 		exit 1
 	fi
 fi
 
 if [[ "${CONFIG[TSAN]}" = "y" ]]; then
 	if ! echo -e 'int main(void) { return 0; }\n' \
-		| ${BUILD_CMD[@]} -fsanitize=thread - 2>/dev/null; then
-		echo --enable-tsan requires libtsan.
-		echo Please install then re-run this script.
+		| "${BUILD_CMD[@]}" -fsanitize=thread - 2> /dev/null; then
+		echo "--enable-tsan requires libtsan."
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 fi
@@ -783,28 +815,28 @@ if [[ "${CONFIG[FUSE]}" = "y" ]]; then
 fi
 
 if [ "${CONFIG[CET]}" = "y" ]; then
-	if ! echo -e 'int main(void) { return 0; }\n' | ${BUILD_CMD[@]} -fcf-protection - 2>/dev/null; then
-		echo --enable-cet requires compiler/linker that supports CET.
-		echo Please install then re-run this script.
+	if ! echo -e 'int main(void) { return 0; }\n' | "${BUILD_CMD[@]}" -fcf-protection - 2> /dev/null; then
+		echo "--enable-cet requires compiler/linker that supports CET."
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 fi
 
 # We are now ready to generate final configuration. But first do sanity
 # check to see if all keys in CONFIG array have its reflection in CONFIG file.
-if [ $(egrep -c "^\s*CONFIG_[[:alnum:]_]+=" $rootdir/CONFIG) -ne ${#CONFIG[@]} ]; then
+if (($(grep -cE "^\s*CONFIG_[[:alnum:]_]+=" "$rootdir/CONFIG") != ${#CONFIG[@]})); then
 	echo ""
 	echo "BUG: Some configuration options are not present in CONFIG file. Please update this file."
 	echo "Missing options in CONFIG (+) file and in current config (-): "
 	diff -u --label "CONFIG file" --label "CONFIG[@]" \
 		<(sed -r -e '/^\s*$/d; /^\s*#.*/d; s/(CONFIG_[[:alnum:]_]+)=.*/\1/g' CONFIG | sort) \
-		<(printf "CONFIG_%s\n" ${!CONFIG[@]} | sort)
+		<(printf "CONFIG_%s\n" "${!CONFIG[@]}" | sort)
 	exit 1
 fi
 
 echo -n "Creating mk/config.mk..."
 cp -f $rootdir/CONFIG $rootdir/mk/config.mk
-for key in ${!CONFIG[@]}; do
+for key in "${!CONFIG[@]}"; do
 	sed -i.bak -r "s#^\s*CONFIG_${key}=.*#CONFIG_${key}\?=${CONFIG[$key]}#g" $rootdir/mk/config.mk
 done
 # On FreeBSD sed -i 'SUFFIX' - SUFFIX is mandatory. So no way but to delete the backed file.
@@ -823,7 +855,7 @@ echo "done."
 # Create .sh with build config for easy sourcing|lookup during the tests.
 for conf in "${!CONFIG[@]}"; do
 	echo "CONFIG_$conf=${CONFIG[$conf]}"
-done >"$rootdir/test/common/build_config.sh"
+done > "$rootdir/test/common/build_config.sh"
 
 if [[ $sys_name == "FreeBSD" ]]; then
 	echo "Type 'gmake' to build."

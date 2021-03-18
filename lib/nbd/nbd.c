@@ -41,6 +41,7 @@
 #include "spdk/bdev.h"
 #include "spdk/endian.h"
 #include "spdk/env.h"
+#include "spdk/likely.h"
 #include "spdk/log.h"
 #include "spdk/util.h"
 #include "spdk/thread.h"
@@ -48,7 +49,8 @@
 #include "spdk/queue.h"
 
 #define GET_IO_LOOP_COUNT		16
-#define NBD_BUSY_WAITING_MS		1000
+#define NBD_START_BUSY_WAITING_MS	1000
+#define NBD_STOP_BUSY_WAITING_MS	10000
 #define NBD_BUSY_POLLING_INTERVAL_US	20000
 #define NBD_IO_TIMEOUT_S		60
 
@@ -105,6 +107,11 @@ struct spdk_nbd_disk {
 	struct spdk_interrupt	*intr;
 	uint32_t		buf_align;
 
+	struct spdk_poller	*retry_poller;
+	int			retry_count;
+	/* Synchronize nbd_start_kernel pthread and nbd_stop */
+	bool			has_nbd_pthread;
+
 	struct nbd_io		*io_in_recv;
 	TAILQ_HEAD(, nbd_io)	received_io_list;
 	TAILQ_HEAD(, nbd_io)	executed_io_list;
@@ -128,6 +135,8 @@ static void _nbd_fini(void *arg1);
 
 static int
 nbd_submit_bdev_io(struct spdk_nbd_disk *nbd, struct nbd_io *io);
+static int
+nbd_io_recv_internal(struct spdk_nbd_disk *nbd);
 
 int
 spdk_nbd_init(void)
@@ -184,6 +193,7 @@ spdk_nbd_fini(spdk_nbd_fini_cb cb_fn, void *cb_arg)
 static int
 nbd_disk_register(struct spdk_nbd_disk *nbd)
 {
+	/* Make sure nbd_path is not used in this SPDK app */
 	if (nbd_disk_find_by_nbd_path(nbd->nbd_path)) {
 		SPDK_NOTICELOG("%s is already exported\n", nbd->nbd_path);
 		return -EBUSY;
@@ -341,6 +351,11 @@ nbd_io_xmit_check(struct spdk_nbd_disk *nbd)
 static int
 nbd_cleanup_io(struct spdk_nbd_disk *nbd)
 {
+	int rc;
+
+	/* Try to read the remaining nbd commands in the socket */
+	while ((rc = nbd_io_recv_internal(nbd)) > 0);
+
 	/* free io_in_recv */
 	if (nbd->io_in_recv != NULL) {
 		nbd_put_io(nbd, nbd->io_in_recv);
@@ -358,16 +373,10 @@ nbd_cleanup_io(struct spdk_nbd_disk *nbd)
 	return 0;
 }
 
-static void
-_nbd_stop(struct spdk_nbd_disk *nbd)
+static int
+_nbd_stop(void *arg)
 {
-	if (nbd->ch) {
-		spdk_put_io_channel(nbd->ch);
-	}
-
-	if (nbd->bdev_desc) {
-		spdk_bdev_close(nbd->bdev_desc);
-	}
+	struct spdk_nbd_disk *nbd = arg;
 
 	if (nbd->nbd_poller) {
 		spdk_poller_unregister(&nbd->nbd_poller);
@@ -379,10 +388,32 @@ _nbd_stop(struct spdk_nbd_disk *nbd)
 
 	if (nbd->spdk_sp_fd >= 0) {
 		close(nbd->spdk_sp_fd);
+		nbd->spdk_sp_fd = -1;
 	}
 
 	if (nbd->kernel_sp_fd >= 0) {
 		close(nbd->kernel_sp_fd);
+		nbd->kernel_sp_fd = -1;
+	}
+
+	/* Continue the stop procedure after the exit of nbd_start_kernel pthread */
+	if (nbd->has_nbd_pthread) {
+		if (nbd->retry_poller == NULL) {
+			nbd->retry_count = NBD_STOP_BUSY_WAITING_MS * 1000ULL / NBD_BUSY_POLLING_INTERVAL_US;
+			nbd->retry_poller = SPDK_POLLER_REGISTER(_nbd_stop, nbd,
+					    NBD_BUSY_POLLING_INTERVAL_US);
+			return SPDK_POLLER_BUSY;
+		}
+
+		if (nbd->retry_count-- > 0) {
+			return SPDK_POLLER_BUSY;
+		}
+
+		SPDK_ERRLOG("Failed to wait for returning of NBD_DO_IT ioctl.\n");
+	}
+
+	if (nbd->retry_poller) {
+		spdk_poller_unregister(&nbd->retry_poller);
 	}
 
 	if (nbd->dev_fd >= 0) {
@@ -398,9 +429,21 @@ _nbd_stop(struct spdk_nbd_disk *nbd)
 		free(nbd->nbd_path);
 	}
 
+	if (nbd->ch) {
+		spdk_put_io_channel(nbd->ch);
+		nbd->ch = NULL;
+	}
+
+	if (nbd->bdev_desc) {
+		spdk_bdev_close(nbd->bdev_desc);
+		nbd->bdev_desc = NULL;
+	}
+
 	nbd_disk_unregister(nbd);
 
 	free(nbd);
+
+	return 0;
 }
 
 int
@@ -657,8 +700,12 @@ nbd_io_recv_internal(struct spdk_nbd_disk *nbd)
 				io->state = NBD_IO_RECV_PAYLOAD;
 			} else {
 				io->state = NBD_IO_XMIT_RESP;
+				if (spdk_likely(nbd->state == NBD_DISK_STATE_RUNNING)) {
+					TAILQ_INSERT_TAIL(&nbd->received_io_list, io, tailq);
+				} else {
+					nbd_io_done(NULL, false, io);
+				}
 				nbd->io_in_recv = NULL;
-				TAILQ_INSERT_TAIL(&nbd->received_io_list, io, tailq);
 			}
 		}
 	}
@@ -678,8 +725,12 @@ nbd_io_recv_internal(struct spdk_nbd_disk *nbd)
 		if (io->offset == io->payload_size) {
 			io->offset = 0;
 			io->state = NBD_IO_XMIT_RESP;
+			if (spdk_likely(nbd->state == NBD_DISK_STATE_RUNNING)) {
+				TAILQ_INSERT_TAIL(&nbd->received_io_list, io, tailq);
+			} else {
+				nbd_io_done(NULL, false, io);
+			}
 			nbd->io_in_recv = NULL;
-			TAILQ_INSERT_TAIL(&nbd->received_io_list, io, tailq);
 		}
 
 	}
@@ -856,12 +907,14 @@ nbd_poll(void *arg)
 static void *
 nbd_start_kernel(void *arg)
 {
-	int dev_fd = (int)(intptr_t)arg;
+	struct spdk_nbd_disk *nbd = arg;
 
 	spdk_unaffinitize_thread();
 
 	/* This will block in the kernel until we close the spdk_sp_fd. */
-	ioctl(dev_fd, NBD_DO_IT);
+	ioctl(nbd->dev_fd, NBD_DO_IT);
+
+	nbd->has_nbd_pthread = false;
 
 	pthread_exit(NULL);
 }
@@ -890,8 +943,6 @@ struct spdk_nbd_start_ctx {
 	struct spdk_nbd_disk	*nbd;
 	spdk_nbd_start_cb	cb_fn;
 	void			*cb_arg;
-	struct spdk_poller	*poller;
-	int			polling_count;
 };
 
 static void
@@ -900,14 +951,7 @@ nbd_start_complete(struct spdk_nbd_start_ctx *ctx)
 	int		rc;
 	pthread_t	tid;
 	int		flag;
-
-	/* Add nbd_disk to the end of disk list */
-	rc = nbd_disk_register(ctx->nbd);
-	if (rc != 0) {
-		SPDK_ERRLOG("Failed to register %s, it should not happen.\n", ctx->nbd->nbd_path);
-		assert(false);
-		goto err;
-	}
+	unsigned long	nbd_flags = 0;
 
 	rc = ioctl(ctx->nbd->dev_fd, NBD_SET_BLKSIZE, spdk_bdev_get_block_size(ctx->nbd->bdev));
 	if (rc == -1) {
@@ -934,17 +978,25 @@ nbd_start_complete(struct spdk_nbd_start_ctx *ctx)
 	SPDK_NOTICELOG("ioctl(NBD_SET_TIMEOUT) is not supported.\n");
 #endif
 
-#ifdef NBD_FLAG_SEND_TRIM
-	rc = ioctl(ctx->nbd->dev_fd, NBD_SET_FLAGS, NBD_FLAG_SEND_TRIM);
-	if (rc == -1) {
-		SPDK_ERRLOG("ioctl(NBD_SET_FLAGS) failed: %s\n", spdk_strerror(errno));
-		rc = -errno;
-		goto err;
-	}
+#ifdef NBD_FLAG_SEND_FLUSH
+	nbd_flags |= NBD_FLAG_SEND_FLUSH;
 #endif
+#ifdef NBD_FLAG_SEND_TRIM
+	nbd_flags |= NBD_FLAG_SEND_TRIM;
+#endif
+	if (nbd_flags) {
+		rc = ioctl(ctx->nbd->dev_fd, NBD_SET_FLAGS, nbd_flags);
+		if (rc == -1) {
+			SPDK_ERRLOG("ioctl(NBD_SET_FLAGS, 0x%lx) failed: %s\n", nbd_flags, spdk_strerror(errno));
+			rc = -errno;
+			goto err;
+		}
+	}
 
-	rc = pthread_create(&tid, NULL, nbd_start_kernel, (void *)(intptr_t)ctx->nbd->dev_fd);
+	ctx->nbd->has_nbd_pthread = true;
+	rc = pthread_create(&tid, NULL, nbd_start_kernel, ctx->nbd);
 	if (rc != 0) {
+		ctx->nbd->has_nbd_pthread = false;
 		SPDK_ERRLOG("could not create thread: %s\n", spdk_strerror(rc));
 		rc = -rc;
 		goto err;
@@ -1006,18 +1058,24 @@ nbd_enable_kernel(void *arg)
 	}
 
 	if (rc) {
-		if (errno == EBUSY && ctx->polling_count-- > 0) {
-			if (ctx->poller == NULL) {
-				ctx->poller = SPDK_POLLER_REGISTER(nbd_enable_kernel, ctx,
-								   NBD_BUSY_POLLING_INTERVAL_US);
+		if (errno == EBUSY) {
+			if (ctx->nbd->retry_poller == NULL) {
+				ctx->nbd->retry_count = NBD_START_BUSY_WAITING_MS * 1000ULL / NBD_BUSY_POLLING_INTERVAL_US;
+				ctx->nbd->retry_poller = SPDK_POLLER_REGISTER(nbd_enable_kernel, ctx,
+							 NBD_BUSY_POLLING_INTERVAL_US);
+				return SPDK_POLLER_BUSY;
+			} else if (ctx->nbd->retry_count-- > 0) {
+				/* Repeatedly unregiter and register retry poller to avoid scan-build error */
+				spdk_poller_unregister(&ctx->nbd->retry_poller);
+				ctx->nbd->retry_poller = SPDK_POLLER_REGISTER(nbd_enable_kernel, ctx,
+							 NBD_BUSY_POLLING_INTERVAL_US);
+				return SPDK_POLLER_BUSY;
 			}
-			/* If the kernel is busy, check back later */
-			return SPDK_POLLER_BUSY;
 		}
 
 		SPDK_ERRLOG("ioctl(NBD_SET_SOCK) failed: %s\n", spdk_strerror(errno));
-		if (ctx->poller) {
-			spdk_poller_unregister(&ctx->poller);
+		if (ctx->nbd->retry_poller) {
+			spdk_poller_unregister(&ctx->nbd->retry_poller);
 		}
 
 		spdk_nbd_stop(ctx->nbd);
@@ -1030,8 +1088,8 @@ nbd_enable_kernel(void *arg)
 		return SPDK_POLLER_BUSY;
 	}
 
-	if (ctx->poller) {
-		spdk_poller_unregister(&ctx->poller);
+	if (ctx->nbd->retry_poller) {
+		spdk_poller_unregister(&ctx->nbd->retry_poller);
 	}
 
 	nbd_start_complete(ctx);
@@ -1068,7 +1126,6 @@ spdk_nbd_start(const char *bdev_name, const char *nbd_path,
 	ctx->nbd = nbd;
 	ctx->cb_fn = cb_fn;
 	ctx->cb_arg = cb_arg;
-	ctx->polling_count = NBD_BUSY_WAITING_MS * 1000ULL / NBD_BUSY_POLLING_INTERVAL_US;
 
 	rc = spdk_bdev_open_ext(bdev_name, true, nbd_bdev_event_cb, nbd, &nbd->bdev_desc);
 	if (rc != 0) {
@@ -1101,10 +1158,9 @@ spdk_nbd_start(const char *bdev_name, const char *nbd_path,
 	TAILQ_INIT(&nbd->received_io_list);
 	TAILQ_INIT(&nbd->executed_io_list);
 
-	/* Make sure nbd_path is not used in this SPDK app */
-	if (nbd_disk_find_by_nbd_path(nbd->nbd_path)) {
-		SPDK_NOTICELOG("%s is already exported\n", nbd->nbd_path);
-		rc = -EBUSY;
+	/* Add nbd_disk to the end of disk list */
+	nbd_disk_register(ctx->nbd);
+	if (rc != 0) {
 		goto err;
 	}
 

@@ -1,37 +1,90 @@
 # Changelog
 
-## v21.01.1:
+## v21.04: (Upcoming Release)
 
-### dpdk
-
-Added `rte_ethdev` and `rte_net` dependencies for all builds with DPDK.
-
-Fixed compatibility issues with DPDK 19.11.
-
-### iscsi
-
-A security vulnerability has been identified and fixed in the SPDK iSCSI target.
-A TEXT PDU with no data, but CONTINUE flag set, would result in a NULL pointer dereference
-and crash the SPDK iSCSI target process. All users of the SPDK iSCSI target
-are recommended to update. All SPDK versions <= v21.01 are affected.
-
-### nbd
-
-Fixed kernel hang when bdev is removed by always setting NBD_SET_TIMEOUT.
 
 ### nvme
 
-Fixed segfault when removing qpair when transport connection fails (issue #1777).
+Added an accelerated table pointer in spdk_nvme_poll_group
+which can be used provide the accelerated functions by users with
+hardware engine, such as crc32c accelerated function.
 
-### ocssd
+### bdev
 
-Fixed the bug that no media event is pushed to the target bdev.
+For `bdev_ocssd_create` RPC, the optional parameter `range` was removed.
+Only one OCSSD bdev can be created for one OCSSD namespace.
+
+Removed the `spdk_bdev_open` from bdev library API.
+Removed the `spdk_vbdev_register` and `spdk_bdev_part_base_construct` from bdev module API.
+Removed the `config_text` function for bdev modules to report legacy config.
+
+### blobstore
+
+Removed the `spdk_bdev_create_bs_dev_from_desc` and `spdk_bdev_create_bs_dev` API.
+
+### env
+
+Added spdk_pci_device_allow API to allow applications to add PCI addresses to
+the allowed list after the application has started.
+
+Removed the `pci_whitelist`, `pci_blacklist` and `master_core` members of struct `spdk_env_opts`.
+
+### event
+
+Removed the `config_file`, `max_delay_us`, `pci_whitelist`
+and `pci_blacklist` members of struct `spdk_app_opts`.
+
+### accel
+
+Two new accelerated crc32 functions 'spdk_accel_submit_crc32cv' and
+'spdk_accel_batch_prep_crc32cv' are added in order to provide the
+chained accelerated CRC32 computation support.
+
+### nvme
+
+Added `spdk_nvme_qpair_get_optimal_poll_group` function and `qpair_get_optimal_poll_group`
+function pointer in spdk_nvmf_transport_ops structure in order to add the qpair to the most
+suitable polling group.
+
+Add OPTPERF and namespace optimal performance fields to nvme_spec.h.
+
+Added spdk_nvme_set_hotplug_filter API to allow applications to choose which
+hot-inserted SSDs should be probed. This is useful for use cases where multiple
+independent SPDK processes are running on one node.  The filter function can
+then be implemented in these processes to decide which SSDs to probe based on
+the new SSD's PCI address.
+
+### nvmf
+
+Removed the `spdk_nvmf_tgt_listen` and `spdk_nvmf_subsystem_add_ns` API.
+
+### opal
+
+Removed the `spdk_opal_supported` API.
 
 ### sock
 
-Added `enable_quickack` and `enable_placement_id` when saving JSON configuration.
+The type of enable_placement_id in struct spdk_sock_impl_opts is changed from
+bool to int. We can use RPC to configure different value of enable_placement_id.
+Then we can leverage SO_INCOMING_CPU to get placement_id, which aims to utilize
+CPU cache locality, enabled by setting enable_placement_id=2.
 
-## v21.01: Dynamic scheduler, vfio-user, ZNS Zone Append
+## v21.01:
+
+### idxd
+
+A new API `spdk_idxd_get_rebalance` was added so that users of the library
+can know whether they need to rebalance the flow control for the channel
+that was just added/removed.  This is based on how the low level library
+shares devices amongst channels.
+
+The API `spdk_idxd_reconfigure_chan` had the `num_channels` removed as this
+is now tracked in the library.  The app makes use the new API above to
+determine whether to rebalance or not. This applies to `spdk_idxd_configure_chan`
+as well.
+
+The API `spdk_idxd_put_channel` now returns the rebalance state for the
+underlying device.
 
 ### bdev
 
@@ -133,6 +186,8 @@ Change the return type of function `spdk_nbd_stop` from void to int. And update 
 `spdk_nbd_fini` with two parameters to make its behavior from sync to async.
 
 ### nvme
+
+Added a new function `spdk_nvme_ctrlr_get_regs_pmrcap` to get the PMR capabilities.
 
 Directives support was added to the NVMe driver.
 

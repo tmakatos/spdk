@@ -66,7 +66,16 @@ function detect_nics_and_probe_drivers() {
 		shift 2
 		# Iterate through the remaining arguments.
 		for i; do
-			modprobe "$i"
+			if [[ $i == irdma ]]; then
+				# Our tests don't play well with iWARP protocol. Make sure we use RoCEv2 instead.
+				if [[ -e /sys/module/irdma/parameters/roce_ena ]]; then
+					# reload the module to re-init the rdma devices
+					(($(< /sys/module/irdma/parameters/roce_ena) != 1)) && modprobe -r irdma
+				fi
+				modprobe "$i" roce_ena=1
+			else
+				modprobe "$i"
+			fi
 		done
 	fi
 }
@@ -406,7 +415,9 @@ function gen_nvmf_target_json() {
 					    "adrfam": "ipv4",
 					    "trsvcid": "$NVMF_PORT",
 					    "subnqn": "nqn.2016-06.io.spdk:cnode$subsystem",
-					    "hostnqn": "nqn.2016-06.io.spdk:host$subsystem"
+					    "hostnqn": "nqn.2016-06.io.spdk:host$subsystem",
+					    "hdgst": ${hdgst:-false},
+					    "ddgst": ${ddgst:-false}
 					  },
 					  "method": "bdev_nvme_attach_controller"
 					}

@@ -37,6 +37,7 @@
 #include "spdk/env.h"
 #include "spdk/util.h"
 #include "spdk/memory.h"
+#include "spdk/likely.h"
 
 #include "spdk/log.h"
 #include "spdk_internal/idxd.h"
@@ -60,10 +61,10 @@ struct device_config *g_dev_cfg = NULL;
  */
 struct device_config g_dev_cfg0 = {
 	.config_num = 0,
-	.num_groups = 4,
+	.num_groups = 1,
 	.num_wqs_per_group = 1,
-	.num_engines_per_group = 1,
-	.total_wqs = 4,
+	.num_engines_per_group = 4,
+	.total_wqs = 1,
 	.total_engines = 4,
 };
 
@@ -100,6 +101,12 @@ _idxd_write_8(struct spdk_idxd_device *idxd, uint32_t offset, uint64_t value)
 	spdk_mmio_write_8((uint64_t *)(idxd->reg_base + offset), value);
 }
 
+bool
+spdk_idxd_device_needs_rebalance(struct spdk_idxd_device *idxd)
+{
+	return idxd->needs_rebalance;
+}
+
 struct spdk_idxd_io_channel *
 spdk_idxd_get_channel(struct spdk_idxd_device *idxd)
 {
@@ -130,13 +137,44 @@ spdk_idxd_get_channel(struct spdk_idxd_device *idxd)
 		batch++;
 	}
 
+	pthread_mutex_lock(&chan->idxd->num_channels_lock);
+	chan->idxd->num_channels++;
+	if (chan->idxd->num_channels > 1) {
+		chan->idxd->needs_rebalance = true;
+	} else {
+		chan->idxd->needs_rebalance = false;
+	}
+	pthread_mutex_unlock(&chan->idxd->num_channels_lock);
+
 	return chan;
 }
 
-void
+bool
 spdk_idxd_put_channel(struct spdk_idxd_io_channel *chan)
 {
+	struct idxd_batch *batch;
+	bool rebalance = false;
+
+	pthread_mutex_lock(&chan->idxd->num_channels_lock);
+	assert(chan->idxd->num_channels > 0);
+	chan->idxd->num_channels--;
+	if (chan->idxd->num_channels > 0) {
+		rebalance = true;
+	}
+	pthread_mutex_unlock(&chan->idxd->num_channels_lock);
+
+	spdk_free(chan->completions);
+	spdk_free(chan->desc);
+	spdk_bit_array_free(&chan->ring_slots);
+	while ((batch = TAILQ_FIRST(&chan->batch_pool))) {
+		TAILQ_REMOVE(&chan->batch_pool, batch, link);
+		spdk_free(batch->user_completions);
+		spdk_free(batch->user_desc);
+	}
+	free(chan->batch_base);
 	free(chan);
+
+	return rebalance;
 }
 
 int
@@ -151,7 +189,9 @@ spdk_idxd_configure_chan(struct spdk_idxd_io_channel *chan)
 		chan->idxd->wq_id = 0;
 	}
 
-	num_ring_slots = chan->idxd->queues[chan->idxd->wq_id].wqcfg.wq_size;
+	pthread_mutex_lock(&chan->idxd->num_channels_lock);
+	num_ring_slots = chan->idxd->queues[chan->idxd->wq_id].wqcfg.wq_size / chan->idxd->num_channels;
+	pthread_mutex_unlock(&chan->idxd->num_channels_lock);
 
 	chan->ring_slots = spdk_bit_array_create(num_ring_slots);
 	if (chan->ring_slots == NULL) {
@@ -272,30 +312,26 @@ _idxd_drain(struct spdk_idxd_io_channel *chan)
 }
 
 int
-spdk_idxd_reconfigure_chan(struct spdk_idxd_io_channel *chan, uint32_t num_channels)
+spdk_idxd_reconfigure_chan(struct spdk_idxd_io_channel *chan)
 {
 	uint32_t num_ring_slots;
 	int rc;
-	struct idxd_batch *batch;
 
 	_idxd_drain(chan);
 
 	assert(spdk_bit_array_count_set(chan->ring_slots) == 0);
 
-	if (num_channels == 0) {
-		spdk_free(chan->completions);
-		spdk_free(chan->desc);
-		spdk_bit_array_free(&chan->ring_slots);
-		while ((batch = TAILQ_FIRST(&chan->batch_pool))) {
-			TAILQ_REMOVE(&chan->batch_pool, batch, link);
-			spdk_free(batch->user_completions);
-			spdk_free(batch->user_desc);
-		}
-		free(chan->batch_base);
+	pthread_mutex_lock(&chan->idxd->num_channels_lock);
+	assert(chan->idxd->num_channels > 0);
+	num_ring_slots = chan->ring_size / chan->idxd->num_channels;
+	/* If no change (ie this was a call from another thread doing its for_each_channel,
+	 * then we can just bail now.
+	 */
+	if (num_ring_slots == chan->max_ring_slots) {
+		pthread_mutex_unlock(&chan->idxd->num_channels_lock);
 		return 0;
 	}
-
-	num_ring_slots = chan->ring_size / num_channels;
+	pthread_mutex_unlock(&chan->idxd->num_channels_lock);
 
 	/* re-allocate our descriptor ring for hw flow control. */
 	rc = spdk_bit_array_resize(&chan->ring_slots, num_ring_slots);
@@ -637,6 +673,7 @@ idxd_attach(struct spdk_pci_device *device)
 	}
 
 	idxd->device = device;
+	pthread_mutex_init(&idxd->num_channels_lock, NULL);
 
 	/* Enable PCI busmaster. */
 	spdk_pci_device_cfg_read32(device, &cmd_reg, 4);
@@ -1141,7 +1178,9 @@ _idxd_batch_prep_nop(struct spdk_idxd_io_channel *chan, struct idxd_batch *batch
 	/* Command specific. */
 	desc->opcode = IDXD_OPCODE_NOOP;
 	/* TODO: temp workaround for simulator.  Remove when fixed or w/silicon. */
-	desc->xfer_size = 1;
+	if (chan->idxd->registers.gencap.raw == 0x1833f011f) {
+		desc->xfer_size = 1;
+	}
 
 	return 0;
 }
@@ -1349,21 +1388,29 @@ _dump_error_reg(struct spdk_idxd_io_channel *chan)
  * needs to look at each array bit to know whether it should even check that completion record. That may be
  * faster though, need to experiment.
  */
-void
+#define IDXD_COMPLETION(x) ((x) > (0) ? (1) : (0))
+#define IDXD_FAILURE(x) ((x) > (1) ? (1) : (0))
+#define IDXD_SW_ERROR(x) ((x) &= (0x1) ? (1) : (0))
+int
 spdk_idxd_process_events(struct spdk_idxd_io_channel *chan)
 {
 	struct idxd_comp *comp_ctx, *tmp;
 	uint64_t sw_error_0;
 	int status = 0;
+	int rc = 0;
 
 	TAILQ_FOREACH_SAFE(comp_ctx, &chan->comp_ctx_oustanding, link, tmp) {
-		if (comp_ctx->hw.status == 1) {
+		if (IDXD_COMPLETION(comp_ctx->hw.status)) {
 
 			TAILQ_REMOVE(&chan->comp_ctx_oustanding, comp_ctx, link);
-			sw_error_0 = _idxd_read_8(chan->idxd, IDXD_SWERR_OFFSET);
-			if (sw_error_0 & 0x1) {
-				_dump_error_reg(chan);
-				status = -EINVAL;
+			rc++;
+
+			if (spdk_unlikely(IDXD_FAILURE(comp_ctx->hw.status))) {
+				sw_error_0 = _idxd_read_8(chan->idxd, IDXD_SWERR_OFFSET);
+				if (IDXD_SW_ERROR(sw_error_0)) {
+					_dump_error_reg(chan);
+					status = -EINVAL;
+				}
 			}
 
 			switch (comp_ctx->desc->opcode) {
@@ -1400,6 +1447,7 @@ spdk_idxd_process_events(struct spdk_idxd_io_channel *chan)
 			}
 		}
 	}
+	return rc;
 }
 
 SPDK_LOG_REGISTER_COMPONENT(idxd)

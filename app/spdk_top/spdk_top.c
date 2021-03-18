@@ -91,16 +91,13 @@
 #define FROM_HEX 16
 #define THREAD_WIN_WIDTH 69
 #define THREAD_WIN_HEIGHT 9
-#define THREAD_WIN_HOR_POS 75
 #define THREAD_WIN_FIRST_COL 2
 #define CORE_WIN_FIRST_COL 16
 #define CORE_WIN_WIDTH 48
 #define CORE_WIN_HEIGHT 9
-#define CORE_WIN_HOR_POS 60
 #define POLLER_WIN_HEIGHT 8
 #define POLLER_WIN_WIDTH 64
 #define POLLER_WIN_FIRST_COL 14
-#define POLLER_WIN_HOR_POS 59
 
 enum tabs {
 	THREADS_TAB,
@@ -1601,6 +1598,7 @@ filter_columns(uint8_t tab)
 	ITEM *cur;
 	void (*p)(enum tabs tab);
 	uint8_t current_index, len = 0;
+	bool disabled[TABS_COL_COUNT];
 
 	for (i = 0; col_desc[i].name != NULL; ++i) {
 		len = spdk_max(col_desc[i].name_len, len);
@@ -1631,6 +1629,10 @@ filter_columns(uint8_t tab)
 		goto fail;
 	}
 
+	for (int i = 0; i < TABS_COL_COUNT; i++) {
+		disabled[i] = col_desc[i].disabled;
+	}
+
 	while (!stop_loop) {
 		c = wgetch(filter_win);
 
@@ -1643,6 +1645,17 @@ filter_columns(uint8_t tab)
 			break;
 		case 27: /* ESC */
 		case 'q':
+			for (int i = 0; i < TABS_COL_COUNT; i++) {
+				cur = current_item(my_menu);
+				col_desc[i].disabled = disabled[i];
+
+				my_items = refresh_filtering_menu(&my_menu, filter_win, tab, my_items, elements,
+								  item_index(cur) + 1);
+				if (my_items == NULL || my_menu == NULL) {
+					goto fail;
+				}
+			}
+
 			stop_loop = true;
 			break;
 		case ' ': /* Space */
@@ -1897,6 +1910,17 @@ free_resources(void)
 	}
 }
 
+static uint64_t
+get_position_for_window(uint64_t window_size, uint64_t max_size)
+{
+	/* This function calculates position for pop-up detail window.
+	 * Since horizontal and vertical positions are calculated the same way
+	 * there is no need for separate functions. */
+	window_size = spdk_min(window_size, max_size);
+
+	return (max_size - window_size) / 2;
+}
+
 static void
 display_thread(struct rpc_thread_info *thread_info)
 {
@@ -1915,7 +1939,8 @@ display_thread(struct rpc_thread_info *thread_info)
 			thread_info->paused_pollers_count;
 
 	thread_win = newwin(pollers_count + THREAD_WIN_HEIGHT, THREAD_WIN_WIDTH,
-			    (g_max_row - pollers_count) / 2, (g_max_col - THREAD_WIN_HOR_POS) / 2);
+			    get_position_for_window(THREAD_WIN_HEIGHT + pollers_count, g_max_row),
+			    get_position_for_window(THREAD_WIN_WIDTH, g_max_col));
 	keypad(thread_win, TRUE);
 	thread_panel = new_panel(thread_win);
 
@@ -2005,7 +2030,6 @@ display_thread(struct rpc_thread_info *thread_info)
 		c = wgetch(thread_win);
 
 		switch (c) {
-		case 10: /* ENTER */
 		case 27: /* ESC */
 			stop_loop = true;
 			break;
@@ -2075,7 +2099,8 @@ show_core(uint8_t current_page)
 
 	threads_count = g_cores_stats.cores.core->threads.threads_count;
 	core_win = newwin(threads_count + CORE_WIN_HEIGHT, CORE_WIN_WIDTH,
-			  (g_max_row - threads_count) / 2, (g_max_col - CORE_WIN_HOR_POS) / 2);
+			  get_position_for_window(CORE_WIN_HEIGHT + threads_count, g_max_row),
+			  get_position_for_window(CORE_WIN_WIDTH, g_max_col));
 
 	keypad(core_win, TRUE);
 	core_panel = new_panel(core_win);
@@ -2170,7 +2195,7 @@ show_poller(uint8_t current_page)
 {
 	PANEL *poller_panel;
 	WINDOW *poller_win;
-	uint64_t poller_counter = 0, count = 0;
+	uint64_t count = 0;
 	uint64_t poller_number = current_page * g_max_data_rows + g_selected_row;
 	struct rpc_poller_info *pollers[RPC_MAX_POLLERS];
 	bool stop_loop = false;
@@ -2183,7 +2208,8 @@ show_poller(uint8_t current_page)
 	assert(poller_number < count);
 
 	poller_win = newwin(POLLER_WIN_HEIGHT, POLLER_WIN_WIDTH,
-			    (g_max_row - poller_counter) / 2, (g_max_col - POLLER_WIN_HOR_POS) / 2);
+			    get_position_for_window(POLLER_WIN_HEIGHT, g_max_row),
+			    get_position_for_window(POLLER_WIN_WIDTH, g_max_col));
 
 	keypad(poller_win, TRUE);
 	poller_panel = new_panel(poller_win);
@@ -2233,7 +2259,6 @@ show_poller(uint8_t current_page)
 	while (!stop_loop) {
 		c = wgetch(poller_win);
 		switch (c) {
-		case 10: /* ENTER */
 		case 27: /* ESC */
 			stop_loop = true;
 			break;
@@ -2460,7 +2485,7 @@ usage(const char *program_name)
 	printf("%s [options]", program_name);
 	printf("\n");
 	printf("options:\n");
-	printf(" -r <path>  RPC listen address (default: /var/tmp/spdk.sock\n");
+	printf(" -r <path>  RPC connect address (default: /var/tmp/spdk.sock)\n");
 	printf(" -h         show this usage\n");
 }
 
@@ -2474,10 +2499,9 @@ int main(int argc, char **argv)
 		case 'r':
 			socket = optarg;
 			break;
-		case 'H':
 		default:
 			usage(argv[0]);
-			return 1;
+			return op == 'h' ? 0 : 1;
 		}
 	}
 

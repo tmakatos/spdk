@@ -183,6 +183,8 @@ parse_args(int argc, char **argv, struct spdk_env_opts *opts)
 			opts->no_pci = true;
 			break;
 		case 'h':
+			usage(argv[0]);
+			exit(EXIT_SUCCESS);
 		default:
 			usage(argv[0]);
 			return 1;
@@ -709,7 +711,13 @@ static void
 nvmf_subsystem_init_done(int rc, void *cb_arg)
 {
 	fprintf(stdout, "bdev subsystem init successfully\n");
-	spdk_rpc_initialize(g_rpc_addr);
+
+	rc = spdk_rpc_initialize(g_rpc_addr);
+	if (rc) {
+		spdk_app_stop(rc);
+		return;
+	}
+
 	spdk_rpc_set_state(SPDK_RPC_RUNTIME);
 
 	g_target_state = NVMF_INIT_TARGET;

@@ -27,6 +27,8 @@
 	spdk_nvme_detach_async;
 	spdk_nvme_detach_poll_async;
 
+	spdk_nvme_pcie_set_hotplug_filter;
+
 	spdk_nvme_ctrlr_is_discovery;
 	spdk_nvme_ctrlr_get_default_ctrlr_opts;
 	spdk_nvme_ctrlr_set_trid;
@@ -39,6 +41,7 @@
 	spdk_nvme_ctrlr_get_regs_cap;
 	spdk_nvme_ctrlr_get_regs_vs;
 	spdk_nvme_ctrlr_get_regs_cmbsz;
+	spdk_nvme_ctrlr_get_regs_pmrcap;
 	spdk_nvme_ctrlr_get_num_ns;
 	spdk_nvme_ctrlr_get_pci_device;
 	spdk_nvme_ctrlr_get_max_xfer_size;
@@ -141,12 +144,15 @@
 	spdk_nvme_ns_cmd_comparev_with_md;
 	spdk_nvme_ns_cmd_compare_with_md;
 
+	spdk_nvme_qpair_get_optimal_poll_group;
 	spdk_nvme_qpair_process_completions;
 	spdk_nvme_qpair_get_failure_reason;
 	spdk_nvme_qpair_add_cmd_error_injection;
 	spdk_nvme_qpair_remove_cmd_error_injection;
 	spdk_nvme_qpair_print_command;
 	spdk_nvme_qpair_print_completion;
+	spdk_nvme_qpair_get_id;
+
 	spdk_nvme_print_command;
 	spdk_nvme_print_completion;
 
@@ -164,12 +170,17 @@
 
 	# public functions from nvme_zns.h
 	spdk_nvme_zns_ns_get_data;
+	spdk_nvme_zns_ns_get_zone_size_sectors;
 	spdk_nvme_zns_ns_get_zone_size;
 	spdk_nvme_zns_ns_get_num_zones;
+	spdk_nvme_zns_ns_get_max_open_zones;
+	spdk_nvme_zns_ns_get_max_active_zones;
 	spdk_nvme_zns_ctrlr_get_data;
 	spdk_nvme_zns_ctrlr_get_max_zone_append_size;
 	spdk_nvme_zns_zone_append;
 	spdk_nvme_zns_zone_append_with_md;
+	spdk_nvme_zns_zone_appendv;
+	spdk_nvme_zns_zone_appendv_with_md;
 	spdk_nvme_zns_close_zone;
 	spdk_nvme_zns_finish_zone;
 	spdk_nvme_zns_open_zone;
@@ -191,7 +202,6 @@
 	spdk_opal_dev_construct;
 	spdk_opal_dev_destruct;
 	spdk_opal_get_d0_features_info;
-	spdk_opal_supported;
 	spdk_opal_cmd_take_ownership;
 	spdk_opal_cmd_revert_tper;
 	spdk_opal_cmd_activate_locking_sp;

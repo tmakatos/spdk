@@ -2,7 +2,7 @@
  *   BSD LICENSE
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
- *   Copyright (c) 2019, 2020 Mellanox Technologies LTD. All rights reserved.
+ *   Copyright (c) 2019-2021 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -163,11 +163,6 @@ struct nvme_rdma_poll_group {
 	STAILQ_HEAD(, nvme_rdma_destroyed_qpair)	destroyed_qpairs;
 };
 
-struct spdk_nvme_recv_wr_list {
-	struct ibv_recv_wr	*first;
-	struct ibv_recv_wr	*last;
-};
-
 /* Memory regions */
 union nvme_rdma_mr {
 	struct ibv_mr	*mr;
@@ -201,8 +196,6 @@ struct nvme_rdma_qpair {
 	struct spdk_nvme_rdma_rsp		*rsps;
 
 	struct ibv_recv_wr			*rsp_recv_wrs;
-
-	struct spdk_nvme_recv_wr_list		recvs_to_post;
 
 	/* Memory region describing all rsps for this qpair */
 	union nvme_rdma_mr			rsp_mr;
@@ -662,20 +655,17 @@ nvme_rdma_qpair_submit_recvs(struct nvme_rdma_qpair *rqpair)
 	struct ibv_recv_wr *bad_recv_wr;
 	int rc = 0;
 
-	if (rqpair->recvs_to_post.first) {
-		rc = ibv_post_recv(rqpair->rdma_qp->qp, rqpair->recvs_to_post.first, &bad_recv_wr);
-		if (spdk_unlikely(rc)) {
-			SPDK_ERRLOG("Failed to post WRs on receive queue, errno %d (%s), bad_wr %p\n",
-				    rc, spdk_strerror(rc), bad_recv_wr);
-			while (bad_recv_wr != NULL) {
-				assert(rqpair->current_num_sends > 0);
-				rqpair->current_num_recvs--;
-				bad_recv_wr = bad_recv_wr->next;
-			}
+	rc = spdk_rdma_qp_flush_recv_wrs(rqpair->rdma_qp, &bad_recv_wr);
+	if (spdk_unlikely(rc)) {
+		SPDK_ERRLOG("Failed to post WRs on receive queue, errno %d (%s), bad_wr %p\n",
+			    rc, spdk_strerror(rc), bad_recv_wr);
+		while (bad_recv_wr != NULL) {
+			assert(rqpair->current_num_sends > 0);
+			rqpair->current_num_recvs--;
+			bad_recv_wr = bad_recv_wr->next;
 		}
-
-		rqpair->recvs_to_post.first = NULL;
 	}
+
 	return rc;
 }
 
@@ -708,13 +698,7 @@ nvme_rdma_qpair_queue_recv_wr(struct nvme_rdma_qpair *rqpair, struct ibv_recv_wr
 	assert(rqpair->current_num_recvs < rqpair->num_entries);
 
 	rqpair->current_num_recvs++;
-	if (rqpair->recvs_to_post.first == NULL) {
-		rqpair->recvs_to_post.first = wr;
-	} else {
-		rqpair->recvs_to_post.last->next = wr;
-	}
-
-	rqpair->recvs_to_post.last = wr;
+	spdk_rdma_qp_queue_recv_wrs(rqpair->rdma_qp, wr);
 
 	if (!rqpair->delay_cmd_submit) {
 		return nvme_rdma_qpair_submit_recvs(rqpair);
@@ -1615,6 +1599,7 @@ nvme_rdma_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr,
 	qpair = &rqpair->qpair;
 	rc = nvme_qpair_init(qpair, qid, ctrlr, qprio, num_requests);
 	if (rc != 0) {
+		nvme_rdma_free(rqpair);
 		return NULL;
 	}
 
@@ -1646,6 +1631,7 @@ nvme_rdma_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 	struct nvme_rdma_qpair *rqpair = nvme_rdma_qpair(qpair);
 	struct nvme_rdma_ctrlr *rctrlr = NULL;
 	struct nvme_rdma_cm_event_entry *entry, *tmp;
+	int rc;
 
 	spdk_rdma_free_mem_map(&rqpair->mr_map);
 	nvme_rdma_unregister_reqs(rqpair);
@@ -1673,8 +1659,8 @@ nvme_rdma_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 
 	if (rqpair->cm_id) {
 		if (rqpair->rdma_qp) {
-			spdk_rdma_qp_disconnect(rqpair->rdma_qp);
-			if (rctrlr != NULL) {
+			rc = spdk_rdma_qp_disconnect(rqpair->rdma_qp);
+			if ((rctrlr != NULL) && (rc == 0)) {
 				if (nvme_rdma_process_event(rqpair, rctrlr->cm_channel, RDMA_CM_EVENT_DISCONNECTED)) {
 					SPDK_DEBUGLOG(nvme, "Target did not respond to qpair disconnect.\n");
 				}
@@ -1700,6 +1686,7 @@ nvme_rdma_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 {
 	struct nvme_rdma_qpair *rqpair;
 
+	assert(qpair != NULL);
 	rqpair = nvme_rdma_qpair(qpair);
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, qpair);
 	if (rqpair->defer_deletion_to_pg) {

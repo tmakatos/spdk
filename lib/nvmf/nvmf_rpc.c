@@ -2,7 +2,7 @@
  *   BSD LICENSE
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
- *   Copyright (c) 2018-2020 Mellanox Technologies LTD. All rights reserved.
+ *   Copyright (c) 2018-2021 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -2052,6 +2052,7 @@ write_nvmf_transport_stats(struct spdk_json_write_ctx *w,
 			spdk_json_write_object_begin(w);
 			spdk_json_write_named_string(w, "name", stat->rdma.devices[i].name);
 			spdk_json_write_named_uint64(w, "polls", stat->rdma.devices[i].polls);
+			spdk_json_write_named_uint64(w, "idle_polls", stat->rdma.devices[i].idle_polls);
 			spdk_json_write_named_uint64(w, "completions", stat->rdma.devices[i].completions);
 			spdk_json_write_named_uint64(w, "requests",
 						     stat->rdma.devices[i].requests);
@@ -2063,6 +2064,14 @@ write_nvmf_transport_stats(struct spdk_json_write_ctx *w,
 						     stat->rdma.devices[i].pending_rdma_read);
 			spdk_json_write_named_uint64(w, "pending_rdma_write",
 						     stat->rdma.devices[i].pending_rdma_write);
+			spdk_json_write_named_uint64(w, "total_send_wrs",
+						     stat->rdma.devices[i].total_send_wrs);
+			spdk_json_write_named_uint64(w, "send_doorbell_updates",
+						     stat->rdma.devices[i].send_doorbell_updates);
+			spdk_json_write_named_uint64(w, "total_recv_wrs",
+						     stat->rdma.devices[i].total_recv_wrs);
+			spdk_json_write_named_uint64(w, "recv_doorbell_updates",
+						     stat->rdma.devices[i].recv_doorbell_updates);
 			spdk_json_write_object_end(w);
 		}
 		spdk_json_write_array_end(w);

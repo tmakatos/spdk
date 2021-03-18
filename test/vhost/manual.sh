@@ -5,9 +5,7 @@ rootdir=$(readlink -f $testdir/../..)
 source $rootdir/test/common/autotest_common.sh
 source $rootdir/test/vhost/common.sh
 
-CENTOS_VM_IMAGE="/home/sys_sgsw/spdk_vhost_CentOS_vm_image.qcow2"
 DEFAULT_FIO_BIN="/home/sys_sgsw/fio_ubuntu"
-CENTOS_FIO_BIN="/home/sys_sgsw/fio_ubuntu_bak"
 
 case $1 in
 	-h | --help)
@@ -38,15 +36,7 @@ if [[ $(uname -s) != Linux ]]; then
 fi
 
 : ${FIO_BIN="$DEFAULT_FIO_BIN"}
-
-if [[ ! -r "${VM_IMAGE}" ]]; then
-	echo ""
-	echo "ERROR: VM image '${VM_IMAGE}' does not exist."
-	echo ""
-	exit 1
-fi
-
-DISKS_NUMBER=$(lspci -mm -n | grep 0108 | tr -d '"' | awk -F " " '{print "0000:"$1}' | wc -l)
+vhosttestinit
 
 WORKDIR=$(readlink -f $(dirname $0))
 

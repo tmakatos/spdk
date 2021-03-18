@@ -67,6 +67,7 @@ DEFINE_STUB(spdk_pci_device_attach, int, (struct spdk_pci_driver *driver, spdk_p
 DEFINE_STUB(spdk_pci_device_claim, int, (struct spdk_pci_device *dev), 0);
 DEFINE_STUB_V(spdk_pci_device_unclaim, (struct spdk_pci_device *dev));
 DEFINE_STUB_V(spdk_pci_device_detach, (struct spdk_pci_device *device));
+DEFINE_STUB(spdk_pci_device_allow, int, (struct spdk_pci_addr *pci_addr), 0);
 DEFINE_STUB(spdk_pci_device_cfg_write16, int, (struct spdk_pci_device *dev, uint16_t value,
 		uint32_t offset), 0);
 DEFINE_STUB(spdk_pci_device_cfg_read16, int, (struct spdk_pci_device *dev, uint16_t *value,
@@ -305,6 +306,7 @@ test_nvme_pcie_hotplug_monitor(void)
 	driver.initialized = true;
 	driver.hotplug_fd = 123;
 	CU_ASSERT(pthread_mutexattr_init(&attr) == 0);
+	CU_ASSERT(pthread_mutex_init(&pctrlr.ctrlr.ctrlr_lock, &attr) == 0);
 	CU_ASSERT(pthread_mutex_init(&driver.lock, &attr) == 0);
 	TAILQ_INIT(&driver.shared_attached_ctrlrs);
 	g_spdk_nvme_driver = &driver;
@@ -387,6 +389,7 @@ test_nvme_pcie_hotplug_monitor(void)
 	CU_ASSERT(pctrlr.ctrlr.is_failed == true);
 
 	pthread_mutex_destroy(&driver.lock);
+	pthread_mutex_destroy(&pctrlr.ctrlr.ctrlr_lock);
 	pthread_mutexattr_destroy(&attr);
 	g_spdk_nvme_driver = NULL;
 }

@@ -648,7 +648,7 @@ _set_thread_name(const char *thread_name)
 #elif defined(__FreeBSD__)
 	pthread_set_name_np(pthread_self(), thread_name);
 #else
-#error missing platform support for thread name
+	pthread_setname_np(pthread_self(), thread_name);
 #endif
 }
 
@@ -703,7 +703,12 @@ _reactors_scheduler_update_core_mode(void *ctx)
 	struct spdk_reactor *reactor;
 	int rc = 0;
 
-	g_scheduler_core_number = spdk_env_get_next_core(g_scheduler_core_number);
+	if (g_scheduler_core_number == SPDK_ENV_LCORE_ID_ANY) {
+		g_scheduler_core_number = spdk_env_get_first_core();
+	} else {
+		g_scheduler_core_number = spdk_env_get_next_core(g_scheduler_core_number);
+	}
+
 	if (g_scheduler_core_number == SPDK_ENV_LCORE_ID_ANY) {
 		_reactors_scheduler_fini();
 		return;
@@ -728,7 +733,7 @@ _reactors_scheduler_balance(void *arg1, void *arg2)
 	if (g_reactor_state == SPDK_REACTOR_STATE_RUNNING) {
 		g_scheduler->balance(g_core_infos, g_reactor_count, &g_governor);
 
-		g_scheduler_core_number = spdk_env_get_first_core();
+		g_scheduler_core_number = SPDK_ENV_LCORE_ID_ANY;
 		_reactors_scheduler_update_core_mode(NULL);
 	}
 }
@@ -819,23 +824,31 @@ _reactors_scheduler_gather_metrics(void *arg1, void *arg2)
 static int _reactor_schedule_thread(struct spdk_thread *thread);
 static uint64_t g_rusage_period;
 
+static void
+_reactor_remove_lw_thread(struct spdk_reactor *reactor, struct spdk_lw_thread *lw_thread)
+{
+	struct spdk_thread	*thread = spdk_thread_get_from_ctx(lw_thread);
+	int efd;
+
+	TAILQ_REMOVE(&reactor->threads, lw_thread, link);
+	assert(reactor->thread_count > 0);
+	reactor->thread_count--;
+
+	/* Operate thread intr if running with full interrupt ability */
+	if (spdk_interrupt_mode_is_enabled()) {
+		efd = spdk_thread_get_interrupt_fd(thread);
+		spdk_fd_group_remove(reactor->fgrp, efd);
+	}
+}
+
 static bool
 reactor_post_process_lw_thread(struct spdk_reactor *reactor, struct spdk_lw_thread *lw_thread)
 {
 	struct spdk_thread *thread = spdk_thread_get_from_ctx(lw_thread);
-	int efd;
 
 	if (spdk_unlikely(lw_thread->resched)) {
 		lw_thread->resched = false;
-		TAILQ_REMOVE(&reactor->threads, lw_thread, link);
-		assert(reactor->thread_count > 0);
-		reactor->thread_count--;
-
-		/* Operate thread intr if running with full interrupt ability */
-		if (spdk_interrupt_mode_is_enabled()) {
-			efd = spdk_thread_get_interrupt_fd(thread);
-			spdk_fd_group_remove(reactor->fgrp, efd);
-		}
+		_reactor_remove_lw_thread(reactor, lw_thread);
 		_reactor_schedule_thread(thread);
 		return true;
 	}
@@ -843,15 +856,7 @@ reactor_post_process_lw_thread(struct spdk_reactor *reactor, struct spdk_lw_thre
 	if (spdk_unlikely(spdk_thread_is_exited(thread) &&
 			  spdk_thread_is_idle(thread))) {
 		if (reactor->flags.is_scheduling == false) {
-			TAILQ_REMOVE(&reactor->threads, lw_thread, link);
-			assert(reactor->thread_count > 0);
-			reactor->thread_count--;
-
-			/* Operate thread intr if running with full interrupt ability */
-			if (spdk_interrupt_mode_is_enabled()) {
-				efd = spdk_thread_get_interrupt_fd(thread);
-				spdk_fd_group_remove(reactor->fgrp, efd);
-			}
+			_reactor_remove_lw_thread(reactor, lw_thread);
 			spdk_thread_destroy(thread);
 			return true;
 		}
@@ -963,16 +968,7 @@ reactor_run(void *arg)
 			thread = spdk_thread_get_from_ctx(lw_thread);
 			spdk_set_thread(thread);
 			if (spdk_thread_is_exited(thread)) {
-				TAILQ_REMOVE(&reactor->threads, lw_thread, link);
-				assert(reactor->thread_count > 0);
-				reactor->thread_count--;
-
-				/* Operate thread intr if running with full interrupt ability */
-				if (spdk_interrupt_mode_is_enabled()) {
-					int efd = spdk_thread_get_interrupt_fd(thread);
-
-					spdk_fd_group_remove(reactor->fgrp, efd);
-				}
+				_reactor_remove_lw_thread(reactor, lw_thread);
 				spdk_thread_destroy(thread);
 			} else {
 				spdk_thread_poll(thread, 0, 0);

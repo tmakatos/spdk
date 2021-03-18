@@ -3,7 +3,7 @@
 #
 #  Copyright (c) Intel Corporation.
 #  Copyright (c) 2017, IBM Corporation.
-#  Copyright (c) 2019, Mellanox Corporation.
+#  Copyright (c) 2019, 2021 Mellanox Corporation.
 #  All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
@@ -47,6 +47,7 @@ endif
 S ?= $(notdir $(CURDIR))
 
 DESTDIR?=
+EXEEXT?=
 
 ifneq ($(prefix),)
 CONFIG_PREFIX=$(prefix)
@@ -69,13 +70,20 @@ endif
 ifneq ($(filter freebsd%,$(TARGET_TRIPLET_WORDS)),)
 OS = FreeBSD
 endif
+ifneq ($(filter mingw% windows%,$(TARGET_TRIPLET_WORDS)),)
+OS = Windows
+endif
 
 TARGET_ARCHITECTURE ?= $(CONFIG_ARCH)
 TARGET_MACHINE := $(firstword $(TARGET_TRIPLET_WORDS))
 
+ifeq ($(OS),Windows)
+EXEEXT = .exe
+endif
+
 COMMON_CFLAGS = -g $(C_OPT) -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wmissing-declarations -fno-strict-aliasing -I$(SPDK_ROOT_DIR)/include
 
-ifneq ($(filter powerpc%,$(TARGET_MACHINE)),)
+ifneq ($(filter powerpc% ppc%,$(TARGET_MACHINE)),)
 COMMON_CFLAGS += -mcpu=$(TARGET_ARCHITECTURE)
 else ifeq ($(TARGET_MACHINE),aarch64)
 ifeq ($(TARGET_ARCHITECTURE),native)
@@ -122,16 +130,25 @@ COMMON_CFLAGS += -fPIC
 # Enable stack buffer overflow checking
 COMMON_CFLAGS += -fstack-protector
 
+ifeq ($(OS).$(CC_TYPE),Windows.gcc)
+# Workaround for gcc bug 86832 - invalid TLS usage
+COMMON_CFLAGS += -mstack-protector-guard=global
+endif
+
 # Prevent accidental multiple definitions of global variables
 COMMON_CFLAGS += -fno-common
 
 # Enable full RELRO - no lazy relocation (resolve everything at load time).
 # This allows the GOT to be made read-only early in the loading process.
+ifneq ($(OS),Windows)
 LDFLAGS += -Wl,-z,relro,-z,now
+endif
 
 # Make the stack non-executable.
 # This is the default in most environments, but it doesn't hurt to set it explicitly.
+ifneq ($(OS),Windows)
 LDFLAGS += -Wl,-z,noexecstack
+endif
 
 # Specify the linker to use
 ifneq ($(LD_TYPE),)
@@ -184,7 +201,7 @@ VFIO_USER_BUILD_TYPE=release
 endif
 VFIO_USER_INSTALL_DIR=$(VFIO_USER_DIR)/build
 VFIO_USER_INCLUDE_DIR=$(VFIO_USER_INSTALL_DIR)/usr/local/include
-VFIO_USER_LIBRARY_DIR=$(VFIO_USER_DIR)/build/$(VFIO_USER_BUILD_TYPE)/lib
+VFIO_USER_LIBRARY_DIR=$(VFIO_USER_INSTALL_DIR)/usr/local/lib64
 CFLAGS += -I$(VFIO_USER_INCLUDE_DIR)
 LDFLAGS += -L$(VFIO_USER_LIBRARY_DIR)
 SYS_LIBS += -Wl,-Bstatic -lvfio-user -Wl,-Bdynamic -ljson-c
@@ -231,6 +248,18 @@ LDFLAGS += --coverage
 endif
 endif
 
+ifeq ($(OS),Windows)
+WPDK_DIR = $(abspath $(CONFIG_WPDK_DIR))
+COMMON_CFLAGS += -I$(WPDK_DIR)/include/wpdk -I$(WPDK_DIR)/include
+LDFLAGS += -L$(WPDK_DIR)/lib
+ifeq ($(CONFIG_SHARED),y)
+SYS_LIBS += -lwpdk
+else
+SYS_LIBS += $(WPDK_DIR)/lib/libwpdk.a
+endif
+SYS_LIBS += -ldbghelp -lkernel32 -lsetupapi -lws2_32 -lrpcrt4 -liphlpapi
+endif
+
 include $(CONFIG_ENV)/env.mk
 
 ifeq ($(CONFIG_ASAN),y)
@@ -253,8 +282,10 @@ ifneq (, $(SPDK_GIT_COMMIT))
 COMMON_CFLAGS += -DSPDK_GIT_COMMIT=$(SPDK_GIT_COMMIT)
 endif
 
+ifneq ($(OS),Windows)
 COMMON_CFLAGS += -pthread
 LDFLAGS += -pthread
+endif
 
 CFLAGS   += $(COMMON_CFLAGS) -Wno-pointer-sign -Wstrict-prototypes -Wold-style-definition -std=gnu99
 CXXFLAGS += $(COMMON_CFLAGS)
@@ -265,6 +296,11 @@ SYS_LIBS += -lcrypto
 
 ifneq ($(CONFIG_NVME_CUSE)$(CONFIG_FUSE),nn)
 SYS_LIBS += -lfuse3
+endif
+
+ifeq ($(OS).$(CC_TYPE),Windows.gcc)
+# Include libssp.a for stack-protector and _FORTIFY_SOURCE
+SYS_LIBS += -l:libssp.a
 endif
 
 MAKEFLAGS += --no-print-directory
@@ -318,7 +354,7 @@ LIB_C=\
 
 # Clean up generated files listed as arguments plus a default list
 CLEAN_C=\
-	$(Q)rm -f *.a *.o *.d *.d.tmp *.gcno *.gcda
+	$(Q)rm -f *.a *.lib *.o *.obj *.d *.d.tmp *.pdb *.gcno *.gcda
 
 # Install a library
 INSTALL_LIB=\
@@ -331,6 +367,18 @@ UNINSTALL_LIB=\
 	$(Q)echo "  UNINSTALL $(DESTDIR)$(libdir)/$(notdir $(LIB))";\
 	rm -f "$(DESTDIR)$(libdir)/$(notdir $(LIB))"; \
 	if [ -d "$(DESTDIR)$(libdir)" ] && [ $$(ls -A "$(DESTDIR)$(libdir)" | wc -l) -eq 0 ]; then rm -rf "$(DESTDIR)$(libdir)"; fi
+
+define pkgconfig_install
+	echo "  INSTALL $(DESTDIR)$(libdir)/pkgconfig/$(notdir $(1))";
+	install -d -m 755 "$(DESTDIR)$(libdir)/pkgconfig";
+	install -m 644 "$(1)" "$(DESTDIR)$(libdir)/pkgconfig";
+endef
+
+define pkgconfig_uninstall
+	echo "  UNINSTALL $(DESTDIR)$(libdir)/pkgconfig/$(notdir $(1))";
+	rm -f "$(DESTDIR)$(libdir)/pkgconfig/$(notdir $(1))";
+	if [ -d "$(DESTDIR)$(libdir)/pkgconfig" ] && [ $$(ls -A "$(DESTDIR)$(libdir)/pkgconfig" | wc -l) -eq 0 ]; then rm -rf "$(DESTDIR)$(libdir)/pkgconfig"; fi;
+endef
 
 ifeq ($(OS),FreeBSD)
 INSTALL_REL_SYMLINK := install -l rs

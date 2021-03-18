@@ -33,6 +33,6 @@
 
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../../..)
 
-TEST_FILE = bdev_ocssd_ut.c
+TEST_FILE = nvme_cuse_ut.c
 
 include $(SPDK_ROOT_DIR)/mk/spdk.unittest.mk

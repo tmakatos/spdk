@@ -45,6 +45,10 @@ DPDK_KMODS = true
 endif
 DPDK_OPTS += -Denable_kmods=$(DPDK_KMODS)
 
+ifeq ($(CONFIG_DEBUG),y)
+DPDK_OPTS += --buildtype=debug
+endif
+
 # the drivers we use
 DPDK_DRIVERS = bus bus/pci bus/vdev mempool/ring
 
@@ -69,15 +73,15 @@ endif
 DPDK_OPTS += -Dmachine=$(TARGET_ARCHITECTURE)
 
 ifneq ($(CONFIG_CROSS_PREFIX),)
+ifeq ($(findstring mingw,$(CONFIG_CROSS_PREFIX)),mingw)
+DPDK_OPTS += --cross-file $(SPDK_ROOT_DIR)/dpdk/config/x86/cross-mingw
+else
 $(error Automatic DPDK cross build is not supported. Please compile DPDK manually \
 with e.g. `meson build --cross-file config/arm/arm64_armv8_linux_gcc`)
 endif
+endif
 
 DPDK_CFLAGS += -fPIC
-
-ifeq ($(CONFIG_DEBUG),y)
-DPDK_CFLAGS += -O0 -g
-endif
 
 ifeq ($(CONFIG_WERROR),y)
 DPDK_CFLAGS += -Werror
@@ -117,7 +121,7 @@ DPDK_ALL_DRIVER_DIRS = $(shell find $(SPDK_ROOT_DIR)/dpdk/drivers -mindepth 1 -t
 DPDK_ALL_DRIVERS = $(DPDK_ALL_DRIVER_DIRS:$(SPDK_ROOT_DIR)/dpdk/drivers/%=%)
 DPDK_DISABLED_DRVERS = $(filter-out $(DPDK_DRIVERS),$(DPDK_ALL_DRIVERS))
 
-ifeq ($(OS),Linux)
+ifneq ($(OS),FreeBSD)
 SED_INPLACE_FLAG = "-i"
 MESON_PREFIX = $(SPDK_ROOT_DIR)/dpdk/build
 else

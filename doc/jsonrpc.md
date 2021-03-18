@@ -1231,6 +1231,43 @@ Example response:
   }
 }
 ~~~
+
+## env_dpdk_get_mem_stats {#rpc_env_dpdk_get_mem_stats}
+
+Write the dpdk memory stats to a file.
+
+### Parameters
+
+This method has no parameters.
+
+### Response
+
+The response is a pathname to a text file containing the memory stats.
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "env_dpdk_get_mem_stats",
+  "id": 1
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "filename": "/tmp/spdk_mem_dump.txt"
+  }
+}
+~~~
+
 # Block Device Abstraction Layer {#jsonrpc_components_bdev}
 
 ## bdev_set_options {#rpc_bdev_set_options}
@@ -1600,6 +1637,43 @@ Example response:
 }
 ~~~
 
+## bdev_set_qd_sampling_period {#rpc_bdev_set_qd_sampling_period}
+
+Enable queue depth tracking on a specified bdev.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | Block device name
+period                  | Required | int         | period (in microseconds).If set to 0, polling will be disabled.
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_set_qd_sampling_period",
+  "id": 1,
+  "params": {
+    "name": "Malloc0",
+    "period": 20
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
 ## bdev_compress_create {#rpc_bdev_compress_create}
 
 Create a new compress bdev on a given base bdev.
@@ -1827,14 +1901,14 @@ Example response:
 
 Construct new OCF bdev.
 Command accepts cache mode that is going to be used.
-Currently, we support Write-Through, Pass-Through and Write-Back OCF cache modes.
+You can find more details about supported cache modes in the [OCF documentation](https://open-cas.github.io/cache_configuration.html#cache-mode)
 
 ### Parameters
 
 Name                    | Optional | Type        | Description
 ----------------------- | -------- | ----------- | -----------
 name                    | Required | string      | Bdev name to use
-mode                    | Required | string      | OCF cache mode ('wb' or 'wt' or 'pt')
+mode                    | Required | string      | OCF cache mode: wb, wt, pt, wa, wi, wo
 cache_bdev_name         | Required | string      | Name of underlying cache bdev
 core_bdev_name          | Required | string      | Name of underlying core bdev
 
@@ -2155,6 +2229,47 @@ Example response:
       }
     }
   ]
+}
+~~~
+
+## bdev_ocf_set_cache_mode {#rpc_bdev_ocf_set_cache_mode}
+
+Set new cache mode on OCF bdev.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | Bdev name
+mode                    | Required | string      | OCF cache mode: wb, wt, pt, wa, wi, wo
+
+### Response
+
+New cache mode name.
+
+### Example
+
+Example request:
+
+~~~
+{
+  "params": {
+    "name": "ocf0",
+    "mode": "pt",
+  },
+  "jsonrpc": "2.0",
+  "method": "bdev_ocf_set_cache_mode",
+  "id": 1
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "pt"
 }
 ~~~
 
@@ -2561,6 +2676,8 @@ hostaddr                | Optional | string      | NVMe-oF host address: ip addr
 hostsvcid               | Optional | string      | NVMe-oF host trsvcid: port number
 prchk_reftag            | Optional | bool        | Enable checking of PI reference tag for I/O processing
 prchk_guard             | Optional | bool        | Enable checking of PI guard for I/O processing
+hdgst                   | Optional | bool        | Enable TCP header digest
+ddgst                   | Optional | bool        | Enable TCP data digest
 
 ### Example
 
@@ -2759,6 +2876,33 @@ Example response:
   "jsonrpc": "2.0",
   "id": 1,
   "result": true
+}
+~~~
+
+## bdev_nvme_apply_firmware {#rpc_bdev_nvme_apply_firmware}
+
+Download and commit firmware to NVMe device.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+filename                | Required | string      | filename of the firmware to download
+bdev_name               | Required | string      | Name of the NVMe block device
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_nvme_apply_firmware",
+  "id": 1,
+  "params": {
+    "filename": "firmware_file",
+    "bdev_name": "NVMe0n1"
+  }
 }
 ~~~
 
@@ -3270,6 +3414,79 @@ Example request:
   "jsonrpc": "2.0",
   "method": "bdev_ftl_delete",
   "id": 1
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## bdev_ocssd_create {#rpc_bdev_ocssd_create}
+
+Create Open Channel zoned bdev on specified Open Channel controller.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+ctrlr_name              | Required | string      | OC NVMe controller
+name                    | Required | string      | Bdev name to create
+nsid                    | Optional | string      | namespace ID
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_ocssd_create",
+  "id": 1,
+  "params": {
+    "ctrlr_name": "nvme0",
+    "bdev_name": "nvme0n1"
+  }
+}
+~~~
+
+Example response:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+## bdev_ocssd_delete {#rpc_bdev_ocssd_delete}
+
+Delete Open Channel zoned bdev.
+
+### Parameters
+
+Name                    | Optional | Type        | Description
+----------------------- | -------- | ----------- | -----------
+name                    | Required | string      | Bdev name to delete
+
+### Example
+
+Example request:
+
+~~~
+{
+  "jsonrpc": "2.0",
+  "method": "bdev_ocssd_delete",
+  "id": 1,
+  "params": {
+    "name": "nvme0n1"
+  }
 }
 ~~~
 
@@ -5064,6 +5281,7 @@ io_unit_size                | Optional | number  | I/O unit size (bytes)
 max_aq_depth                | Optional | number  | Max number of admin cmds per AQ
 num_shared_buffers          | Optional | number  | The number of pooled data buffers available to the transport
 buf_cache_size              | Optional | number  | The number of shared buffers to reserve for each poll group
+num_cqe                     | Optional | number  | The number of CQ entires. Only used when no_srq=true (RDMA only)
 max_srq_depth               | Optional | number  | The number of elements in a per-thread shared receive queue (RDMA only)
 no_srq                      | Optional | boolean | Disable shared receive queue even for devices that support it. (RDMA only)
 c2h_success                 | Optional | boolean | Disable C2H success optimization (TCP only)
@@ -5896,7 +6114,11 @@ Example response:
                 "request_latency": 0,
                 "pending_free_request": 0,
                 "pending_rdma_read": 0,
-                "pending_rdma_write": 0
+                "pending_rdma_write": 0,
+                "total_send_wrs": 0,
+                "send_doorbell_updates": 0,
+                "total_recv_wrs": 0,
+                "recv_doorbell_updates": 1
               },
               {
                 "name": "mlx5_0",
@@ -5906,7 +6128,11 @@ Example response:
                 "request_latency": 1249323766184,
                 "pending_free_request": 0,
                 "pending_rdma_read": 337602,
-                "pending_rdma_write": 0
+                "pending_rdma_write": 0,
+                "total_send_wrs": 15165875,
+                "send_doorbell_updates": 1516587,
+                "total_recv_wrs": 15165875,
+                "recv_doorbell_updates": 1516587
               }
             ]
           }
@@ -7691,7 +7917,7 @@ Example response:
   "result": {
     "recv_buf_size": 2097152,
     "send_buf_size": 2097152,
-    "enable_recv_pipe": true
+    "enable_recv_pipe": true,
     "enable_zerocopy_send": true
   }
 }
@@ -7711,7 +7937,7 @@ send_buf_size           | Optional | number      | Size of socket send buffer in
 enable_recv_pipe        | Optional | boolean     | Enable or disable receive pipe
 enable_zerocopy_send    | Optional | boolean     | Enable or disable zero copy on send
 enable_quick_ack        | Optional | boolean     | Enable or disable quick ACK
-enable_placement_id     | Optional | boolean     | Enable or disable placement_id
+enable_placement_id     | Optional | number      | Enable or disable placement_id. 0:disable,1:incoming_napi,2:incoming_cpu
 
 ### Response
 
@@ -7733,7 +7959,7 @@ Example request:
     "enable_recv_pipe": false,
     "enable_zerocopy_send": true,
     "enable_quick_ack": false,
-    "enable_placement_id": false
+    "enable_placement_id": 0
   }
 }
 ~~~

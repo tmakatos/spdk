@@ -139,7 +139,7 @@ function linux_bind_driver() {
 	echo "$ven_dev_id" > "/sys/bus/pci/drivers/$driver_name/new_id" 2> /dev/null || true
 	echo "$bdf" > "/sys/bus/pci/drivers/$driver_name/bind" 2> /dev/null || true
 
-	if [[ $driver_name == uio_pci_generic && -e /sys/module/igb_uio ]]; then
+	if [[ $driver_name == uio_pci_generic ]] && ! check_for_driver igb_uio; then
 		# Check if the uio_pci_generic driver is broken as it might be in
 		# some 4.18.x kernels (see centos8 for instance) - if our device
 		# didn't get a proper uio entry, fallback to igb_uio
@@ -287,11 +287,12 @@ function configure_linux_pci() {
 	driver_name=""
 	igb_uio_fallback=""
 
-	# igb_uio is a common driver to override with and it depends on uio.
-	modprobe uio
 	if [[ -r "$rootdir/dpdk/build-tmp/kernel/linux/igb_uio/igb_uio.ko" ]]; then
-		igb_uio_fallback=$rootdir/dpdk/build-tmp/kernel/linux/igb_uio/igb_uio.ko
-		insmod "$igb_uio_fallback" || true
+		# igb_uio is a common driver to override with and it depends on uio.
+		modprobe uio || true
+		if ! check_for_driver igb_uio || insmod "$rootdir/dpdk/build-tmp/kernel/linux/igb_uio/igb_uio.ko"; then
+			igb_uio_fallback="$rootdir/dpdk/build-tmp/kernel/linux/igb_uio/igb_uio.ko"
+		fi
 	fi
 
 	if [[ -n "${DRIVER_OVERRIDE}" ]]; then
@@ -314,9 +315,10 @@ function configure_linux_pci() {
 		if modinfo vfio_iommu_type1 > /dev/null; then
 			modprobe vfio_iommu_type1
 		fi
-	elif modinfo uio_pci_generic > /dev/null 2>&1; then
+	elif ! check_for_driver uio_pci_generic || modinfo uio_pci_generic > /dev/null 2>&1; then
 		driver_name=uio_pci_generic
 	elif [[ -e $igb_uio_fallback ]]; then
+		driver_path="$igb_uio_fallback"
 		driver_name="igb_uio"
 		echo "WARNING: uio_pci_generic not detected - using $driver_name"
 	else

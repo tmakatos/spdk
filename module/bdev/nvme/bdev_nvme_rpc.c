@@ -176,6 +176,7 @@ struct rpc_bdev_nvme_attach_controller {
 	char *hostsvcid;
 	bool prchk_reftag;
 	bool prchk_guard;
+	struct spdk_nvme_ctrlr_opts opts;
 };
 
 static void
@@ -207,7 +208,9 @@ static const struct spdk_json_object_decoder rpc_bdev_nvme_attach_controller_dec
 	{"hostsvcid", offsetof(struct rpc_bdev_nvme_attach_controller, hostsvcid), spdk_json_decode_string, true},
 
 	{"prchk_reftag", offsetof(struct rpc_bdev_nvme_attach_controller, prchk_reftag), spdk_json_decode_bool, true},
-	{"prchk_guard", offsetof(struct rpc_bdev_nvme_attach_controller, prchk_guard), spdk_json_decode_bool, true}
+	{"prchk_guard", offsetof(struct rpc_bdev_nvme_attach_controller, prchk_guard), spdk_json_decode_bool, true},
+	{"hdgst", offsetof(struct rpc_bdev_nvme_attach_controller, opts.header_digest), spdk_json_decode_bool, true},
+	{"ddgst", offsetof(struct rpc_bdev_nvme_attach_controller, opts.data_digest), spdk_json_decode_bool, true}
 };
 
 #define NVME_MAX_BDEVS_PER_RPC 128
@@ -262,6 +265,8 @@ rpc_bdev_nvme_attach_controller(struct spdk_jsonrpc_request *request,
 		spdk_jsonrpc_send_error_response(request, -ENOMEM, spdk_strerror(ENOMEM));
 		return;
 	}
+
+	spdk_nvme_ctrlr_get_default_ctrlr_opts(&ctx->req.opts, sizeof(ctx->req.opts));
 
 	if (spdk_json_decode_object(params, rpc_bdev_nvme_attach_controller_decoders,
 				    SPDK_COUNTOF(rpc_bdev_nvme_attach_controller_decoders),
@@ -375,7 +380,7 @@ rpc_bdev_nvme_attach_controller(struct spdk_jsonrpc_request *request,
 	ctx->request = request;
 	ctx->count = NVME_MAX_BDEVS_PER_RPC;
 	rc = bdev_nvme_create(&trid, &hostid, ctx->req.name, ctx->names, ctx->count, ctx->req.hostnqn,
-			      prchk_flags, rpc_bdev_nvme_attach_controller_done, ctx);
+			      prchk_flags, rpc_bdev_nvme_attach_controller_done, ctx, &ctx->req.opts);
 	if (rc) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -584,9 +589,9 @@ rpc_bdev_nvme_detach_controller(struct spdk_jsonrpc_request *request,
 			goto cleanup;
 		}
 		memcpy(trid.subnqn, req.subnqn, len + 1);
-		rc = bdev_nvme_remove_trid(req.name, &trid);
+		rc = bdev_nvme_delete(req.name, &trid);
 	} else {
-		rc = bdev_nvme_delete(req.name);
+		rc = bdev_nvme_delete(req.name, NULL);
 	}
 
 	if (rc != 0) {
@@ -769,6 +774,11 @@ apply_firmware_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 }
 
 static void
+apply_firmware_open_cb(enum spdk_bdev_event_type type, struct spdk_bdev *bdev, void *event_ctx)
+{
+}
+
+static void
 rpc_bdev_nvme_apply_firmware(struct spdk_jsonrpc_request *request,
 			     const struct spdk_json_val *params)
 {
@@ -829,7 +839,7 @@ rpc_bdev_nvme_apply_firmware(struct spdk_jsonrpc_request *request,
 			goto err;
 		}
 
-		if (spdk_bdev_open(bdev2, true, NULL, NULL, &desc) != 0) {
+		if (spdk_bdev_open_ext(spdk_bdev_get_name(bdev2), true, apply_firmware_open_cb, NULL, &desc) != 0) {
 			snprintf(msg, sizeof(msg), "Device %s is in use.", firm_ctx->req->bdev_name);
 			free(opt);
 			goto err;

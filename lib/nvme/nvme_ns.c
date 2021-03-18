@@ -2,7 +2,7 @@
  *   BSD LICENSE
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
- *   Copyright (c) 2020 Mellanox Technologies LTD. All rights reserved.
+ *   Copyright (c) 2020, 2021 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -36,7 +36,7 @@
 static inline struct spdk_nvme_ns_data *
 _nvme_ns_get_data(struct spdk_nvme_ns *ns)
 {
-	return &ns->ctrlr->nsdata[ns->id - 1];
+	return &ns->nsdata;
 }
 
 /**
@@ -64,6 +64,7 @@ nvme_ns_set_identify_data(struct spdk_nvme_ns *ns)
 	}
 
 	ns->sectors_per_max_io = spdk_nvme_ns_get_max_io_xfer_size(ns) / ns->extended_lba_size;
+	ns->sectors_per_max_io_no_md = spdk_nvme_ns_get_max_io_xfer_size(ns) / ns->sector_size;
 
 	if (nsdata->noiob) {
 		ns->sectors_per_stripe = nsdata->noiob;
@@ -154,7 +155,6 @@ nvme_ctrlr_identify_ns_iocs_specific(struct spdk_nvme_ns *ns)
 {
 	struct nvme_completion_poll_status *status;
 	struct spdk_nvme_ctrlr *ctrlr = ns->ctrlr;
-	struct spdk_nvme_zns_ns_data **nsdata_zns;
 	int rc;
 
 	switch (ns->csi) {
@@ -169,12 +169,10 @@ nvme_ctrlr_identify_ns_iocs_specific(struct spdk_nvme_ns *ns)
 		assert(0);
 	}
 
-	assert(ctrlr->nsdata_zns);
-	nsdata_zns = &ctrlr->nsdata_zns[ns->id - 1];
-	assert(!*nsdata_zns);
-	*nsdata_zns = spdk_zmalloc(sizeof(**nsdata_zns), 64, NULL, SPDK_ENV_SOCKET_ID_ANY,
-				   SPDK_MALLOC_SHARE | SPDK_MALLOC_DMA);
-	if (!*nsdata_zns) {
+	assert(!ns->nsdata_zns);
+	ns->nsdata_zns = spdk_zmalloc(sizeof(*ns->nsdata_zns), 64, NULL, SPDK_ENV_SOCKET_ID_ANY,
+				      SPDK_MALLOC_SHARE);
+	if (!ns->nsdata_zns) {
 		return -ENOMEM;
 	}
 
@@ -186,7 +184,7 @@ nvme_ctrlr_identify_ns_iocs_specific(struct spdk_nvme_ns *ns)
 	}
 
 	rc = nvme_ctrlr_cmd_identify(ctrlr, SPDK_NVME_IDENTIFY_NS_IOCS, 0, ns->id, ns->csi,
-				     *nsdata_zns, sizeof(**nsdata_zns),
+				     ns->nsdata_zns, sizeof(*ns->nsdata_zns),
 				     nvme_completion_poll_cb, status);
 	if (rc != 0) {
 		nvme_ns_free_zns_specific_data(ns);
@@ -462,9 +460,9 @@ nvme_ns_free_zns_specific_data(struct spdk_nvme_ns *ns)
 		return;
 	}
 
-	if (ns->ctrlr->nsdata_zns) {
-		spdk_free(ns->ctrlr->nsdata_zns[ns->id - 1]);
-		ns->ctrlr->nsdata_zns[ns->id - 1] = NULL;
+	if (ns->nsdata_zns) {
+		spdk_free(ns->nsdata_zns);
+		ns->nsdata_zns = NULL;
 	}
 }
 
@@ -556,6 +554,7 @@ void nvme_ns_destruct(struct spdk_nvme_ns *ns)
 	ns->md_size = 0;
 	ns->pi_type = 0;
 	ns->sectors_per_max_io = 0;
+	ns->sectors_per_max_io_no_md = 0;
 	ns->sectors_per_stripe = 0;
 	ns->flags = 0;
 	ns->csi = SPDK_NVME_CSI_NVM;

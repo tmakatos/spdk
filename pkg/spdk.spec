@@ -31,14 +31,10 @@ License: BSD
 # Only x86_64 is supported
 ExclusiveArch: x86_64
 
-BuildRequires: gcc gcc-c++ make python3
-BuildRequires: dpdk-devel, numactl-devel
-#BuildRequires: libiscsi-devel
-#BuildRequires: libaio-devel, openssl-devel
-BuildRequires: libaio-devel
-BuildRequires: libuuid-devel
-#BuildRequires: libibverbs-devel, librdmacm-devel
-BuildRequires: ncurses-devel
+BuildRequires: gcc gcc-c++ make
+BuildRequires: dpdk-devel, numactl-devel, ncurses-devel
+BuildRequires: libiscsi-devel, libaio-devel, openssl-devel, libuuid-devel
+BuildRequires: libibverbs-devel, librdmacm-devel
 %if %{with doc}
 BuildRequires: doxygen mscgen graphviz
 %endif
@@ -52,18 +48,9 @@ BuildRequires: cmake gcc gcc-c++ json-c-devel libcmocka-devel openssl-devel
 BuildRequires: autoconf automake libtool meson
 
 # Install dependencies
-
-# FIXME not required if using internal DPDK 
-#Requires: dpdk >= 17.11
-
-#Requires: numactl-libs, openssl-libs
-
-# FIXME not required if not built with libiscsi
-#Requires: libiscsi
-
-Requires: libaio
-Requires: libuuid
-
+Requires: dpdk >= 19.11, numactl-libs, openssl-libs
+Requires: libiscsi, libaio, libuuid
+Requires: python3-configshell, python3-pexpect
 # NVMe over Fabrics
 #Requires: librdmacm, librdmacm
 

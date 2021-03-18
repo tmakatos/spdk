@@ -54,10 +54,50 @@ DEFINE_STUB_V(nvme_qpair_resubmit_requests, (struct spdk_nvme_qpair *qpair, uint
 DEFINE_STUB(spdk_nvme_poll_group_process_completions, int64_t, (struct spdk_nvme_poll_group *group,
 		uint32_t completions_per_qpair, spdk_nvme_disconnected_qpair_cb disconnected_qpair_cb), 0)
 
+DEFINE_STUB(rdma_ack_cm_event, int, (struct rdma_cm_event *event), 0);
+DEFINE_STUB_V(rdma_free_devices, (struct ibv_context **list));
+DEFINE_STUB(fcntl, int, (int fd, int cmd, ...), 0);
+DEFINE_STUB_V(rdma_destroy_event_channel, (struct rdma_event_channel *channel));
+
 struct nvme_rdma_ut_bdev_io {
 	struct iovec iovs[NVME_RDMA_MAX_SGL_DESCRIPTORS];
 	int iovpos;
 };
+
+DEFINE_RETURN_MOCK(rdma_get_devices, struct ibv_context **);
+struct ibv_context **
+rdma_get_devices(int *num_devices)
+{
+	static struct ibv_context *_contexts[] = {
+		(struct ibv_context *)0xDEADBEEF,
+		(struct ibv_context *)0xFEEDBEEF,
+		NULL
+	};
+
+	HANDLE_RETURN_MOCK(rdma_get_devices);
+	return _contexts;
+}
+
+DEFINE_RETURN_MOCK(rdma_create_event_channel, struct rdma_event_channel *);
+struct rdma_event_channel *
+rdma_create_event_channel(void)
+{
+	HANDLE_RETURN_MOCK(rdma_create_event_channel);
+	return NULL;
+}
+
+DEFINE_RETURN_MOCK(ibv_query_device, int);
+int
+ibv_query_device(struct ibv_context *context,
+		 struct ibv_device_attr *device_attr)
+{
+	if (device_attr) {
+		device_attr->max_sge = NVME_RDMA_MAX_SGL_DESCRIPTORS;
+	}
+	HANDLE_RETURN_MOCK(ibv_query_device);
+
+	return 0;
+}
 
 /* essentially a simplification of bdev_nvme_next_sge and bdev_nvme_reset_sgl */
 static void nvme_rdma_ut_reset_sgl(void *cb_arg, uint32_t offset)
@@ -365,7 +405,7 @@ test_nvme_rdma_build_contig_inline_request(void)
 static void
 test_nvme_rdma_alloc_reqs(void)
 {
-	struct nvme_rdma_qpair rqpair = {0};
+	struct nvme_rdma_qpair rqpair = {};
 	int rc;
 
 	memset(&g_nvme_hooks, 0, sizeof(g_nvme_hooks));
@@ -419,6 +459,258 @@ test_nvme_rdma_alloc_reqs(void)
 	spdk_free(rqpair.cmds);
 }
 
+static void
+test_nvme_rdma_alloc_rsps(void)
+{
+	struct nvme_rdma_qpair rqpair = {};
+	int rc;
+
+	memset(&g_nvme_hooks, 0, sizeof(g_nvme_hooks));
+
+	/* Test case 1 calloc false */
+	rqpair.num_entries = 0;
+	rc = nvme_rdma_alloc_rsps(&rqpair);
+	CU_ASSERT(rqpair.rsp_sgls == NULL);
+	SPDK_CU_ASSERT_FATAL(rc == -ENOMEM);
+
+	/* Test case 2 calloc success */
+	memset(&rqpair, 0, sizeof(rqpair));
+	rqpair.num_entries = 1;
+
+	rc = nvme_rdma_alloc_rsps(&rqpair);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(rqpair.rsp_sgls != NULL);
+	CU_ASSERT(rqpair.rsp_recv_wrs != NULL);
+	CU_ASSERT(rqpair.rsps != NULL);
+	nvme_rdma_free_rsps(&rqpair);
+}
+
+static void
+test_nvme_rdma_ctrlr_create_qpair(void)
+{
+	struct spdk_nvme_ctrlr ctrlr = {};
+	uint16_t qid, qsize;
+	struct spdk_nvme_qpair *qpair;
+	struct nvme_rdma_qpair *rqpair;
+
+	/* Test case 1: max qsize. Expect: PASS */
+	qsize = 0xffff;
+	qid = 1;
+
+	qpair = nvme_rdma_ctrlr_create_qpair(&ctrlr, qid, qsize,
+					     SPDK_NVME_QPRIO_URGENT, 1,
+					     false);
+	CU_ASSERT(qpair != NULL);
+	rqpair = SPDK_CONTAINEROF(qpair, struct nvme_rdma_qpair, qpair);
+	CU_ASSERT(qpair == &rqpair->qpair);
+	CU_ASSERT(rqpair->num_entries == qsize);
+	CU_ASSERT(rqpair->delay_cmd_submit == false);
+	CU_ASSERT(rqpair->rsp_sgls != NULL);
+	CU_ASSERT(rqpair->rsp_recv_wrs != NULL);
+	CU_ASSERT(rqpair->rsps != NULL);
+
+	nvme_rdma_free_reqs(rqpair);
+	nvme_rdma_free_rsps(rqpair);
+	nvme_rdma_free(rqpair);
+	rqpair = NULL;
+
+	/* Test case 2: queue qsize zero. ExpectL FAIL */
+	qsize = 0;
+
+	qpair = nvme_rdma_ctrlr_create_qpair(&ctrlr, qid, qsize,
+					     SPDK_NVME_QPRIO_URGENT, 1,
+					     false);
+	SPDK_CU_ASSERT_FATAL(qpair == NULL);
+}
+
+DEFINE_STUB(ibv_create_cq, struct ibv_cq *, (struct ibv_context *context, int cqe, void *cq_context,
+		struct ibv_comp_channel *channel, int comp_vector), (struct ibv_cq *)0xFEEDBEEF);
+DEFINE_STUB(ibv_destroy_cq, int, (struct ibv_cq *cq), 0);
+
+static void
+test_nvme_rdma_poller_create(void)
+{
+	struct nvme_rdma_poll_group	group = {};
+	struct ibv_context *contexts = (struct ibv_context *)0xDEADBEEF;
+
+	/* Case: calloc and ibv not need to fail test */
+	STAILQ_INIT(&group.pollers);
+	group.num_pollers = 1;
+	int rc = nvme_rdma_poller_create(&group, contexts);
+
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(group.num_pollers = 2);
+	CU_ASSERT(&group.pollers != NULL);
+	CU_ASSERT(group.pollers.stqh_first->device == contexts);
+	CU_ASSERT(group.pollers.stqh_first->cq == (struct ibv_cq *)0xFEEDBEEF);
+	CU_ASSERT(group.pollers.stqh_first->current_num_wc == DEFAULT_NVME_RDMA_CQ_SIZE);
+	CU_ASSERT(group.pollers.stqh_first->required_num_wc == 0);
+
+	nvme_rdma_poll_group_free_pollers(&group);
+}
+
+static void
+test_nvme_rdma_qpair_process_cm_event(void)
+{
+	struct nvme_rdma_qpair rqpair = {};
+	struct rdma_cm_event	 event = {};
+	struct spdk_nvmf_rdma_accept_private_data	accept_data = {};
+	int rc = 0;
+
+	/* case1: event == RDMA_CM_EVENT_ADDR_RESOLVED */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_ADDR_RESOLVED;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+
+	/* case2: event == RDMA_CM_EVENT_CONNECT_REQUEST */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_CONNECT_REQUEST;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+
+	/* case3: event == RDMA_CM_EVENT_CONNECT_ERROR */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_CONNECT_ERROR;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+
+	/* case4: event == RDMA_CM_EVENT_UNREACHABLE */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_UNREACHABLE;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+
+	/* case5: event == RDMA_CM_EVENT_CONNECT_RESPONSE */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_CONNECT_RESPONSE;
+	event.param.conn.private_data = NULL;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == -1);
+
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_CONNECT_RESPONSE;
+	event.param.conn.private_data = &accept_data;
+	accept_data.crqsize = 512;
+	rqpair.num_entries = 1024;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(rqpair.num_entries == 512);
+
+	/* case6: event == RDMA_CM_EVENT_DISCONNECTED */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_DISCONNECTED;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(rqpair.qpair.transport_failure_reason == SPDK_NVME_QPAIR_FAILURE_REMOTE);
+
+	/* case7: event == RDMA_CM_EVENT_DEVICE_REMOVAL */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_DEVICE_REMOVAL;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(rqpair.qpair.transport_failure_reason == SPDK_NVME_QPAIR_FAILURE_LOCAL);
+
+	/* case8: event == RDMA_CM_EVENT_MULTICAST_JOIN */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_MULTICAST_JOIN;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+
+	/* case9: event == RDMA_CM_EVENT_ADDR_CHANGE */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_ADDR_CHANGE;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(rqpair.qpair.transport_failure_reason == SPDK_NVME_QPAIR_FAILURE_LOCAL);
+
+	/* case10: event == RDMA_CM_EVENT_TIMEWAIT_EXIT */
+	rqpair.evt = &event;
+	event.event = RDMA_CM_EVENT_TIMEWAIT_EXIT;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+
+	/* case11: default event == 0xFF */
+	rqpair.evt = &event;
+	event.event = 0xFF;
+	rc = nvme_rdma_qpair_process_cm_event(&rqpair);
+	CU_ASSERT(rc == 0);
+}
+
+static void
+test_nvme_rdma_mr_get_lkey(void)
+{
+	union nvme_rdma_mr mr = {};
+	struct ibv_mr	ibv_mr = {};
+	uint64_t mr_key;
+	uint32_t lkey;
+
+	memset(&g_nvme_hooks, 0, sizeof(g_nvme_hooks));
+	ibv_mr.lkey = 1;
+	mr_key = 2;
+
+	/* Case 1:  get key form key address */
+	mr.key = (uint64_t)&mr_key;
+	g_nvme_hooks.get_rkey = (void *)0xAEADBEEF;
+
+	lkey = nvme_rdma_mr_get_lkey(&mr);
+	CU_ASSERT(lkey == mr_key);
+
+	/* Case 2: Get key from ibv_mr  */
+	g_nvme_hooks.get_rkey = NULL;
+	mr.mr = &ibv_mr;
+
+	lkey = nvme_rdma_mr_get_lkey(&mr);
+	CU_ASSERT(lkey == ibv_mr.lkey);
+}
+
+static void
+test_nvme_rdma_ctrlr_construct(void)
+{
+	struct spdk_nvme_ctrlr *ctrlr;
+	struct spdk_nvme_transport_id trid = {};
+	struct spdk_nvme_ctrlr_opts opts = {};
+	struct nvme_rdma_qpair *rqpair = NULL;
+	struct nvme_rdma_ctrlr *rctrlr = NULL;
+	struct rdma_event_channel cm_channel = {};
+	void *devhandle = NULL;
+	int rc;
+
+	opts.transport_retry_count = NVME_RDMA_CTRLR_MAX_TRANSPORT_RETRY_COUNT + 1;
+	opts.transport_ack_timeout = NVME_RDMA_CTRLR_MAX_TRANSPORT_ACK_TIMEOUT + 1;
+	opts.admin_queue_size = 0xFFFF;
+	trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
+	trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
+	MOCK_SET(rdma_create_event_channel, &cm_channel);
+
+	ctrlr = nvme_rdma_ctrlr_construct(&trid, &opts, devhandle);
+	SPDK_CU_ASSERT_FATAL(ctrlr != NULL);
+	CU_ASSERT(ctrlr->opts.transport_retry_count ==
+		  NVME_RDMA_CTRLR_MAX_TRANSPORT_RETRY_COUNT);
+	CU_ASSERT(ctrlr->opts.transport_ack_timeout ==
+		  NVME_RDMA_CTRLR_MAX_TRANSPORT_ACK_TIMEOUT);
+	CU_ASSERT(ctrlr->opts.admin_queue_size == opts.admin_queue_size);
+	rctrlr = SPDK_CONTAINEROF(ctrlr, struct nvme_rdma_ctrlr, ctrlr);
+	CU_ASSERT(rctrlr->max_sge == NVME_RDMA_MAX_SGL_DESCRIPTORS);
+	CU_ASSERT(rctrlr->cm_channel == &cm_channel);
+	CU_ASSERT(!strncmp((char *)&rctrlr->ctrlr.trid,
+			   (char *)&trid, sizeof(trid)));
+
+	SPDK_CU_ASSERT_FATAL(ctrlr->adminq != NULL);
+	rqpair = SPDK_CONTAINEROF(ctrlr->adminq, struct nvme_rdma_qpair, qpair);
+	CU_ASSERT(rqpair->num_entries == opts.admin_queue_size);
+	CU_ASSERT(rqpair->delay_cmd_submit == false);
+	CU_ASSERT(rqpair->rsp_sgls != NULL);
+	CU_ASSERT(rqpair->rsp_recv_wrs != NULL);
+	CU_ASSERT(rqpair->rsps != NULL);
+	MOCK_CLEAR(rdma_create_event_channel);
+
+	/* Hardcode the trtype, because nvme_qpair_init() is stub function. */
+	rqpair->qpair.trtype = SPDK_NVME_TRANSPORT_RDMA;
+	rc = nvme_rdma_ctrlr_destruct(ctrlr);
+	CU_ASSERT(rc == 0);
+}
+
 int main(int argc, char **argv)
 {
 	CU_pSuite	suite = NULL;
@@ -433,6 +725,12 @@ int main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_rdma_build_contig_request);
 	CU_ADD_TEST(suite, test_nvme_rdma_build_contig_inline_request);
 	CU_ADD_TEST(suite, test_nvme_rdma_alloc_reqs);
+	CU_ADD_TEST(suite, test_nvme_rdma_alloc_rsps);
+	CU_ADD_TEST(suite, test_nvme_rdma_ctrlr_create_qpair);
+	CU_ADD_TEST(suite, test_nvme_rdma_poller_create);
+	CU_ADD_TEST(suite, test_nvme_rdma_qpair_process_cm_event);
+	CU_ADD_TEST(suite, test_nvme_rdma_mr_get_lkey);
+	CU_ADD_TEST(suite, test_nvme_rdma_ctrlr_construct);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();
