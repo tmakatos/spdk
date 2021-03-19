@@ -73,7 +73,8 @@ struct nvmf_vfio_user_qpair;
 
 typedef int (*nvmf_vfio_user_req_cb_fn)(struct nvmf_vfio_user_req *req, void *cb_arg);
 
-#define NVMF_VFIO_USER_MDTS	32
+/* Maximum Data Transfer Size */
+#define NVMF_VFIO_USER_MDTS	64
 #define NVMF_VFIO_USER_MAX_IOVECS	(NVMF_VFIO_USER_MDTS + 1)
 
 struct nvmf_vfio_user_req  {
