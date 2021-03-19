@@ -1007,25 +1007,12 @@ static void
 start_cache_cmpl(ocf_cache_t cache, void *priv, int error)
 {
 	struct vbdev_ocf *vbdev = priv;
-	uint64_t mem_needed;
 
 	ocf_mngt_cache_unlock(cache);
 
 	if (error) {
 		SPDK_ERRLOG("Error %d during start cache %s, starting rollback\n",
 			    error, vbdev->name);
-
-		if (error == -OCF_ERR_NO_MEM) {
-			ocf_mngt_get_ram_needed(cache, &vbdev->cfg.device, &mem_needed);
-
-			SPDK_NOTICELOG("Try to increase hugepage memory size or cache line size. "
-				       "For your configuration:\nDevice size: %"PRIu64" bytes\n"
-				       "Cache line size: %"PRIu64" bytes\nFree memory needed to start "
-				       "cache: %"PRIu64" bytes\n", vbdev->cache.bdev->blockcnt *
-				       vbdev->cache.bdev->blocklen, vbdev->cfg.cache.cache_line_size,
-				       mem_needed);
-		}
-
 		vbdev_ocf_mngt_exit(vbdev, unregister_path_dirty, error);
 		return;
 	}
@@ -1477,31 +1464,6 @@ vbdev_ocf_construct(const char *vbdev_name,
 	} else {
 		cb(0, vbdev, cb_arg);
 	}
-}
-
-/* Set new cache mode on OCF cache */
-void
-vbdev_ocf_set_cache_mode(struct vbdev_ocf *vbdev,
-			 const char *cache_mode_name,
-			 void (*cb)(int, struct vbdev_ocf *, void *),
-			 void *cb_arg)
-{
-	ocf_cache_t cache;
-	ocf_cache_mode_t cache_mode;
-	int rc;
-
-	cache = vbdev->ocf_cache;
-	cache_mode = ocf_get_cache_mode(cache_mode_name);
-
-	rc = ocf_mngt_cache_trylock(cache);
-	if (rc) {
-		cb(rc, vbdev, cb_arg);
-		return;
-	}
-
-	rc = ocf_mngt_cache_set_mode(cache, cache_mode);
-	ocf_mngt_cache_unlock(cache);
-	cb(rc, vbdev, cb_arg);
 }
 
 /* This called if new device is created in SPDK application

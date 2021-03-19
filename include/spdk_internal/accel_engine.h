@@ -80,26 +80,14 @@ struct spdk_accel_task {
 	struct spdk_accel_batch		*batch;
 	spdk_accel_completion_cb	cb_fn;
 	void				*cb_arg;
-	union {
-		struct {
-			struct iovec			*iovs; /* iovs passed by the caller */
-			uint32_t			iovcnt; /* iovcnt passed by the caller */
-		} v;
-		void				*src;
-	};
+	void				*src;
 	union {
 		void			*dst;
 		void			*src2;
 	};
-	union {
-		struct {
-			spdk_accel_completion_cb	cb_fn;
-			void				*cb_arg;
-		} chained;
-		void				*dst2;
-		uint32_t			seed;
-		uint64_t			fill_pattern;
-	};
+	void				*dst2;
+	uint32_t			seed;
+	uint64_t			fill_pattern;
 	enum accel_opcode		op_code;
 	uint64_t			nbytes;
 	TAILQ_ENTRY(spdk_accel_task)	link;

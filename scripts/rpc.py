@@ -325,16 +325,6 @@ if __name__ == "__main__":
     p.add_argument('name', nargs='?', default=None, help='name of OCF vbdev or name of cache device or name of core device (optional)')
     p.set_defaults(func=bdev_ocf_get_bdevs)
 
-    def bdev_ocf_set_cache_mode(args):
-        print_json(rpc.bdev.bdev_ocf_set_cache_mode(args.client,
-                                                    name=args.name,
-                                                    mode=args.mode))
-    p = subparsers.add_parser('bdev_ocf_set_cache_mode',
-                              help='Set cache mode of OCF block device')
-    p.add_argument('name', help='Name of OCF bdev')
-    p.add_argument('mode', help='OCF cache mode', choices=['wb', 'wt', 'pt', 'wa', 'wi', 'wo'])
-    p.set_defaults(func=bdev_ocf_set_cache_mode)
-
     def bdev_malloc_create(args):
         num_blocks = (args.total_size * 1024 * 1024) // args.block_size
         print_json(rpc.bdev.bdev_malloc_create(args.client,
@@ -520,9 +510,7 @@ if __name__ == "__main__":
                                                          hostaddr=args.hostaddr,
                                                          hostsvcid=args.hostsvcid,
                                                          prchk_reftag=args.prchk_reftag,
-                                                         prchk_guard=args.prchk_guard,
-                                                         hdgst=args.hdgst,
-                                                         ddgst=args.ddgst))
+                                                         prchk_guard=args.prchk_guard))
 
     p = subparsers.add_parser('bdev_nvme_attach_controller', aliases=['construct_nvme_bdev'],
                               help='Add bdevs with nvme backend')
@@ -547,10 +535,6 @@ if __name__ == "__main__":
                    help='Enable checking of PI reference tag for I/O processing.', action='store_true')
     p.add_argument('-g', '--prchk-guard',
                    help='Enable checking of PI guard for I/O processing.', action='store_true')
-    p.add_argument('-e', '--hdgst',
-                   help='Enable TCP header digest.', action='store_true')
-    p.add_argument('-d', '--ddgst',
-                   help='Enable TCP data digest.', action='store_true')
     p.set_defaults(func=bdev_nvme_attach_controller)
 
     def bdev_nvme_get_controllers(args):
@@ -1871,7 +1855,6 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                                        max_aq_depth=args.max_aq_depth,
                                        num_shared_buffers=args.num_shared_buffers,
                                        buf_cache_size=args.buf_cache_size,
-                                       num_cqe=args.num_cqe,
                                        max_srq_depth=args.max_srq_depth,
                                        no_srq=args.no_srq,
                                        c2h_success=args.c2h_success,
@@ -1895,8 +1878,6 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-a', '--max-aq-depth', help='Max number of admin cmds per AQ', type=int)
     p.add_argument('-n', '--num-shared-buffers', help='The number of pooled data buffers available to the transport', type=int)
     p.add_argument('-b', '--buf-cache-size', help='The number of shared buffers to reserve for each poll group', type=int)
-    p.add_argument('-d', '--num_cqe', help="""The number of CQ entires. Only used when no_srq=true.
-    Relevant only for RDMA transport""", type=int)
     p.add_argument('-s', '--max-srq-depth', help='Max number of outstanding I/O per SRQ. Relevant only for RDMA transport', type=int)
     p.add_argument('-r', '--no-srq', action='store_true', help='Disable per-thread shared receive queue. Relevant only for RDMA transport')
     p.add_argument('-o', '--c2h-success', action='store_false', help='Disable C2H success optimization. Relevant only for TCP transport')
@@ -2318,13 +2299,16 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         print_json(rpc.bdev.bdev_ocssd_create(args.client,
                                               ctrlr_name=args.ctrlr_name,
                                               bdev_name=args.name,
-                                              nsid=nsid))
+                                              nsid=nsid,
+                                              range=args.range))
 
     p = subparsers.add_parser('bdev_ocssd_create',
                               help='Creates zoned bdev on specified Open Channel controller')
     p.add_argument('-c', '--ctrlr_name', help='Name of the OC NVMe controller', required=True)
     p.add_argument('-b', '--name', help='Name of the bdev to create', required=True)
     p.add_argument('-n', '--nsid', help='Namespace ID', required=False)
+    p.add_argument('-r', '--range', help='Parallel unit range (in the form of BEGIN-END (inclusive))',
+                   required=False)
     p.set_defaults(func=bdev_ocssd_create)
 
     def bdev_ocssd_delete(args):
@@ -2597,7 +2581,6 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('-i', '--impl', help='Socket implementation name, e.g. posix', required=True)
     p.add_argument('-r', '--recv-buf-size', help='Size of receive buffer on socket in bytes', type=int)
     p.add_argument('-s', '--send-buf-size', help='Size of send buffer on socket in bytes', type=int)
-    p.add_argument('-p', '--enable-placement-id', help='Option for placement-id. 0:disable,1:incoming_napi,2:incoming_cpu', type=int)
     p.add_argument('--enable-recv-pipe', help='Enable receive pipe',
                    action='store_true', dest='enable_recv_pipe')
     p.add_argument('--disable-recv-pipe', help='Disable receive pipe',
@@ -2610,6 +2593,10 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
                    action='store_true', dest='enable_quickack')
     p.add_argument('--disable-quickack', help='Disable quick ACK',
                    action='store_false', dest='enable_quickack')
+    p.add_argument('--enable-placement_id', help='Enable placement_id',
+                   action='store_true', dest='enable_placement_id')
+    p.add_argument('--disable-placement_id', help='Disable placement_id',
+                   action='store_false', dest='enable_placement_id')
     p.set_defaults(func=sock_impl_set_options, enable_recv_pipe=None, enable_zerocopy_send=None,
                    enable_quickack=None, enable_placement_id=None)
 
@@ -2698,14 +2685,9 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
         print_json = null_print
         print_array = null_print
     else:
-        try:
-            args.client = rpc.client.JSONRPCClient(args.server_addr, args.port, args.timeout,
-                                                   log_level=getattr(logging, args.verbose.upper()),
-                                                   conn_retries=args.conn_retries)
-        except JSONRPCException as ex:
-            print(ex.message)
-            exit(1)
-
+        args.client = rpc.client.JSONRPCClient(args.server_addr, args.port, args.timeout,
+                                               log_level=getattr(logging, args.verbose.upper()),
+                                               conn_retries=args.conn_retries)
     if hasattr(args, 'func'):
         try:
             call_rpc_func(args)

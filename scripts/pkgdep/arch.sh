@@ -6,7 +6,6 @@ pacman -Sy --needed --noconfirm gcc make cmake cunit libaio openssl \
 # Additional dependencies for SPDK CLI
 pacman -Sy --needed --noconfirm python-pexpect python-pip libffi
 pip install configshell_fb
-pip install pyelftools
 # Additional dependencies for DPDK
 pacman -Sy --needed --noconfirm numactl nasm
 # Additional dependencies for ISA-L used in compression
@@ -14,7 +13,7 @@ pacman -Sy --needed --noconfirm autoconf automake libtool help2man
 if [[ $INSTALL_DEV_TOOLS == "true" ]]; then
 	# Tools for developers
 	pacman -Sy --needed --noconfirm git astyle autopep8 \
-		clang sg3_utils pciutils shellcheck bash-completion
+		clang sg3_utils pciutils shellcheck
 	#fakeroot needed to instal via makepkg
 	pacman -Sy --needed --noconfirm fakeroot
 	su - $SUDO_USER -c "pushd /tmp;

@@ -3127,14 +3127,11 @@ nvmf_fc_adm_add_rem_nport_listener(struct spdk_nvmf_fc_nport *nport, bool add)
 {
 	struct spdk_nvmf_tgt *tgt = nvmf_fc_get_tgt();
 	struct spdk_nvmf_subsystem *subsystem;
-	struct spdk_nvmf_listen_opts opts;
 
 	if (!tgt) {
 		SPDK_ERRLOG("No nvmf target defined\n");
 		return -EINVAL;
 	}
-
-	spdk_nvmf_listen_opts_init(&opts, sizeof(opts));
 
 	subsystem = spdk_nvmf_subsystem_get_first(tgt);
 	while (subsystem) {
@@ -3149,7 +3146,7 @@ nvmf_fc_adm_add_rem_nport_listener(struct spdk_nvmf_fc_nport *nport, bool add)
 						    nport->fc_nodename.u.wwn,
 						    nport->fc_portname.u.wwn);
 
-				if (spdk_nvmf_tgt_listen_ext(subsystem->tgt, &ctx->trid, &opts)) {
+				if (spdk_nvmf_tgt_listen(subsystem->tgt, &ctx->trid)) {
 					SPDK_ERRLOG("Failed to add transport address %s to tgt listeners\n",
 						    ctx->trid.traddr);
 					free(ctx);

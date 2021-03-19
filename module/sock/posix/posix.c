@@ -2,7 +2,7 @@
  *   BSD LICENSE
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
- *   Copyright (c) 2020, 2021 Mellanox Technologies LTD. All rights reserved.
+ *   Copyright (c) 2020 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -33,16 +33,11 @@
 
 #include "spdk/stdinc.h"
 
-#if defined(__FreeBSD__)
-#include <sys/event.h>
-#define SPDK_KEVENT
-#else
-#include <sys/epoll.h>
-#define SPDK_EPOLL
-#endif
-
 #if defined(__linux__)
+#include <sys/epoll.h>
 #include <linux/errqueue.h>
+#elif defined(__FreeBSD__)
+#include <sys/event.h>
 #endif
 
 #include "spdk/log.h"
@@ -84,9 +79,9 @@ static struct spdk_sock_impl_opts g_spdk_posix_sock_impl_opts = {
 	.recv_buf_size = MIN_SO_RCVBUF_SIZE,
 	.send_buf_size = MIN_SO_SNDBUF_SIZE,
 	.enable_recv_pipe = true,
-	.enable_zerocopy_send = true,
+	.enable_zerocopy_send = false,
 	.enable_quickack = false,
-	.enable_placement_id = 0,
+	.enable_placement_id = false,
 };
 
 static int
@@ -332,12 +327,14 @@ posix_sock_alloc(int fd, bool enable_zero_copy)
 #if defined(SPDK_ZEROCOPY)
 	flag = 1;
 
-	if (enable_zero_copy && g_spdk_posix_sock_impl_opts.enable_zerocopy_send) {
-		/* Try to turn on zero copy sends */
-		rc = setsockopt(sock->fd, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag));
-		if (rc == 0) {
-			sock->zcopy = true;
-		}
+	if (!enable_zero_copy || !g_spdk_posix_sock_impl_opts.enable_zerocopy_send) {
+		return sock;
+	}
+
+	/* Try to turn on zero copy sends */
+	rc = setsockopt(sock->fd, SOL_SOCKET, SO_ZEROCOPY, &flag, sizeof(flag));
+	if (rc == 0) {
+		sock->zcopy = true;
 	}
 #endif
 
@@ -661,7 +658,6 @@ static int
 _sock_check_zcopy(struct spdk_sock *sock)
 {
 	struct spdk_posix_sock *psock = __posix_sock(sock);
-	struct spdk_posix_sock_group_impl *group = __posix_group_impl(sock->group_impl);
 	struct msghdr msgh = {};
 	uint8_t buf[sizeof(struct cmsghdr) + sizeof(struct sock_extended_err)];
 	ssize_t rc;
@@ -725,12 +721,6 @@ _sock_check_zcopy(struct spdk_sock *sock)
 				}
 			}
 
-			/* If we reaped buffer reclaim notification and sock is not in pending_recv list yet,
-			 * add it now. It allows to call socket callback and process completions */
-			if (found && !psock->pending_recv && group) {
-				psock->pending_recv = true;
-				TAILQ_INSERT_TAIL(&group->pending_recv, psock, link);
-			}
 		}
 	}
 
@@ -845,17 +835,9 @@ _sock_flush(struct spdk_sock *sock)
 }
 
 static int
-posix_sock_flush(struct spdk_sock *sock)
+posix_sock_flush(struct spdk_sock *_sock)
 {
-#ifdef SPDK_ZEROCOPY
-	struct spdk_posix_sock *psock = __posix_sock(sock);
-
-	if (psock->zcopy && !TAILQ_EMPTY(&sock->pending_reqs)) {
-		_sock_check_zcopy(sock);
-	}
-#endif
-
-	return _sock_flush(sock);
+	return _sock_flush(_sock);
 }
 
 static ssize_t
@@ -1092,34 +1074,16 @@ posix_sock_get_placement_id(struct spdk_sock *_sock, int *placement_id)
 		return rc;
 	}
 
-	if (g_spdk_posix_sock_impl_opts.enable_placement_id != 0) {
-		switch (g_spdk_posix_sock_impl_opts.enable_placement_id) {
-		case 1: {
 #if defined(SO_INCOMING_NAPI_ID)
-			struct spdk_posix_sock *sock = __posix_sock(_sock);
-			socklen_t len = sizeof(int);
+	struct spdk_posix_sock *sock = __posix_sock(_sock);
+	socklen_t salen = sizeof(int);
 
-			rc = getsockopt(sock->fd, SOL_SOCKET, SO_INCOMING_NAPI_ID, placement_id, &len);
-#endif
-			break;
-		}
-		case 2: {
-#if defined(SO_INCOMING_CPU)
-			struct spdk_posix_sock *sock = __posix_sock(_sock);
-			socklen_t len = sizeof(int);
-
-			rc = getsockopt(sock->fd, SOL_SOCKET, SO_INCOMING_CPU, placement_id, &len);
-#endif
-			break;
-		}
-		default:
-			break;
-		}
-	}
-
+	rc = getsockopt(sock->fd, SOL_SOCKET, SO_INCOMING_NAPI_ID, placement_id, &salen);
 	if (rc != 0) {
 		SPDK_ERRLOG("getsockopt() failed (errno=%d)\n", errno);
 	}
+
+#endif
 	return rc;
 }
 
@@ -1129,9 +1093,9 @@ posix_sock_group_impl_create(void)
 	struct spdk_posix_sock_group_impl *group_impl;
 	int fd;
 
-#if defined(SPDK_EPOLL)
+#if defined(__linux__)
 	fd = epoll_create1(0);
-#elif defined(SPDK_KEVENT)
+#elif defined(__FreeBSD__)
 	fd = kqueue();
 #endif
 	if (fd == -1) {
@@ -1158,7 +1122,7 @@ posix_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_
 	struct spdk_posix_sock *sock = __posix_sock(_sock);
 	int rc;
 
-#if defined(SPDK_EPOLL)
+#if defined(__linux__)
 	struct epoll_event event;
 
 	memset(&event, 0, sizeof(event));
@@ -1167,7 +1131,7 @@ posix_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_
 	event.data.ptr = sock;
 
 	rc = epoll_ctl(group->fd, EPOLL_CTL_ADD, sock->fd, &event);
-#elif defined(SPDK_KEVENT)
+#elif defined(__FreeBSD__)
 	struct kevent event;
 	struct timespec ts = {0};
 
@@ -1202,12 +1166,12 @@ posix_sock_group_impl_remove_sock(struct spdk_sock_group_impl *_group, struct sp
 		assert(sock->pending_recv == false);
 	}
 
-#if defined(SPDK_EPOLL)
+#if defined(__linux__)
 	struct epoll_event event;
 
 	/* Event parameter is ignored but some old kernel version still require it. */
 	rc = epoll_ctl(group->fd, EPOLL_CTL_DEL, sock->fd, &event);
-#elif defined(SPDK_KEVENT)
+#elif defined(__FreeBSD__)
 	struct kevent event;
 	struct timespec ts = {0};
 
@@ -1233,9 +1197,9 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 	struct spdk_sock *sock, *tmp;
 	int num_events, i, rc;
 	struct spdk_posix_sock *psock, *ptmp;
-#if defined(SPDK_EPOLL)
+#if defined(__linux__)
 	struct epoll_event events[MAX_EVENTS_PER_POLL];
-#elif defined(SPDK_KEVENT)
+#elif defined(__FreeBSD__)
 	struct kevent events[MAX_EVENTS_PER_POLL];
 	struct timespec ts = {0};
 #endif
@@ -1250,9 +1214,9 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 		}
 	}
 
-#if defined(SPDK_EPOLL)
+#if defined(__linux__)
 	num_events = epoll_wait(group->fd, events, max_events, 0);
-#elif defined(SPDK_KEVENT)
+#elif defined(__FreeBSD__)
 	num_events = kevent(group->fd, NULL, 0, events, max_events, &ts);
 #endif
 
@@ -1272,7 +1236,7 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 	}
 
 	for (i = 0; i < num_events; i++) {
-#if defined(SPDK_EPOLL)
+#if defined(__linux__)
 		sock = events[i].data.ptr;
 		psock = __posix_sock(sock);
 
@@ -1291,7 +1255,7 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 			continue;
 		}
 
-#elif defined(SPDK_KEVENT)
+#elif defined(__FreeBSD__)
 		sock = events[i].udata;
 		psock = __posix_sock(sock);
 #endif
@@ -1308,14 +1272,6 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 	TAILQ_FOREACH_SAFE(psock, &group->pending_recv, link, ptmp) {
 		if (num_events == max_events) {
 			break;
-		}
-
-		/* If the socket's cb_fn is NULL, just remove it from the
-		 * list and do not add it to socks array */
-		if (spdk_unlikely(psock->base.cb_fn == NULL)) {
-			psock->pending_recv = false;
-			TAILQ_REMOVE(&group->pending_recv, psock, link);
-			continue;
 		}
 
 		socks[num_events++] = &psock->base;

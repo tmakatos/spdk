@@ -29,7 +29,7 @@ VM_SETUP_PATH=$(readlink -f ${BASH_SOURCE%/*})
 
 UPGRADE=false
 INSTALL=false
-CONF="rocksdb,fio,flamegraph,tsocks,qemu,libiscsi,nvmecli,qat,spdk,refspdk,vagrant,igb_uio,ice"
+CONF="rocksdb,fio,flamegraph,tsocks,qemu,libiscsi,nvmecli,qat,spdk,refspdk,vagrant,igb_uio"
 package_manager=
 
 function pre_install() { :; }
@@ -44,7 +44,7 @@ function usage() {
 	echo "  -h --help"
 	echo "  -u --upgrade Run $package_manager upgrade"
 	echo "  -i --install-deps Install $package_manager based dependencies"
-	echo "  -t --test-conf List of test configurations to enable (${CONF},irdma)"
+	echo "  -t --test-conf List of test configurations to enable (${CONF})"
 	echo "  -c --conf-path Path to configuration file"
 	echo "  -d --dir-git Path to where git sources should be saved"
 	echo "  -s --disable-tsocks Disable use of tsocks"
@@ -165,7 +165,6 @@ if $INSTALL; then
 fi
 
 source "$vmsetupdir/pkgdep/git"
-install_sources
 
 # create autorun-spdk.conf in home folder. This is sourced by the autotest_common.sh file.
 # By setting any one of the values below to 0, you can skip that specific test. If you are

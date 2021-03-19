@@ -42,7 +42,6 @@
 #include "sock/posix/posix.c"
 
 #include "spdk_internal/mock.h"
-#include "common/lib/test_env.c"
 
 #define UT_IP	"test_ip"
 #define UT_PORT	1234

@@ -161,6 +161,7 @@ struct spdk_iscsi_pdu {
 	struct iscsi_bhs bhs;
 	struct spdk_mobj *mobj;
 	bool is_rejected;
+	uint8_t *data_buf;
 	uint8_t *data;
 	uint8_t header_digest[ISCSI_DIGEST_LEN];
 	uint8_t data_digest[ISCSI_DIGEST_LEN];

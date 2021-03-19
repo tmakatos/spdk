@@ -614,11 +614,8 @@ spdk_app_json_config_load(const char *json_config_file, const char *rpc_addr,
 		goto fail;
 	}
 
-	rc = spdk_rpc_initialize(ctx->rpc_socket_path_temp);
-	if (rc) {
-		goto fail;
-	}
-
+	/* FIXME: spdk_rpc_initialize() function should return error code. */
+	spdk_rpc_initialize(ctx->rpc_socket_path_temp);
 	ctx->client_conn = spdk_jsonrpc_client_connect(ctx->rpc_socket_path_temp, AF_UNIX);
 	if (ctx->client_conn == NULL) {
 		SPDK_ERRLOG("Failed to connect to '%s'\n", ctx->rpc_socket_path_temp);

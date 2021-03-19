@@ -613,8 +613,6 @@ int main(int argc, char **argv)
 			file_name = optarg;
 			break;
 		case 'h':
-			usage();
-			exit(EXIT_SUCCESS);
 		default:
 			usage();
 			exit(1);

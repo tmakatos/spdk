@@ -387,11 +387,6 @@ create_malloc_disk(struct spdk_bdev **bdev, const char *name, const struct spdk_
 		return -EINVAL;
 	}
 
-	if (block_size % 512) {
-		SPDK_ERRLOG("block size must be 512 bytes aligned\n");
-		return -EINVAL;
-	}
-
 	mdisk = calloc(1, sizeof(*mdisk));
 	if (!mdisk) {
 		SPDK_ERRLOG("mdisk calloc() failed\n");

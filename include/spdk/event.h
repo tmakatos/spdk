@@ -89,6 +89,7 @@ typedef void (*spdk_sighandler_t)(int signal);
  */
 struct spdk_app_opts {
 	const char *name;
+	const char *config_file; /* deprecated */
 	const char *json_config_file;
 	bool json_config_ignore_errors;
 	const char *rpc_addr; /* Can be UNIX domain socket path or IP address + TCP port */
@@ -101,7 +102,10 @@ struct spdk_app_opts {
 
 	bool			enable_coredump;
 	int			mem_channel;
-	int			main_core;
+	union {
+		int			main_core;
+		int			master_core __attribute__((deprecated));
+	};
 	int			mem_size;
 	bool			no_pci;
 	bool			hugepage_single_segments;
@@ -109,9 +113,24 @@ struct spdk_app_opts {
 	const char		*hugedir;
 	enum spdk_log_level	print_level;
 	size_t			num_pci_addr;
-	struct spdk_pci_addr	*pci_blocked;
-	struct spdk_pci_addr	*pci_allowed;
+	union {
+		struct spdk_pci_addr	*pci_blocked;
+		struct spdk_pci_addr	*pci_blacklist __attribute__((deprecated));
+	};
+	union {
+		struct spdk_pci_addr	*pci_allowed;
+		struct spdk_pci_addr	*pci_whitelist __attribute__((deprecated));
+	};
 	const char		*iova_mode;
+
+	/* DEPRECATED. No longer has any effect.
+	 *
+	 * The maximum latency allowed when passing an event
+	 * from one core to another. A value of 0
+	 * means all cores continually poll. This is
+	 * specified in microseconds.
+	 */
+	uint64_t		max_delay_us;
 
 	/* Wait for the associated RPC before initializing subsystems
 	 * when this flag is enabled.

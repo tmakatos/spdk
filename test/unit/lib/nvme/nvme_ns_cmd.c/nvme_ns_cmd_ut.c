@@ -240,7 +240,6 @@ prepare_for_test(struct spdk_nvme_ns *ns, struct spdk_nvme_ctrlr *ctrlr,
 	}
 	ns->md_size = md_size;
 	ns->sectors_per_max_io = spdk_nvme_ns_get_max_io_xfer_size(ns) / ns->extended_lba_size;
-	ns->sectors_per_max_io_no_md = spdk_nvme_ns_get_max_io_xfer_size(ns) / ns->sector_size;
 	ns->sectors_per_stripe = stripe_size / ns->extended_lba_size;
 
 	memset(qpair, 0, sizeof(*qpair));
@@ -910,7 +909,11 @@ test_nvme_ns_cmd_comparev_with_md(void)
 	 * Protection information enabled + PRACT
 	 *
 	 * Special case for 8-byte metadata + PI + PRACT: no metadata transferred
-	 * 256 blocks * 512 bytes per block = single 128 KB I/O (no splitting required)
+	 * In theory, 256 blocks * 512 bytes per block = one I/O (128 KB)
+	 * However, the splitting code does not account for PRACT when calculating
+	 * max sectors per transfer, so we actually get two I/Os:
+	 *   child 0: 252 blocks
+	 *   child 1: 4 blocks
 	 */
 	prepare_for_test(&ns, &ctrlr, &qpair, 512, 8, 128 * 1024, 0, true);
 	ns.flags |= SPDK_NVME_NS_DPS_PI_SUPPORTED;
@@ -920,11 +923,18 @@ test_nvme_ns_cmd_comparev_with_md(void)
 
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	SPDK_CU_ASSERT_FATAL(g_request != NULL);
-	SPDK_CU_ASSERT_FATAL(g_request->num_children == 0);
+	SPDK_CU_ASSERT_FATAL(g_request->num_children == 2);
+	child0 = TAILQ_FIRST(&g_request->children);
 
-	CU_ASSERT(g_request->payload.md == NULL);
-	CU_ASSERT(g_request->payload_offset == 0);
-	CU_ASSERT(g_request->payload_size == 256 * 512); /* NOTE: does not include metadata! */
+	SPDK_CU_ASSERT_FATAL(child0 != NULL);
+	CU_ASSERT(child0->payload_offset == 0);
+	CU_ASSERT(child0->payload_size == 252 * 512); /* NOTE: does not include metadata! */
+	child1 = TAILQ_NEXT(child0, child_tailq);
+
+	SPDK_CU_ASSERT_FATAL(child1 != NULL);
+	CU_ASSERT(child1->payload.md == NULL);
+	CU_ASSERT(child1->payload_offset == 252 * 512);
+	CU_ASSERT(child1->payload_size == 4 * 512);
 
 	nvme_request_free_children(g_request);
 	nvme_free_request(g_request);
@@ -1363,7 +1373,11 @@ test_nvme_ns_cmd_write_with_md(void)
 	 * Protection information enabled + PRACT
 	 *
 	 * Special case for 8-byte metadata + PI + PRACT: no metadata transferred
-	 * 256 blocks * 512 bytes per block = single 128 KB I/O (no splitting required)
+	 * In theory, 256 blocks * 512 bytes per block = one I/O (128 KB)
+	 * However, the splitting code does not account for PRACT when calculating
+	 * max sectors per transfer, so we actually get two I/Os:
+	 *   child 0: 252 blocks
+	 *   child 1: 4 blocks
 	 */
 	prepare_for_test(&ns, &ctrlr, &qpair, 512, 8, 128 * 1024, 0, true);
 	ns.flags |= SPDK_NVME_NS_DPS_PI_SUPPORTED;
@@ -1373,11 +1387,18 @@ test_nvme_ns_cmd_write_with_md(void)
 
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	SPDK_CU_ASSERT_FATAL(g_request != NULL);
-	SPDK_CU_ASSERT_FATAL(g_request->num_children == 0);
+	SPDK_CU_ASSERT_FATAL(g_request->num_children == 2);
+	child0 = TAILQ_FIRST(&g_request->children);
 
-	CU_ASSERT(g_request->payload.md == NULL);
-	CU_ASSERT(g_request->payload_offset == 0);
-	CU_ASSERT(g_request->payload_size == 256 * 512); /* NOTE: does not include metadata! */
+	SPDK_CU_ASSERT_FATAL(child0 != NULL);
+	CU_ASSERT(child0->payload_offset == 0);
+	CU_ASSERT(child0->payload_size == 252 * 512); /* NOTE: does not include metadata! */
+	child1 = TAILQ_NEXT(child0, child_tailq);
+
+	SPDK_CU_ASSERT_FATAL(child1 != NULL);
+	CU_ASSERT(child1->payload.md == NULL);
+	CU_ASSERT(child1->payload_offset == 252 * 512);
+	CU_ASSERT(child1->payload_size == 4 * 512);
 
 	nvme_request_free_children(g_request);
 	nvme_free_request(g_request);
@@ -1570,83 +1591,6 @@ test_nvme_ns_cmd_zone_append_with_md(void)
 }
 
 static void
-test_nvme_ns_cmd_zone_appendv_with_md(void)
-{
-	struct spdk_nvme_ns		ns;
-	struct spdk_nvme_ctrlr		ctrlr;
-	struct spdk_nvme_qpair		qpair;
-	int				rc = 0;
-	uint32_t			lba_count;
-	uint32_t			sector_size = 512;
-	uint32_t			md_size = 128;
-	char				*metadata = NULL;
-	uint64_t			sge_length;
-
-	metadata = malloc(md_size * 384);
-	SPDK_CU_ASSERT_FATAL(metadata != NULL);
-
-	/*
-	 * 512 byte data + 128 byte metadata
-	 * Separate metadata buffer
-	 * Max data transfer size 256 KB
-	 * Max zone append size 128 KB
-	 *
-	 * 256 blocks * 512 bytes per block = 128 KB I/O
-	 * 128 KB I/O <= max zone append size. Test should pass.
-	 */
-	lba_count = 256;
-	sge_length = lba_count * sector_size;
-	prepare_for_test(&ns, &ctrlr, &qpair, sector_size, md_size, 256 * 1024, 0, false);
-	ctrlr.max_zone_append_size = 128 * 1024;
-	ctrlr.flags |= SPDK_NVME_CTRLR_ZONE_APPEND_SUPPORTED;
-	ns.csi = SPDK_NVME_CSI_ZNS;
-	rc = nvme_ns_cmd_zone_appendv_with_md(&ns, &qpair, 0x0, lba_count, NULL, &sge_length, 0,
-					      nvme_request_reset_sgl, nvme_request_next_sge, metadata, 0, 0);
-	SPDK_CU_ASSERT_FATAL(rc == 0);
-	SPDK_CU_ASSERT_FATAL(g_request != NULL);
-	SPDK_CU_ASSERT_FATAL(g_request->num_children == 0);
-
-	CU_ASSERT(g_request->payload.md == metadata);
-	CU_ASSERT(g_request->md_size == lba_count * md_size);
-	CU_ASSERT(g_request->payload_size == lba_count * sector_size);
-
-	CU_ASSERT(g_request->cmd.opc == SPDK_NVME_OPC_ZONE_APPEND);
-	CU_ASSERT(nvme_payload_type(&g_request->payload) == NVME_PAYLOAD_TYPE_SGL);
-	CU_ASSERT(g_request->payload.reset_sgl_fn == nvme_request_reset_sgl);
-	CU_ASSERT(g_request->payload.next_sge_fn == nvme_request_next_sge);
-	CU_ASSERT(g_request->payload.contig_or_cb_arg == &sge_length);
-	CU_ASSERT(g_request->cmd.nsid == ns.id);
-
-	nvme_free_request(g_request);
-	cleanup_after_test(&qpair);
-
-	/*
-	 * 512 byte data + 128 byte metadata
-	 * Separate metadata buffer
-	 * Max data transfer size 256 KB
-	 * Max zone append size 128 KB
-	 *
-	 * 512 blocks * 512 bytes per block = 256 KB I/O
-	 * 256 KB I/O > max zone append size. Test should fail.
-	 */
-	lba_count = 512;
-	sge_length = lba_count * sector_size;
-	prepare_for_test(&ns, &ctrlr, &qpair, sector_size, md_size, 256 * 1024, 0, false);
-	ctrlr.max_zone_append_size = 128 * 1024;
-	ctrlr.flags |= SPDK_NVME_CTRLR_ZONE_APPEND_SUPPORTED;
-	ns.csi = SPDK_NVME_CSI_ZNS;
-
-	rc = nvme_ns_cmd_zone_appendv_with_md(&ns, &qpair, 0x0, lba_count, NULL, &sge_length, 0,
-					      nvme_request_reset_sgl, nvme_request_next_sge, metadata, 0, 0);
-	SPDK_CU_ASSERT_FATAL(rc == -EINVAL);
-	SPDK_CU_ASSERT_FATAL(g_request == NULL);
-
-	cleanup_after_test(&qpair);
-
-	free(metadata);
-}
-
-static void
 test_nvme_ns_cmd_read_with_md(void)
 {
 	struct spdk_nvme_ns             ns;
@@ -1814,7 +1758,11 @@ test_nvme_ns_cmd_compare_with_md(void)
 	 * Protection information enabled + PRACT
 	 *
 	 * Special case for 8-byte metadata + PI + PRACT: no metadata transferred
-	 * 256 blocks * 512 bytes per block = single 128 KB I/O (no splitting required)
+	 * In theory, 256 blocks * 512 bytes per block = one I/O (128 KB)
+	 * However, the splitting code does not account for PRACT when calculating
+	 * max sectors per transfer, so we actually get two I/Os:
+	 *   child 0: 252 blocks
+	 *   child 1: 4 blocks
 	 */
 	prepare_for_test(&ns, &ctrlr, &qpair, 512, 8, 128 * 1024, 0, true);
 	ns.flags |= SPDK_NVME_NS_DPS_PI_SUPPORTED;
@@ -1824,11 +1772,18 @@ test_nvme_ns_cmd_compare_with_md(void)
 
 	SPDK_CU_ASSERT_FATAL(rc == 0);
 	SPDK_CU_ASSERT_FATAL(g_request != NULL);
-	SPDK_CU_ASSERT_FATAL(g_request->num_children == 0);
+	SPDK_CU_ASSERT_FATAL(g_request->num_children == 2);
+	child0 = TAILQ_FIRST(&g_request->children);
 
-	CU_ASSERT(g_request->payload.md == NULL);
-	CU_ASSERT(g_request->payload_offset == 0);
-	CU_ASSERT(g_request->payload_size == 256 * 512); /* NOTE: does not include metadata! */
+	SPDK_CU_ASSERT_FATAL(child0 != NULL);
+	CU_ASSERT(child0->payload_offset == 0);
+	CU_ASSERT(child0->payload_size == 252 * 512); /* NOTE: does not include metadata! */
+	child1 = TAILQ_NEXT(child0, child_tailq);
+
+	SPDK_CU_ASSERT_FATAL(child1 != NULL);
+	CU_ASSERT(child1->payload.md == NULL);
+	CU_ASSERT(child1->payload_offset == 252 * 512);
+	CU_ASSERT(child1->payload_size == 4 * 512);
 
 	nvme_request_free_children(g_request);
 	nvme_free_request(g_request);
@@ -1927,7 +1882,6 @@ int main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_ns_cmd_writev);
 	CU_ADD_TEST(suite, test_nvme_ns_cmd_write_with_md);
 	CU_ADD_TEST(suite, test_nvme_ns_cmd_zone_append_with_md);
-	CU_ADD_TEST(suite, test_nvme_ns_cmd_zone_appendv_with_md);
 	CU_ADD_TEST(suite, test_nvme_ns_cmd_comparev);
 	CU_ADD_TEST(suite, test_nvme_ns_cmd_compare_and_write);
 	CU_ADD_TEST(suite, test_nvme_ns_cmd_compare_with_md);

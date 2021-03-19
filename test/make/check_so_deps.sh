@@ -132,11 +132,12 @@ EOF
 			fi
 
 			if [[ $so_name_changed == yes ]]; then
-				# After 21.01 LTS all SO major versions were intentionally increased. Disable this check until SPDK 21.04 release.
-				found_abi_change=true
 				if ! $found_abi_change; then
-					echo "SO name for $so_file changed without a change to abi. please revert that change."
-					touch $fail_file
+					# Unfortunately, libspdk_idxd made it into 20.04 without an SO suffix. TODO:: remove after 20.07
+					if [ "$so_file" != "libspdk_idxd.so" ] && [ "$so_file" != "libspdk_accel_idxd.so" ]; then
+						echo "SO name for $so_file changed without a change to abi. please revert that change."
+						touch $fail_file
+					fi
 				fi
 
 				if ((new_so_maj != old_so_maj && new_so_min != 0)); then
@@ -225,26 +226,7 @@ function confirm_deps() {
 	fi
 }
 
-function confirm_makefile_deps() {
-	echo "---------------------------------------------------------------------"
-	# Exclude libspdk_env_dpdk.so from the library list. We don't link against this one so that
-	# users can define their own environment abstraction. However we do want to still check it
-	# for dependencies to avoid printing out a bunch of confusing symbols under the missing
-	# symbols section.
-	SPDK_LIBS=("$libdir/"libspdk_!(env_dpdk).so)
-
-	declare -A IGNORED_LIBS=()
-	if grep -q 'CONFIG_RDMA?=n' $rootdir/mk/config.mk; then
-		IGNORED_LIBS["rdma"]=1
-	fi
-
-	(
-		import_libs_deps_mk
-		for lib in "${SPDK_LIBS[@]}"; do confirm_deps "$lib" & done
-		wait
-	)
-}
-
+source ~/autorun-spdk.conf
 config_params=$(get_config_params)
 if [ "$SPDK_TEST_OCF" -eq 1 ]; then
 	config_params="$config_params --with-ocf=$rootdir/build/ocf.a"
@@ -264,7 +246,23 @@ rm -f $fail_file
 
 run_test "confirm_abi_deps" confirm_abi_deps
 
-run_test "confirm_makefile_deps" confirm_makefile_deps
+echo "---------------------------------------------------------------------"
+# Exclude libspdk_env_dpdk.so from the library list. We don't link against this one so that
+# users can define their own environment abstraction. However we do want to still check it
+# for dependencies to avoid printing out a bunch of confusing symbols under the missing
+# symbols section.
+SPDK_LIBS=("$libdir/"libspdk_!(env_dpdk).so)
+
+declare -A IGNORED_LIBS=()
+if grep -q 'CONFIG_RDMA?=n' $rootdir/mk/config.mk; then
+	IGNORED_LIBS["rdma"]=1
+fi
+
+(
+	import_libs_deps_mk
+	for lib in "${SPDK_LIBS[@]}"; do confirm_deps "$lib" & done
+	wait
+)
 
 $MAKE $MAKEFLAGS clean
 

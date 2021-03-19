@@ -51,35 +51,31 @@ rpc_subsystem_poll(void *arg)
 	return SPDK_POLLER_BUSY;
 }
 
-int
+void
 spdk_rpc_initialize(const char *listen_addr)
 {
 	int rc;
 
 	if (listen_addr == NULL) {
-		/* Not treated as an error */
-		return 0;
+		return;
 	}
 
 	if (!spdk_rpc_verify_methods()) {
-		return -EINVAL;
+		spdk_app_stop(-EINVAL);
+		return;
 	}
 
 	/* Listen on the requested address */
 	rc = spdk_rpc_listen(listen_addr);
 	if (rc != 0) {
 		SPDK_ERRLOG("Unable to start RPC service at %s\n", listen_addr);
-		/* TODO: Eventually, treat this as an error. But it historically has not
-		 * been and many tests rely on this gracefully failing. */
-		return 0;
+		return;
 	}
 
 	spdk_rpc_set_state(SPDK_RPC_STARTUP);
 
 	/* Register a poller to periodically check for RPCs */
 	g_rpc_poller = SPDK_POLLER_REGISTER(rpc_subsystem_poll, NULL, RPC_SELECT_INTERVAL);
-
-	return 0;
 }
 
 void

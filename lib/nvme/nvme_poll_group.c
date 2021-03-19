@@ -35,7 +35,7 @@
 #include "nvme_internal.h"
 
 struct spdk_nvme_poll_group *
-spdk_nvme_poll_group_create(void *ctx, struct spdk_nvme_accel_fn_table *table)
+spdk_nvme_poll_group_create(void *ctx)
 {
 	struct spdk_nvme_poll_group *group;
 
@@ -44,40 +44,10 @@ spdk_nvme_poll_group_create(void *ctx, struct spdk_nvme_accel_fn_table *table)
 		return NULL;
 	}
 
-	group->accel_fn_table.table_size = sizeof(struct spdk_nvme_accel_fn_table);
-	if (table && table->table_size != 0) {
-		group->accel_fn_table.table_size = table->table_size;
-#define SET_FIELD(field) \
-	if (offsetof(struct spdk_nvme_accel_fn_table, field) + sizeof(table->field) <= table->table_size) { \
-		group->accel_fn_table.field = table->field; \
-	} \
-
-		SET_FIELD(submit_accel_crc32c);
-		/* Do not remove this statement, you should always update this statement when you adding a new field,
-		 * and do not forget to add the SET_FIELD statement for your added field. */
-		SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_accel_fn_table) == 16, "Incorrect size");
-
-#undef SET_FIELD
-	}
-
 	group->ctx = ctx;
 	STAILQ_INIT(&group->tgroups);
 
 	return group;
-}
-
-struct spdk_nvme_poll_group *
-spdk_nvme_qpair_get_optimal_poll_group(struct spdk_nvme_qpair *qpair)
-{
-	struct spdk_nvme_transport_poll_group *tgroup;
-
-	tgroup = nvme_transport_qpair_get_optimal_poll_group(qpair->transport, qpair);
-
-	if (tgroup == NULL) {
-		return NULL;
-	}
-
-	return tgroup->group;
 }
 
 int

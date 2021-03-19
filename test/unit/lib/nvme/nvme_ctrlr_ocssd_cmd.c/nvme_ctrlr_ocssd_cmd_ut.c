@@ -32,14 +32,8 @@
  */
 
 #include "spdk_cunit.h"
-#include "common/lib/test_env.c"
 
 #include "nvme/nvme_ctrlr_ocssd_cmd.c"
-
-DEFINE_STUB(spdk_nvme_ctrlr_get_ns, struct spdk_nvme_ns *,
-	    (struct spdk_nvme_ctrlr *ctrlr, uint32_t ns_id), NULL);
-DEFINE_STUB(spdk_nvme_ctrlr_get_first_active_ns, uint32_t,
-	    (struct spdk_nvme_ctrlr *ctrlr), 0);
 
 #define DECLARE_AND_CONSTRUCT_CTRLR()	\
 	struct spdk_nvme_ctrlr	ctrlr = {};	\
@@ -48,11 +42,7 @@ DEFINE_STUB(spdk_nvme_ctrlr_get_first_active_ns, uint32_t,
 						\
 	STAILQ_INIT(&adminq.free_req);		\
 	STAILQ_INSERT_HEAD(&adminq.free_req, &req, stailq);	\
-	ctrlr.adminq = &adminq;	\
-	CU_ASSERT(pthread_mutex_init(&ctrlr.ctrlr_lock, NULL) == 0);
-
-#define DECONSTRUCT_CTRLR() \
-	CU_ASSERT(pthread_mutex_destroy(&ctrlr.ctrlr_lock) == 0);
+	ctrlr.adminq = &adminq;
 
 pid_t g_spdk_nvme_pid;
 struct nvme_request g_req;
@@ -94,8 +84,6 @@ test_geometry_cmd(void)
 
 	spdk_nvme_ocssd_ctrlr_cmd_geometry(&ctrlr, expected_geometry_ns, &geo,
 					   sizeof(geo), NULL, NULL);
-
-	DECONSTRUCT_CTRLR();
 }
 
 int main(int argc, char **argv)

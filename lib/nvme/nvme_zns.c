@@ -2,7 +2,6 @@
  *   BSD LICENSE
  *
  *   Copyright (c) 2020, Western Digital Corporation. All rights reserved.
- *   Copyright (c) 2021 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -37,44 +36,22 @@
 const struct spdk_nvme_zns_ns_data *
 spdk_nvme_zns_ns_get_data(struct spdk_nvme_ns *ns)
 {
-	return ns->nsdata_zns;
-}
-
-uint64_t
-spdk_nvme_zns_ns_get_zone_size_sectors(struct spdk_nvme_ns *ns)
-{
-	const struct spdk_nvme_zns_ns_data *nsdata_zns = spdk_nvme_zns_ns_get_data(ns);
-	const struct spdk_nvme_ns_data *nsdata = spdk_nvme_ns_get_data(ns);
-
-	return nsdata_zns->lbafe[nsdata->flbas.format].zsze;
+	return ns->ctrlr->nsdata_zns[ns->id - 1];
 }
 
 uint64_t
 spdk_nvme_zns_ns_get_zone_size(struct spdk_nvme_ns *ns)
 {
-	return spdk_nvme_zns_ns_get_zone_size_sectors(ns) * spdk_nvme_ns_get_sector_size(ns);
+	const struct spdk_nvme_zns_ns_data *nsdata_zns = spdk_nvme_zns_ns_get_data(ns);
+	const struct spdk_nvme_ns_data *nsdata = spdk_nvme_ns_get_data(ns);
+
+	return nsdata_zns->lbafe[nsdata->flbas.format].zsze * spdk_nvme_ns_get_sector_size(ns);
 }
 
 uint64_t
 spdk_nvme_zns_ns_get_num_zones(struct spdk_nvme_ns *ns)
 {
-	return spdk_nvme_ns_get_num_sectors(ns) / spdk_nvme_zns_ns_get_zone_size_sectors(ns);
-}
-
-uint32_t
-spdk_nvme_zns_ns_get_max_open_zones(struct spdk_nvme_ns *ns)
-{
-	const struct spdk_nvme_zns_ns_data *nsdata_zns = spdk_nvme_zns_ns_get_data(ns);
-
-	return nsdata_zns->mor + 1;
-}
-
-uint32_t
-spdk_nvme_zns_ns_get_max_active_zones(struct spdk_nvme_ns *ns)
-{
-	const struct spdk_nvme_zns_ns_data *nsdata_zns = spdk_nvme_zns_ns_get_data(ns);
-
-	return nsdata_zns->mar + 1;
+	return spdk_nvme_ns_get_size(ns) / spdk_nvme_zns_ns_get_zone_size(ns);
 }
 
 const struct spdk_nvme_zns_ctrlr_data *
@@ -107,31 +84,6 @@ spdk_nvme_zns_zone_append_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpai
 {
 	return nvme_ns_cmd_zone_append_with_md(ns, qpair, buffer, metadata, zslba, lba_count,
 					       cb_fn, cb_arg, io_flags, apptag_mask, apptag);
-}
-
-int
-spdk_nvme_zns_zone_appendv(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
-			   uint64_t zslba, uint32_t lba_count,
-			   spdk_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t io_flags,
-			   spdk_nvme_req_reset_sgl_cb reset_sgl_fn,
-			   spdk_nvme_req_next_sge_cb next_sge_fn)
-{
-	return nvme_ns_cmd_zone_appendv_with_md(ns, qpair, zslba, lba_count, cb_fn, cb_arg,
-						io_flags, reset_sgl_fn, next_sge_fn,
-						NULL, 0, 0);
-}
-
-int
-spdk_nvme_zns_zone_appendv_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
-				   uint64_t zslba, uint32_t lba_count,
-				   spdk_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t io_flags,
-				   spdk_nvme_req_reset_sgl_cb reset_sgl_fn,
-				   spdk_nvme_req_next_sge_cb next_sge_fn, void *metadata,
-				   uint16_t apptag_mask, uint16_t apptag)
-{
-	return nvme_ns_cmd_zone_appendv_with_md(ns, qpair, zslba, lba_count, cb_fn, cb_arg,
-						io_flags, reset_sgl_fn, next_sge_fn,
-						metadata, apptag_mask, apptag);
 }
 
 static int

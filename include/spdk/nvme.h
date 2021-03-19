@@ -259,36 +259,6 @@ struct spdk_nvme_ctrlr_opts {
 };
 
 /**
- * NVMe acceleration operation callback.
- *
- * \param cb_arg The user provided arg which is passed to the corresponding accelerated function call
- * defined in struct spdk_nvme_accel_fn_table.
- * \param status 0 if it completed successfully, or negative errno if it failed.
- */
-typedef void (*spdk_nvme_accel_completion_cb)(void *cb_arg, int status);
-
-/**
- * Function table for the NVMe acccelerator device.
- *
- * This table provides a set of APIs to allow user to leverage
- * accelerator functions.
- */
-struct spdk_nvme_accel_fn_table {
-	/**
-	 * The size of spdk_nvme_accel_fun_table according to the caller of
-	 * this library is used for ABI compatibility.  The library uses this
-	 * field to know how many fields in this structure are valid.
-	 * And the library will populate any remaining fields with default values.
-	 * Newly added fields should be put at the end of the struct.
-	 */
-	size_t table_size;
-
-	/** The accelerated crc32c function. */
-	void (*submit_accel_crc32c)(void *ctx, uint32_t *dst, struct iovec *iov,
-				    uint32_t iov_cnt, uint32_t seed, spdk_nvme_accel_completion_cb cb_fn, void *cb_arg);
-};
-
-/**
  * Indicate whether a ctrlr handle is associated with a Discovery controller.
  *
  * \param ctrlr Opaque handle to NVMe controller.
@@ -687,24 +657,6 @@ typedef void (*spdk_nvme_attach_cb)(void *cb_ctx, const struct spdk_nvme_transpo
  */
 typedef void (*spdk_nvme_remove_cb)(void *cb_ctx, struct spdk_nvme_ctrlr *ctrlr);
 
-typedef bool (*spdk_nvme_pcie_hotplug_filter_cb)(const struct spdk_pci_addr *addr);
-
-/**
- * Register the associated function to allow filtering of hot-inserted PCIe SSDs.
- *
- * If an application is using spdk_nvme_probe() to detect hot-inserted SSDs,
- * this function may be used to register a function to filter those SSDs.
- * If the filter function returns true, the nvme library will notify the SPDK
- * env layer to allow probing of the device.
- *
- * Registering a filter function is optional.  If none is registered, the nvme
- * library will allow probing of all hot-inserted SSDs.
- *
- * \param filter_cb Filter function callback routine
- */
-void
-spdk_nvme_pcie_set_hotplug_filter(spdk_nvme_pcie_hotplug_filter_cb filter_cb);
-
 /**
  * Enumerate the bus indicated by the transport ID and attach the userspace NVMe
  * driver to each device found if desired.
@@ -1046,15 +998,6 @@ union spdk_nvme_vs_register spdk_nvme_ctrlr_get_regs_vs(struct spdk_nvme_ctrlr *
  * \return the NVMe controller CMBSZ (Controller Memory Buffer Size) register.
  */
 union spdk_nvme_cmbsz_register spdk_nvme_ctrlr_get_regs_cmbsz(struct spdk_nvme_ctrlr *ctrlr);
-
-/**
- * Get the NVMe controller PMRCAP (Persistent Memory Region Capabilities) register.
- *
- * \param ctrlr Opaque handle to NVMe controller.
- *
- * \return the NVMe controller PMRCAP (Persistent Memory Region Capabilities) register.
- */
-union spdk_nvme_pmrcap_register spdk_nvme_ctrlr_get_regs_pmrcap(struct spdk_nvme_ctrlr *ctrlr);
 
 /**
  * Get the number of namespaces for the given NVMe controller.
@@ -1440,8 +1383,7 @@ spdk_nvme_qp_failure_reason spdk_nvme_ctrlr_get_admin_qp_failure_reason(
  *
  * \param qpair I/O queue pair to free.
  *
- * \return 0 on success, -1 on failure.  On failure, the caller should reset
- * the controller and try to free the io qpair again after the reset.
+ * \return 0 on success, -1 on failure.
  */
 int spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair);
 
@@ -2239,22 +2181,10 @@ typedef void (*spdk_nvme_disconnected_qpair_cb)(struct spdk_nvme_qpair *qpair,
  * Create a new poll group.
  *
  * \param ctx A user supplied context that can be retrieved later with spdk_nvme_poll_group_get_ctx
- * \param table The call back table defined by users which contains the accelerated functions
- * which can be used to accelerate some operations such as crc32c.
  *
  * \return Pointer to the new poll group, or NULL on error.
  */
-struct spdk_nvme_poll_group *spdk_nvme_poll_group_create(void *ctx,
-		struct spdk_nvme_accel_fn_table *table);
-
-/**
- * Get a optimal poll group.
- *
- * \param qpair The qpair to get the optimal poll group.
- *
- * \return Pointer to the optimal poll group, or NULL if not found.
- */
-struct spdk_nvme_poll_group *spdk_nvme_qpair_get_optimal_poll_group(struct spdk_nvme_qpair *qpair);
+struct spdk_nvme_poll_group *spdk_nvme_poll_group_create(void *ctx);
 
 /**
  * Add an spdk_nvme_qpair to a poll group. qpairs may only be added to
@@ -2525,16 +2455,16 @@ enum spdk_nvme_csi spdk_nvme_ns_get_csi(const struct spdk_nvme_ns *ns);
  * \brief Namespace command support flags.
  */
 enum spdk_nvme_ns_flags {
-	SPDK_NVME_NS_DEALLOCATE_SUPPORTED	= 1 << 0, /**< The deallocate command is supported */
-	SPDK_NVME_NS_FLUSH_SUPPORTED		= 1 << 1, /**< The flush command is supported */
-	SPDK_NVME_NS_RESERVATION_SUPPORTED	= 1 << 2, /**< The reservation command is supported */
-	SPDK_NVME_NS_WRITE_ZEROES_SUPPORTED	= 1 << 3, /**< The write zeroes command is supported */
-	SPDK_NVME_NS_DPS_PI_SUPPORTED		= 1 << 4, /**< The end-to-end data protection is supported */
-	SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED	= 1 << 5, /**< The extended lba format is supported,
+	SPDK_NVME_NS_DEALLOCATE_SUPPORTED	= 0x1, /**< The deallocate command is supported */
+	SPDK_NVME_NS_FLUSH_SUPPORTED		= 0x2, /**< The flush command is supported */
+	SPDK_NVME_NS_RESERVATION_SUPPORTED	= 0x4, /**< The reservation command is supported */
+	SPDK_NVME_NS_WRITE_ZEROES_SUPPORTED	= 0x8, /**< The write zeroes command is supported */
+	SPDK_NVME_NS_DPS_PI_SUPPORTED		= 0x10, /**< The end-to-end data protection is supported */
+	SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED	= 0x20, /**< The extended lba format is supported,
 							      metadata is transferred as a contiguous
 							      part of the logical block that it is associated with */
-	SPDK_NVME_NS_WRITE_UNCORRECTABLE_SUPPORTED	= 1 << 6, /**< The write uncorrectable command is supported */
-	SPDK_NVME_NS_COMPARE_SUPPORTED		= 1 << 7, /**< The compare command is supported */
+	SPDK_NVME_NS_WRITE_UNCORRECTABLE_SUPPORTED	= 0x40, /**< The write uncorrectable command is supported */
+	SPDK_NVME_NS_COMPARE_SUPPORTED		= 0x80, /**< The compare command is supported */
 };
 
 /**
@@ -3279,14 +3209,6 @@ void spdk_nvme_qpair_print_completion(struct spdk_nvme_qpair *qpair,
 				      struct spdk_nvme_cpl *cpl);
 
 /**
- * \brief Gets the NVMe qpair ID for the specified qpair.
- *
- * \param qpair Pointer to the NVMe queue pair.
- * \returns ID for the specified qpair.
- */
-uint16_t spdk_nvme_qpair_get_id(struct spdk_nvme_qpair *qpair);
-
-/**
  * \brief Prints (SPDK_NOTICELOG) the contents of an NVMe submission queue entry (command).
  *
  * \param qid Queue identifier.
@@ -3486,8 +3408,6 @@ struct spdk_nvme_transport_ops {
 	void (*admin_qpair_abort_aers)(struct spdk_nvme_qpair *qpair);
 
 	struct spdk_nvme_transport_poll_group *(*poll_group_create)(void);
-	struct spdk_nvme_transport_poll_group *(*qpair_get_optimal_poll_group)(
-		struct spdk_nvme_qpair *qpair);
 
 	int (*poll_group_add)(struct spdk_nvme_transport_poll_group *tgroup, struct spdk_nvme_qpair *qpair);
 

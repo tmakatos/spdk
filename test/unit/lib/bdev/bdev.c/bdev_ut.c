@@ -689,6 +689,7 @@ num_blocks_test(void)
 {
 	struct spdk_bdev bdev;
 	struct spdk_bdev_desc *desc = NULL;
+	struct spdk_bdev_desc *desc_ext = NULL;
 	int rc;
 
 	memset(&bdev, 0, sizeof(bdev));
@@ -703,15 +704,21 @@ num_blocks_test(void)
 	/* Shrinking block number */
 	CU_ASSERT(spdk_bdev_notify_blockcnt_change(&bdev, 30) == 0);
 
-	rc = spdk_bdev_open_ext("num_blocks", false, bdev_open_cb1, &desc, &desc);
+	/* In case bdev opened */
+	rc = spdk_bdev_open(&bdev, false, NULL, NULL, &desc);
 	CU_ASSERT(rc == 0);
 	SPDK_CU_ASSERT_FATAL(desc != NULL);
-	CU_ASSERT(&bdev == spdk_bdev_desc_get_bdev(desc));
 
 	/* Growing block number */
 	CU_ASSERT(spdk_bdev_notify_blockcnt_change(&bdev, 80) == 0);
 	/* Shrinking block number */
 	CU_ASSERT(spdk_bdev_notify_blockcnt_change(&bdev, 20) != 0);
+
+	/* In case bdev opened with ext API */
+	rc = spdk_bdev_open_ext("num_blocks", false, bdev_open_cb1, &desc_ext, &desc_ext);
+	CU_ASSERT(rc == 0);
+	SPDK_CU_ASSERT_FATAL(desc_ext != NULL);
+	CU_ASSERT(&bdev == spdk_bdev_desc_get_bdev(desc_ext));
 
 	g_event_type1 = 0xFF;
 	/* Growing block number */
@@ -725,6 +732,7 @@ num_blocks_test(void)
 	CU_ASSERT(spdk_bdev_notify_blockcnt_change(&bdev, 100) == 0);
 
 	spdk_bdev_close(desc);
+	spdk_bdev_close(desc_ext);
 	spdk_bdev_unregister(&bdev, NULL, NULL);
 
 	poll_threads();
@@ -741,8 +749,6 @@ io_valid_test(void)
 	memset(&bdev, 0, sizeof(bdev));
 
 	bdev.blocklen = 512;
-	CU_ASSERT(pthread_mutex_init(&bdev.internal.mutex, NULL) == 0);
-
 	spdk_bdev_notify_blockcnt_change(&bdev, 100);
 
 	/* All parameters valid */
@@ -759,8 +765,6 @@ io_valid_test(void)
 
 	/* Offset near end of uint64_t range (2^64 - 1) */
 	CU_ASSERT(bdev_io_valid_blocks(&bdev, 18446744073709551615ULL, 1) == false);
-
-	CU_ASSERT(pthread_mutex_destroy(&bdev.internal.mutex) == 0);
 }
 
 static void

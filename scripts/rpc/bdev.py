@@ -204,24 +204,6 @@ def bdev_ocf_get_bdevs(client, name=None):
     return client.call('bdev_ocf_get_bdevs', params)
 
 
-def bdev_ocf_set_cache_mode(client, name, mode):
-    """Set cache mode of OCF block device
-
-    Args:
-        name: name of OCF bdev
-        mode: OCF cache mode: {'wb', 'wt', 'pt', 'wa', 'wi', 'wo'}
-
-    Returns:
-        New cache mode name
-    """
-    params = {
-        'name': name,
-        'mode': mode,
-    }
-
-    return client.call('bdev_ocf_set_cache_mode', params)
-
-
 @deprecated_alias('construct_malloc_bdev')
 def bdev_malloc_create(client, num_blocks, block_size, name=None, uuid=None):
     """Construct a malloc block device.
@@ -506,8 +488,7 @@ def bdev_nvme_set_hotplug(client, enable, period_us=None):
 @deprecated_alias('construct_nvme_bdev')
 def bdev_nvme_attach_controller(client, name, trtype, traddr, adrfam=None, trsvcid=None,
                                 priority=None, subnqn=None, hostnqn=None, hostaddr=None,
-                                hostsvcid=None, prchk_reftag=None, prchk_guard=None,
-                                hdgst=None, ddgst=None):
+                                hostsvcid=None, prchk_reftag=None, prchk_guard=None):
     """Construct block device for each NVMe namespace in the attached controller.
 
     Args:
@@ -523,8 +504,6 @@ def bdev_nvme_attach_controller(client, name, trtype, traddr, adrfam=None, trsvc
         hostsvcid: host transport service ID (port number for IP-based transports, NULL for PCIe or FC; optional)
         prchk_reftag: Enable checking of PI reference tag for I/O processing (optional)
         prchk_guard: Enable checking of PI guard for I/O processing (optional)
-        hdgst: Enable TCP header digest (optional)
-        ddgst: Enable TCP data digest (optional)
 
     Returns:
         Names of created block devices.
@@ -559,12 +538,6 @@ def bdev_nvme_attach_controller(client, name, trtype, traddr, adrfam=None, trsvc
 
     if prchk_guard:
         params['prchk_guard'] = prchk_guard
-
-    if hdgst:
-        params['hdgst'] = hdgst
-
-    if ddgst:
-        params['ddgst'] = ddgst
 
     return client.call('bdev_nvme_attach_controller', params)
 
@@ -1050,12 +1023,16 @@ def bdev_ocssd_create(client, ctrlr_name, bdev_name, nsid=None, range=None):
         ctrlr_name: name of the OC NVMe controller
         bdev_name: name of the bdev to create
         nsid: namespace ID
+        range: parallel unit range
     """
     params = {'ctrlr_name': ctrlr_name,
               'bdev_name': bdev_name}
 
     if nsid is not None:
         params['nsid'] = nsid
+
+    if range is not None:
+        params['range'] = range
 
     return client.call('bdev_ocssd_create', params)
 

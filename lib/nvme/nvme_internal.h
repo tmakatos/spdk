@@ -2,7 +2,7 @@
  *   BSD LICENSE
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
- *   Copyright (c) 2020, 2021 Mellanox Technologies LTD. All rights reserved.
+ *   Copyright (c) 2020 Mellanox Technologies LTD. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -454,7 +454,6 @@ struct spdk_nvme_qpair {
 
 struct spdk_nvme_poll_group {
 	void						*ctx;
-	struct spdk_nvme_accel_fn_table			accel_fn_table;
 	STAILQ_HEAD(, spdk_nvme_transport_poll_group)	tgroups;
 };
 
@@ -482,7 +481,6 @@ struct spdk_nvme_ns {
 	uint32_t			md_size;
 	uint32_t			pi_type;
 	uint32_t			sectors_per_max_io;
-	uint32_t			sectors_per_max_io_no_md;
 	uint32_t			sectors_per_stripe;
 	uint32_t			id;
 	uint16_t			flags;
@@ -495,12 +493,6 @@ struct spdk_nvme_ns {
 
 	uint32_t			ana_group_id;
 	enum spdk_nvme_ana_state	ana_state;
-
-	/* Identify Namespace data. */
-	struct spdk_nvme_ns_data	nsdata;
-
-	/* Zoned Namespace Command Set Specific Identify Namespace data. */
-	struct spdk_nvme_zns_ns_data	*nsdata_zns;
 };
 
 /**
@@ -818,6 +810,18 @@ struct spdk_nvme_ctrlr {
 	 */
 	uint32_t			*active_ns_list;
 
+	/**
+	 * Array of Identify Namespace data.
+	 *
+	 * Stored separately from ns since nsdata should not normally be accessed during I/O.
+	 */
+	struct spdk_nvme_ns_data	*nsdata;
+
+	/**
+	 * Array of pointers to Zoned Namespace Command Set Specific Identify Namespace data.
+	 */
+	struct spdk_nvme_zns_ns_data	**nsdata_zns;
+
 	struct spdk_bit_array		*free_io_qids;
 	TAILQ_HEAD(, spdk_nvme_qpair)	active_io_qpairs;
 
@@ -1014,7 +1018,6 @@ int	nvme_ctrlr_submit_admin_request(struct spdk_nvme_ctrlr *ctrlr,
 int	nvme_ctrlr_get_cap(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_cap_register *cap);
 int	nvme_ctrlr_get_vs(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_vs_register *vs);
 int	nvme_ctrlr_get_cmbsz(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_cmbsz_register *cmbsz);
-int	nvme_ctrlr_get_pmrcap(struct spdk_nvme_ctrlr *ctrlr, union spdk_nvme_pmrcap_register *pmrcap);
 bool	nvme_ctrlr_multi_iocs_enabled(struct spdk_nvme_ctrlr *ctrlr);
 void	nvme_ctrlr_init_cap(struct spdk_nvme_ctrlr *ctrlr, const union spdk_nvme_cap_register *cap,
 			    const union spdk_nvme_vs_register *vs);
@@ -1045,12 +1048,6 @@ int	nvme_ns_cmd_zone_append_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qp
 					void *buffer, void *metadata, uint64_t zslba,
 					uint32_t lba_count, spdk_nvme_cmd_cb cb_fn, void *cb_arg,
 					uint32_t io_flags, uint16_t apptag_mask, uint16_t apptag);
-int nvme_ns_cmd_zone_appendv_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
-				     uint64_t zslba, uint32_t lba_count,
-				     spdk_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t io_flags,
-				     spdk_nvme_req_reset_sgl_cb reset_sgl_fn,
-				     spdk_nvme_req_next_sge_cb next_sge_fn, void *metadata,
-				     uint16_t apptag_mask, uint16_t apptag);
 
 int	nvme_fabric_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value);
 int	nvme_fabric_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value);
@@ -1318,9 +1315,6 @@ int nvme_transport_qpair_iterate_requests(struct spdk_nvme_qpair *qpair,
 
 struct spdk_nvme_transport_poll_group *nvme_transport_poll_group_create(
 	const struct spdk_nvme_transport *transport);
-struct spdk_nvme_transport_poll_group *nvme_transport_qpair_get_optimal_poll_group(
-	const struct spdk_nvme_transport *transport,
-	struct spdk_nvme_qpair *qpair);
 int nvme_transport_poll_group_add(struct spdk_nvme_transport_poll_group *tgroup,
 				  struct spdk_nvme_qpair *qpair);
 int nvme_transport_poll_group_remove(struct spdk_nvme_transport_poll_group *tgroup,

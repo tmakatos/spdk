@@ -14,8 +14,7 @@ cd "$rootdir"
 
 function unittest_bdev() {
 	$valgrind $testdir/lib/bdev/bdev.c/bdev_ut
-	$valgrind $testdir/lib/bdev/nvme/bdev_ocssd.c/bdev_ocssd_ut
-	$valgrind $testdir/lib/bdev/nvme/bdev_nvme.c/bdev_nvme_ut
+	$valgrind $testdir/lib/bdev/bdev_ocssd.c/bdev_ocssd_ut
 	$valgrind $testdir/lib/bdev/raid/bdev_raid.c/bdev_raid_ut
 	$valgrind $testdir/lib/bdev/bdev_zone.c/bdev_zone_ut
 	$valgrind $testdir/lib/bdev/gpt/gpt.c/gpt_ut
@@ -84,8 +83,6 @@ function unittest_nvme() {
 	$valgrind $testdir/lib/nvme/nvme_quirks.c/nvme_quirks_ut
 	$valgrind $testdir/lib/nvme/nvme_tcp.c/nvme_tcp_ut
 	$valgrind $testdir/lib/nvme/nvme_uevent.c/nvme_uevent_ut
-	$valgrind $testdir/lib/nvme/nvme_transport.c/nvme_transport_ut
-	$valgrind $testdir/lib/nvme/nvme_io_msg.c/nvme_io_msg_ut
 }
 
 function unittest_nvmf() {
@@ -195,7 +192,6 @@ if [ $(uname -s) = Linux ]; then
 	run_test "unittest_ftl" unittest_ftl
 fi
 
-run_test "unittest_accel" $valgrind $testdir/lib/accel/accel.c/accel_engine_ut
 run_test "unittest_ioat" $valgrind $testdir/lib/ioat/ioat.c/ioat_ut
 if grep -q '#define SPDK_CONFIG_IDXD 1' $rootdir/include/spdk/config.h; then
 	run_test "unittest_idxd" $valgrind $testdir/lib/idxd/idxd.c/idxd_ut
@@ -208,10 +204,6 @@ run_test "unittest_log" $valgrind $testdir/lib/log/log.c/log_ut
 run_test "unittest_lvol" $valgrind $testdir/lib/lvol/lvol.c/lvol_ut
 if grep -q '#define SPDK_CONFIG_RDMA 1' $rootdir/include/spdk/config.h; then
 	run_test "unittest_nvme_rdma" $valgrind $testdir/lib/nvme/nvme_rdma.c/nvme_rdma_ut
-fi
-
-if grep -q '#define SPDK_CONFIG_NVME_CUSE 1' $rootdir/include/spdk/config.h; then
-	run_test "unittest_nvme_cuse" $valgrind $testdir/lib/nvme/nvme_cuse.c/nvme_cuse_ut
 fi
 
 run_test "unittest_nvmf" unittest_nvmf

@@ -76,15 +76,24 @@ struct spdk_env_opts {
 	const char		*core_mask;
 	int			shm_id;
 	int			mem_channel;
-	int			main_core;
+	union {
+		int			main_core;
+		int			master_core __attribute__((deprecated));
+	};
 	int			mem_size;
 	bool			no_pci;
 	bool			hugepage_single_segments;
 	bool			unlink_hugepage;
 	size_t			num_pci_addr;
 	const char		*hugedir;
-	struct spdk_pci_addr	*pci_blocked;
-	struct spdk_pci_addr	*pci_allowed;
+	union {
+		struct spdk_pci_addr	*pci_blocked;
+		struct spdk_pci_addr	*pci_blacklist __attribute__((deprecated));
+	};
+	union {
+		struct spdk_pci_addr	*pci_allowed;
+		struct spdk_pci_addr	*pci_whitelist __attribute__((deprecated));
+	};
 	const char		*iova_mode;
 	uint64_t		base_virtaddr;
 
@@ -1000,22 +1009,6 @@ int spdk_pci_device_attach(struct spdk_pci_driver *driver, spdk_pci_enum_cb enum
 			   void *enum_ctx, struct spdk_pci_addr *pci_address);
 
 /**
- * Allow the specified PCI device to be probed by the calling process.
- *
- * When using spdk_pci_enumerate(), only devices with allowed PCI addresses will
- * be probed.  By default, this is all PCI addresses, but the pci_allowed
- * and pci_blocked environment options can override this behavior.
- * This API enables the caller to allow a new PCI address that may have previously
- * been blocked.
- *
- * \param pci_addr PCI address to allow
- * \return 0 if successful
- * \return -ENOMEM if environment-specific data structures cannot be allocated
- * \return -EINVAL if specified PCI address is not valid
- */
-int spdk_pci_device_allow(struct spdk_pci_addr *pci_addr);
-
-/**
  * Read \c len bytes from the PCI configuration space.
  *
  * \param dev PCI device.
@@ -1329,7 +1322,7 @@ int spdk_mem_reserve(void *vaddr, size_t len);
  * \param vaddr Virtual address to get
  * \param offset Virtual address's map offset to the file descriptor
  *
- * \return negative errno on failure, otherwise return the file descriptor
+ * \ return negative errno on failure, otherwise return the file descriptor
  */
 int spdk_mem_get_fd_and_offset(void *vaddr, uint64_t *offset);
 

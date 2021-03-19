@@ -40,9 +40,7 @@
 
 SPDK_LOG_REGISTER_COMPONENT(iscsi)
 
-struct spdk_iscsi_globals g_iscsi = {
-	.mutex = PTHREAD_MUTEX_INITIALIZER
-};
+struct spdk_iscsi_globals g_iscsi;
 
 static int
 test_setup(void)

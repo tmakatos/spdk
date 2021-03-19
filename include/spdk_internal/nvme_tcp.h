@@ -102,7 +102,6 @@ struct nvme_tcp_pdu {
 	bool						has_hdgst;
 	bool						ddgst_enable;
 	uint32_t					header_digest_crc32;
-	uint32_t					data_digest_crc32;
 	uint8_t						data_digest[SPDK_NVME_TCP_DIGEST_LEN];
 
 	uint8_t						ch_valid_bytes;
@@ -619,12 +618,12 @@ nvme_tcp_pdu_calc_psh_len(struct nvme_tcp_pdu *pdu, bool hdgst_enable)
 	if (g_nvme_tcp_hdgst[pdu->hdr.common.pdu_type] && hdgst_enable) {
 		pdu->has_hdgst = true;
 		psh_len += SPDK_NVME_TCP_DIGEST_LEN;
-	}
-	if (pdu->hdr.common.plen > psh_len) {
-		pdo = pdu->hdr.common.pdo;
-		padding_len = pdo - psh_len;
-		if (padding_len > 0) {
-			psh_len = pdo;
+		if (pdu->hdr.common.plen > psh_len) {
+			pdo = pdu->hdr.common.pdo;
+			padding_len = pdo - psh_len;
+			if (padding_len > 0) {
+				psh_len = pdo;
+			}
 		}
 	}
 

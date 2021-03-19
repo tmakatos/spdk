@@ -85,7 +85,7 @@ yum install -y gcc gcc-c++ make cmake CUnit-devel libaio-devel openssl-devel \
 if echo "$ID $VERSION_ID" | grep -E -q 'centos 8|rhel 8'; then
 	yum install -y python36
 	#Create hard link to use in SPDK as python
-	if [[ ! -e /usr/bin/python && -e /etc/alternatives/python3 ]]; then
+	if [[ ! -e /usr/bin/python && -e /etc/alternative/python3 ]]; then
 		ln -s /etc/alternatives/python3 /usr/bin/python
 	fi
 else
@@ -94,7 +94,6 @@ fi
 yum install -y python3-pip
 pip3 install ninja
 pip3 install meson
-pip3 install pyelftools
 
 # Additional dependencies for SPDK CLI - not available in rhel and centos
 if ! echo "$ID $VERSION_ID" | grep -E -q 'rhel 7|centos 7'; then
@@ -112,7 +111,7 @@ if [[ $INSTALL_DEV_TOOLS == "true" ]]; then
 	else
 		yum install -y python-pycodestyle lcov ShellCheck
 	fi
-	yum install -y git astyle sg3_utils pciutils libabigail bash-completion
+	yum install -y git astyle sg3_utils pciutils libabigail
 fi
 if [[ $INSTALL_PMEM == "true" ]]; then
 	# Additional dependencies for building pmem based backends
@@ -120,7 +119,7 @@ if [[ $INSTALL_PMEM == "true" ]]; then
 fi
 if [[ $INSTALL_FUSE == "true" ]]; then
 	# Additional dependencies for FUSE and NVMe-CUSE
-	yum install -y fuse3-devel
+	yum install -y kernel-modules-extra fuse3-devel
 fi
 if [[ $INSTALL_RDMA == "true" ]]; then
 	# Additional dependencies for RDMA transport in NVMe over Fabrics

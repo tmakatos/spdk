@@ -2,8 +2,7 @@
 
 # Minimal install
 zypper install -y gcc gcc-c++ make cmake cunit-devel libaio-devel libopenssl-devel \
-	libuuid-devel python-base ncurses-devel json-c-devel libcmocka-devel ninja meson \
-	python-pyelftools
+	libuuid-devel python-base ncurses-devel json-c-devel libcmocka-devel ninja meson
 # Additional dependencies for DPDK
 zypper install -y libnuma-devel nasm
 # Additional dependencies for ISA-L used in compression
@@ -11,7 +10,7 @@ zypper install -y autoconf automake libtool help2man
 if [[ $INSTALL_DEV_TOOLS == "true" ]]; then
 	# Tools for developers
 	zypper install -y git-core lcov python-pycodestyle sg3_utils \
-		pciutils ShellCheck bash-completion
+		pciutils ShellCheck
 fi
 if [[ $INSTALL_PMEM == "true" ]]; then
 	# Additional dependencies for building pmem based backends

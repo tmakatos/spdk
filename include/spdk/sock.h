@@ -116,7 +116,7 @@ struct spdk_sock_impl_opts {
 	/**
 	 * Enable or disable placement_id. Used by posix and uring socket modules.
 	 */
-	uint32_t enable_placement_id;
+	bool enable_placement_id;
 
 };
 

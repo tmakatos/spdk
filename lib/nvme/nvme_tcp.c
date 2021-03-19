@@ -300,15 +300,8 @@ nvme_tcp_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 {
 	struct nvme_tcp_qpair *tqpair = nvme_tcp_qpair(qpair);
 	struct nvme_tcp_pdu *pdu;
-	int rc;
 
-	rc = spdk_sock_close(&tqpair->sock);
-
-	if (tqpair->sock != NULL) {
-		SPDK_ERRLOG("tqpair=%p, errno=%d, rc=%d\n", tqpair, errno, rc);
-		/* Set it to NULL manually */
-		tqpair->sock = NULL;
-	}
+	spdk_sock_close(&tqpair->sock);
 
 	/* clear the send_queue */
 	while (!TAILQ_EMPTY(&tqpair->send_queue)) {
@@ -327,7 +320,10 @@ nvme_tcp_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_q
 {
 	struct nvme_tcp_qpair *tqpair;
 
-	assert(qpair != NULL);
+	if (!qpair) {
+		return -1;
+	}
+
 	nvme_transport_ctrlr_disconnect_qpair(ctrlr, qpair);
 	nvme_tcp_qpair_abort_reqs(qpair, 1);
 	nvme_qpair_deinit(qpair);
@@ -377,80 +373,6 @@ _pdu_write_done(void *cb_arg, int err)
 	pdu->cb_fn(pdu->cb_arg);
 }
 
-static void
-_tcp_write_pdu(struct nvme_tcp_pdu *pdu)
-{
-	uint32_t mapped_length = 0;
-	struct nvme_tcp_qpair *tqpair = pdu->qpair;
-
-	pdu->sock_req.iovcnt = nvme_tcp_build_iovs(pdu->iov, NVME_TCP_MAX_SGL_DESCRIPTORS, pdu,
-			       (bool)tqpair->flags.host_hdgst_enable, (bool)tqpair->flags.host_ddgst_enable,
-			       &mapped_length);
-	pdu->sock_req.cb_fn = _pdu_write_done;
-	pdu->sock_req.cb_arg = pdu;
-	TAILQ_INSERT_TAIL(&tqpair->send_queue, pdu, tailq);
-	spdk_sock_writev_async(tqpair->sock, &pdu->sock_req);
-}
-
-static void
-data_crc32_accel_done(void *cb_arg, int status)
-{
-	struct nvme_tcp_pdu *pdu = cb_arg;
-
-	if (spdk_unlikely(status)) {
-		SPDK_ERRLOG("Failed to compute the data digest for pdu =%p\n", pdu);
-		_pdu_write_done(pdu, status);
-		return;
-	}
-
-	pdu->data_digest_crc32 ^= SPDK_CRC32C_XOR;
-	MAKE_DIGEST_WORD(pdu->data_digest, pdu->data_digest_crc32);
-
-	_tcp_write_pdu(pdu);
-}
-
-static void
-pdu_data_crc32_compute(struct nvme_tcp_pdu *pdu)
-{
-	struct nvme_tcp_qpair *tqpair = pdu->qpair;
-	uint32_t crc32c;
-	struct nvme_tcp_poll_group *tgroup = nvme_tcp_poll_group(tqpair->qpair.poll_group);
-
-	/* Data Digest */
-	if (pdu->data_len > 0 && g_nvme_tcp_ddgst[pdu->hdr.common.pdu_type] &&
-	    tqpair->flags.host_ddgst_enable) {
-		/* Only suport this limitated case for the first step */
-		if (tgroup != NULL && tgroup->group.group->accel_fn_table.submit_accel_crc32c &&
-		    spdk_likely(!pdu->dif_ctx && (pdu->data_len % SPDK_NVME_TCP_DIGEST_ALIGNMENT == 0))) {
-			tgroup->group.group->accel_fn_table.submit_accel_crc32c(tgroup->group.group->ctx,
-					&pdu->data_digest_crc32, pdu->data_iov,
-					pdu->data_iovcnt, 0, data_crc32_accel_done, pdu);
-			return;
-		}
-
-		crc32c = nvme_tcp_pdu_calc_data_digest(pdu);
-		MAKE_DIGEST_WORD(pdu->data_digest, crc32c);
-	}
-
-	_tcp_write_pdu(pdu);
-}
-
-static void
-header_crc32_accel_done(void *cb_arg, int status)
-{
-	struct nvme_tcp_pdu *pdu = cb_arg;
-
-	pdu->header_digest_crc32 ^= SPDK_CRC32C_XOR;
-	MAKE_DIGEST_WORD((uint8_t *)pdu->hdr.raw + pdu->hdr.common.hlen, pdu->header_digest_crc32);
-	if (spdk_unlikely(status)) {
-		SPDK_ERRLOG("Failed to compute header digest on pdu=%p\n", pdu);
-		_pdu_write_done(pdu, status);
-		return;
-	}
-
-	pdu_data_crc32_compute(pdu);
-}
-
 static int
 nvme_tcp_qpair_write_pdu(struct nvme_tcp_qpair *tqpair,
 			 struct nvme_tcp_pdu *pdu,
@@ -459,30 +381,34 @@ nvme_tcp_qpair_write_pdu(struct nvme_tcp_qpair *tqpair,
 {
 	int hlen;
 	uint32_t crc32c;
-	struct nvme_tcp_poll_group *tgroup = nvme_tcp_poll_group(tqpair->qpair.poll_group);
+	uint32_t mapped_length = 0;
 
 	hlen = pdu->hdr.common.hlen;
 
-	pdu->cb_fn = cb_fn;
-	pdu->cb_arg = cb_arg;
-	pdu->qpair = tqpair;
-
 	/* Header Digest */
 	if (g_nvme_tcp_hdgst[pdu->hdr.common.pdu_type] && tqpair->flags.host_hdgst_enable) {
-		if (tgroup != NULL && tgroup->group.group->accel_fn_table.submit_accel_crc32c) {
-			pdu->iov[0].iov_base = &pdu->hdr.raw;
-			pdu->iov[0].iov_len = hlen;
-			tgroup->group.group->accel_fn_table.submit_accel_crc32c(tgroup->group.group->ctx,
-					&pdu->header_digest_crc32,
-					pdu->iov, 1, 0, header_crc32_accel_done, pdu);
-			return 0;
-		} else {
-			crc32c = nvme_tcp_pdu_calc_header_digest(pdu);
-			MAKE_DIGEST_WORD((uint8_t *)pdu->hdr.raw + hlen, crc32c);
-		}
+		crc32c = nvme_tcp_pdu_calc_header_digest(pdu);
+		MAKE_DIGEST_WORD((uint8_t *)pdu->hdr.raw + hlen, crc32c);
 	}
 
-	pdu_data_crc32_compute(pdu);
+	/* Data Digest */
+	if (pdu->data_len > 0 && g_nvme_tcp_ddgst[pdu->hdr.common.pdu_type] &&
+	    tqpair->flags.host_ddgst_enable) {
+		crc32c = nvme_tcp_pdu_calc_data_digest(pdu);
+		MAKE_DIGEST_WORD(pdu->data_digest, crc32c);
+	}
+
+	pdu->cb_fn = cb_fn;
+	pdu->cb_arg = cb_arg;
+
+	pdu->sock_req.iovcnt = nvme_tcp_build_iovs(pdu->iov, NVME_TCP_MAX_SGL_DESCRIPTORS, pdu,
+			       (bool)tqpair->flags.host_hdgst_enable, (bool)tqpair->flags.host_ddgst_enable,
+			       &mapped_length);
+	pdu->qpair = tqpair;
+	pdu->sock_req.cb_fn = _pdu_write_done;
+	pdu->sock_req.cb_arg = pdu;
+	TAILQ_INSERT_TAIL(&tqpair->send_queue, pdu, tailq);
+	spdk_sock_writev_async(tqpair->sock, &pdu->sock_req);
 
 	return 0;
 }
@@ -845,7 +771,7 @@ nvme_tcp_qpair_send_h2c_term_req(struct nvme_tcp_qpair *tqpair, struct nvme_tcp_
 	/* Contain the header len of the wrong received pdu */
 	h2c_term_req->common.plen = h2c_term_req->common.hlen + copy_len;
 	nvme_tcp_qpair_set_recv_state(tqpair, NVME_TCP_PDU_RECV_STATE_ERROR);
-	nvme_tcp_qpair_write_pdu(tqpair, rsp_pdu, nvme_tcp_qpair_send_h2c_term_req_complete, tqpair);
+	nvme_tcp_qpair_write_pdu(tqpair, rsp_pdu, nvme_tcp_qpair_send_h2c_term_req_complete, NULL);
 
 }
 
@@ -1750,7 +1676,7 @@ nvme_tcp_qpair_icreq_send(struct nvme_tcp_qpair *tqpair)
 }
 
 static int
-nvme_tcp_qpair_connect_sock(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
+nvme_tcp_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
 {
 	struct sockaddr_storage dst_addr;
 	struct sockaddr_storage src_addr;
@@ -1814,24 +1740,6 @@ nvme_tcp_qpair_connect_sock(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpai
 		return rc;
 	}
 
-	return 0;
-}
-
-static int
-nvme_tcp_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
-{
-	int rc = 0;
-	struct nvme_tcp_qpair *tqpair;
-
-	tqpair = nvme_tcp_qpair(qpair);
-
-	if (!tqpair->sock) {
-		rc = nvme_tcp_qpair_connect_sock(ctrlr, qpair);
-		if (rc < 0) {
-			return rc;
-		}
-	}
-
 	if (qpair->poll_group) {
 		rc = nvme_poll_group_connect_qpair(qpair);
 		if (rc) {
@@ -1886,14 +1794,6 @@ nvme_tcp_ctrlr_create_qpair(struct spdk_nvme_ctrlr *ctrlr,
 	}
 
 	rc = nvme_tcp_alloc_reqs(tqpair);
-	if (rc) {
-		nvme_tcp_ctrlr_delete_io_qpair(ctrlr, qpair);
-		return NULL;
-	}
-
-	/* spdk_nvme_qpair_get_optimal_poll_group needs socket information.
-	 * So create the socket first when creating a qpair. */
-	rc = nvme_tcp_qpair_connect_sock(ctrlr, qpair);
 	if (rc) {
 		nvme_tcp_ctrlr_delete_io_qpair(ctrlr, qpair);
 		return NULL;
@@ -2056,21 +1956,6 @@ nvme_tcp_poll_group_create(void)
 	return &group->group;
 }
 
-static struct spdk_nvme_transport_poll_group *
-nvme_tcp_qpair_get_optimal_poll_group(struct spdk_nvme_qpair *qpair)
-{
-	struct nvme_tcp_qpair *tqpair = nvme_tcp_qpair(qpair);
-	struct spdk_sock_group *group = NULL;
-	int rc;
-
-	rc = spdk_sock_get_optimal_sock_group(tqpair->sock, &group);
-	if (!rc && group != NULL) {
-		return spdk_sock_group_get_ctx(group);
-	}
-
-	return NULL;
-}
-
 static int
 nvme_tcp_poll_group_connect_qpair(struct spdk_nvme_qpair *qpair)
 {
@@ -2194,7 +2079,6 @@ const struct spdk_nvme_transport_ops tcp_ops = {
 	.admin_qpair_abort_aers = nvme_tcp_admin_qpair_abort_aers,
 
 	.poll_group_create = nvme_tcp_poll_group_create,
-	.qpair_get_optimal_poll_group = nvme_tcp_qpair_get_optimal_poll_group,
 	.poll_group_connect_qpair = nvme_tcp_poll_group_connect_qpair,
 	.poll_group_disconnect_qpair = nvme_tcp_poll_group_disconnect_qpair,
 	.poll_group_add = nvme_tcp_poll_group_add,

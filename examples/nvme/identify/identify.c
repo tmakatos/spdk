@@ -50,7 +50,6 @@
 #define MAX_DISCOVERY_LOG_ENTRIES	((uint64_t)1000)
 
 #define NUM_CHUNK_INFO_ENTRIES		8
-#define MAX_OCSSD_PU			128
 #define MAX_ZONE_DESC_ENTRIES		8
 
 static int outstanding_commands;
@@ -86,9 +85,9 @@ static uint64_t g_discovery_page_numrec;
 
 static struct spdk_ocssd_geometry_data geometry_data;
 
-static struct spdk_ocssd_chunk_information_entry *g_ocssd_chunk_info_page;
+static struct spdk_ocssd_chunk_information_entry g_ocssd_chunk_info_page[NUM_CHUNK_INFO_ENTRIES ];
 
-static int64_t g_zone_report_limit = 8;
+static bool g_zone_report_full = false;
 
 static bool g_hex_dump = false;
 
@@ -108,8 +107,6 @@ static char g_hostnqn[SPDK_NVMF_NQN_MAX_LEN + 1];
 static int g_controllers_found = 0;
 
 static bool g_vmd = false;
-
-static bool g_ocssd_verbose = false;
 
 static void
 hex_dump(const void *data, size_t size)
@@ -228,10 +225,7 @@ get_features(struct spdk_nvme_ctrlr *ctrlr)
 		SPDK_OCSSD_FEAT_MEDIA_FEEDBACK,
 	};
 
-	/* Submit only one GET FEATURES at a time. There is a known issue #1799
-	 * with Google Cloud Platform NVMe SSDs that do not handle overlapped
-	 * GET FEATURES commands correctly.
-	 */
+	/* Submit several GET FEATURES commands and wait for them to complete */
 	outstanding_commands = 0;
 	for (i = 0; i < SPDK_COUNTOF(features_to_get); i++) {
 		if (!spdk_nvme_ctrlr_is_ocssd_supported(ctrlr) &&
@@ -243,12 +237,11 @@ get_features(struct spdk_nvme_ctrlr *ctrlr)
 		} else {
 			printf("get_feature(0x%02X) failed to submit command\n", features_to_get[i]);
 		}
-
-		while (outstanding_commands) {
-			spdk_nvme_ctrlr_process_admin_completions(ctrlr);
-		}
 	}
 
+	while (outstanding_commands) {
+		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+	}
 }
 
 static int
@@ -549,34 +542,15 @@ get_ocssd_chunk_info_log_page(struct spdk_nvme_ns *ns)
 {
 	struct spdk_nvme_ctrlr *ctrlr = spdk_nvme_ns_get_ctrlr(ns);
 	int nsid = spdk_nvme_ns_get_id(ns);
-	uint32_t num_entry = geometry_data.num_grp * geometry_data.num_pu * geometry_data.num_chk;
-	uint32_t xfer_size = spdk_nvme_ns_get_max_io_xfer_size(ns);
-	uint32_t buf_size = 0;
-	uint64_t buf_offset = 0;
 	outstanding_commands = 0;
 
-	assert(num_entry != 0);
-	if (!g_ocssd_verbose) {
-		num_entry = spdk_min(num_entry, NUM_CHUNK_INFO_ENTRIES);
-	}
-
-	g_ocssd_chunk_info_page = calloc(num_entry, sizeof(struct spdk_ocssd_chunk_information_entry));
-	assert(g_ocssd_chunk_info_page != NULL);
-
-	buf_size = num_entry * sizeof(struct spdk_ocssd_chunk_information_entry);
-	while (buf_size > 0) {
-		xfer_size = spdk_min(buf_size, xfer_size);
-		if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_OCSSD_LOG_CHUNK_INFO,
-						     nsid, (void *) g_ocssd_chunk_info_page + buf_offset,
-						     xfer_size, buf_offset, get_log_page_completion, NULL) == 0) {
-			outstanding_commands++;
-		} else {
-			printf("get_ocssd_chunk_info_log_page() failed\n");
-			return -1;
-		}
-
-		buf_size -= xfer_size;
-		buf_offset += xfer_size;
+	if (spdk_nvme_ctrlr_cmd_get_log_page(ctrlr, SPDK_OCSSD_LOG_CHUNK_INFO,
+					     nsid, &g_ocssd_chunk_info_page, sizeof(g_ocssd_chunk_info_page), 0,
+					     get_log_page_completion, NULL) == 0) {
+		outstanding_commands++;
+	} else {
+		printf("get_ocssd_chunk_info_log_page() failed\n");
+		return -1;
 	}
 
 	while (outstanding_commands) {
@@ -674,16 +648,6 @@ print_ascii_string(const void *buf, size_t size)
 	}
 }
 
-/* Underline a "line" with the given marker, e.g. print_uline("=", printf(...)); */
-static void
-print_uline(char marker, int line_len)
-{
-	for (int i = 1; i < line_len; ++i) {
-		putchar(marker);
-	}
-	putchar('\n');
-}
-
 static void
 print_ocssd_chunk_info(struct spdk_ocssd_chunk_information_entry *chk_info, int chk_num)
 {
@@ -710,45 +674,6 @@ print_ocssd_chunk_info(struct spdk_ocssd_chunk_information_entry *chk_info, int 
 		printf("Starting LBA:                   %" PRIu64 "\n", chk_info[i].slba);
 		printf("Number of blocks in chunk:      %" PRIu64 "\n", chk_info[i].cnlb);
 		printf("Write Pointer:                  %" PRIu64 "\n", chk_info[i].wp);
-	}
-}
-
-static void
-print_ocssd_chunk_info_verbose(struct spdk_ocssd_chunk_information_entry *chk_info)
-{
-	uint32_t pu, chk, i;
-	uint32_t cnt_free, cnt_closed, cnt_open, cnt_offline;
-	uint32_t max_pu = spdk_min(MAX_OCSSD_PU, (geometry_data.num_grp * geometry_data.num_pu));
-	char cs_str[MAX_OCSSD_PU + 1], cs;
-
-	assert(chk_info != NULL);
-	printf("OCSSD Chunk Info Verbose\n");
-	printf("======================\n");
-
-	printf("%4s %-*s %3s %3s %3s %3s\n", "band", max_pu, "chunk state", "fr", "cl", "op", "of");
-	for (chk = 0; chk < geometry_data.num_chk; chk++) {
-		cnt_free = cnt_closed = cnt_open = cnt_offline = 0;
-		for (pu = 0; pu < max_pu; pu++) {
-			i = (pu * geometry_data.num_chk) + chk;
-			if (chk_info[i].cs.free) {
-				cnt_free++;
-				cs = 'f';
-			} else if (chk_info[i].cs.closed) {
-				cnt_closed++;
-				cs = 'c';
-			} else if (chk_info[i].cs.open) {
-				cnt_open++;
-				cs = 'o';
-			} else if (chk_info[i].cs.offline) {
-				cnt_offline++;
-				cs = 'l';
-			} else {
-				cs = '.';
-			}
-			cs_str[pu] = cs;
-		}
-		cs_str[pu] = 0;
-		printf("%4d %s %3d %3d %3d %3d\n", chk, cs_str, cnt_free, cnt_closed, cnt_open, cnt_offline);
 	}
 }
 
@@ -802,7 +727,7 @@ get_and_print_zns_zone_report(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *q
 {
 	struct spdk_nvme_zns_zone_report *report_buf;
 	size_t report_bufsize;
-	uint64_t zone_size_lba = spdk_nvme_zns_ns_get_zone_size_sectors(ns);
+	uint64_t zone_size_lba = spdk_nvme_zns_ns_get_zone_size(ns) / spdk_nvme_ns_get_sector_size(ns);
 	uint64_t total_zones = spdk_nvme_zns_ns_get_num_zones(ns);
 	uint64_t max_zones_per_buf, zones_to_print, i;
 	uint64_t handled_zones = 0;
@@ -817,10 +742,15 @@ get_and_print_zns_zone_report(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *q
 		exit(1);
 	}
 
-	zones_to_print = g_zone_report_limit ? spdk_min(total_zones, (uint64_t)g_zone_report_limit) : \
-			 total_zones;
-
-	print_uline('=', printf("NVMe ZNS Zone Report (first %zu of %zu)\n", zones_to_print, total_zones));
+	if (g_zone_report_full) {
+		zones_to_print = total_zones;
+		printf("NVMe ZNS Zone Report\n");
+		printf("====================\n");
+	} else {
+		zones_to_print = spdk_min(total_zones, MAX_ZONE_DESC_ENTRIES);
+		printf("NVMe ZNS Zone Report Glance\n");
+		printf("===========================\n");
+	}
 
 	while (handled_zones < zones_to_print) {
 		memset(report_buf, 0, report_bufsize);
@@ -896,24 +826,6 @@ print_zns_ns_data(const struct spdk_nvme_zns_ns_data *nsdata_zns)
 	printf("\n");
 }
 
-static const char *
-csi_name(enum spdk_nvme_csi csi)
-{
-	switch (csi) {
-	case SPDK_NVME_CSI_NVM:
-		return "NVM";
-	case SPDK_NVME_CSI_KV:
-		return "KV";
-	case SPDK_NVME_CSI_ZNS:
-		return "ZNS";
-	default:
-		if (csi >= 0x30 && csi <= 0x3f) {
-			return "Vendor specific";
-		}
-		return "Unknown";
-	}
-}
-
 static void
 print_namespace(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 {
@@ -941,8 +853,6 @@ print_namespace(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	/* This function is only called for active namespaces. */
 	assert(spdk_nvme_ns_is_active(ns));
 
-	printf("Command Set Identifier:                %s (%02Xh)\n",
-	       csi_name(spdk_nvme_ns_get_csi(ns)), spdk_nvme_ns_get_csi(ns));
 	printf("Deallocate:                            %s\n",
 	       (flags & SPDK_NVME_NS_DEALLOCATE_SUPPORTED) ? "Supported" : "Not Supported");
 	printf("Deallocated/Unwritten Error:           %s\n",
@@ -1046,11 +956,7 @@ print_namespace(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 		get_ocssd_geometry(ns, &geometry_data);
 		print_ocssd_geometry(&geometry_data);
 		get_ocssd_chunk_info_log_page(ns);
-		if (g_ocssd_verbose) {
-			print_ocssd_chunk_info_verbose(g_ocssd_chunk_info_page);
-		} else {
-			print_ocssd_chunk_info(g_ocssd_chunk_info_page, NUM_CHUNK_INFO_ENTRIES);
-		}
+		print_ocssd_chunk_info(g_ocssd_chunk_info_page, NUM_CHUNK_INFO_ENTRIES);
 	} else if (spdk_nvme_ns_get_csi(ns) == SPDK_NVME_CSI_ZNS) {
 		struct spdk_nvme_qpair *qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, NULL, 0);
 		if (qpair == NULL) {
@@ -1168,7 +1074,6 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	union spdk_nvme_cap_register		cap;
 	union spdk_nvme_vs_register		vs;
 	union spdk_nvme_cmbsz_register		cmbsz;
-	union spdk_nvme_pmrcap_register		pmrcap;
 	uint8_t					str[512];
 	uint32_t				i, j;
 	struct spdk_nvme_error_information_entry *error_entry;
@@ -1181,7 +1086,6 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	cap = spdk_nvme_ctrlr_get_regs_cap(ctrlr);
 	vs = spdk_nvme_ctrlr_get_regs_vs(ctrlr);
 	cmbsz = spdk_nvme_ctrlr_get_regs_cmbsz(ctrlr);
-	pmrcap = spdk_nvme_ctrlr_get_regs_pmrcap(ctrlr);
 
 	if (!spdk_nvme_ctrlr_is_discovery(ctrlr)) {
 		/*
@@ -1294,9 +1198,6 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 	       (uint64_t)1 << (12 + cap.bits.mpsmin));
 	printf("Memory Page Size Maximum:              %" PRIu64 " bytes\n",
 	       (uint64_t)1 << (12 + cap.bits.mpsmax));
-	printf("Persistent Memory Region:              %s\n",
-	       cap.bits.pmrs ? "Supported" : "Not Supported");
-
 	printf("Optional Asynchronous Events Supported\n");
 	printf("  Namespace Attribute Notices:         %s\n",
 	       cdata->oaes.ns_attribute_notices ? "Supported" : "Not Supported");
@@ -1327,19 +1228,6 @@ print_controller(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_transport
 		       cmbsz.bits.rds ? "Supported" : "Not Supported");
 		printf("Write data and metadata in CMB:        %s\n",
 		       cmbsz.bits.wds ? "Supported" : "Not Supported");
-	} else {
-		printf("Supported:                             No\n");
-	}
-	printf("\n");
-
-	printf("Persistent Memory Region Support\n");
-	printf("================================\n");
-	if (cap.bits.pmrs != 0) {
-		printf("Supported:                             Yes\n");
-		printf("Read data and metadata in PMR          %s\n",
-		       pmrcap.bits.rds ? "Supported" : "Not Supported");
-		printf("Write data and metadata in PMR:        %s\n",
-		       pmrcap.bits.wds ? "Supported" : "Not Supported");
 	} else {
 		printf("Supported:                             No\n");
 	}
@@ -2045,7 +1933,7 @@ usage(const char *program_name)
 	printf(" -d         DPDK huge memory size in MB\n");
 	printf(" -g         use single file descriptor for DPDK memory segments\n");
 	printf(" -x         print hex dump of raw data\n");
-	printf(" -z         For NVMe Zoned Namespaces, dump the full zone report (-z) or the first N entries (-z N)\n");
+	printf(" -z         For NVMe Zoned Namespaces, dump the full zone report\n");
 	printf(" -v         verbose (enable warnings)\n");
 	printf(" -V         enumerate VMD\n");
 	printf(" -H         show this usage\n");
@@ -2060,7 +1948,7 @@ parse_args(int argc, char **argv)
 	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
 	snprintf(g_trid.subnqn, sizeof(g_trid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
 
-	while ((op = getopt(argc, argv, "d:gi:op:r:xz::HL:V")) != -1) {
+	while ((op = getopt(argc, argv, "d:gi:p:r:xzHL:V")) != -1) {
 		switch (op) {
 		case 'd':
 			g_dpdk_mem = spdk_strtol(optarg, 10);
@@ -2079,9 +1967,6 @@ parse_args(int argc, char **argv)
 				return g_shm_id;
 			}
 			break;
-		case 'o':
-			g_ocssd_verbose = true;
-			break;
 		case 'p':
 			g_main_core = spdk_strtol(optarg, 10);
 			if (g_main_core < 0) {
@@ -2096,7 +1981,6 @@ parse_args(int argc, char **argv)
 				return 1;
 			}
 
-			assert(optarg != NULL);
 			hostnqn = strcasestr(optarg, "hostnqn:");
 			if (hostnqn) {
 				size_t len;
@@ -2117,18 +2001,7 @@ parse_args(int argc, char **argv)
 			g_hex_dump = true;
 			break;
 		case 'z':
-			if (optarg == NULL && argv[optind] != NULL && argv[optind][0] != '-') {
-				g_zone_report_limit = spdk_strtol(argv[optind], 10);
-				++optind;
-			} else if (optarg) {
-				g_zone_report_limit = spdk_strtol(optarg, 10);
-			} else {
-				g_zone_report_limit = 0;
-			}
-			if (g_zone_report_limit < 0) {
-				fprintf(stderr, "Invalid Zone Report limit\n");
-				return g_zone_report_limit;
-			}
+			g_zone_report_full = true;
 			break;
 		case 'L':
 			rc = spdk_log_set_flag(optarg);

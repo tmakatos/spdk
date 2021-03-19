@@ -2,17 +2,12 @@
 *.a
 *.cmd
 *.d
-*.dll
-*.exe
 *.gcda
 *.gcno
 *.kdev4
 *.ko
-*.lib
 *.log
 *.o
-*.obj
-*.pdb
 *.pyc
 *.so
 *.so.*

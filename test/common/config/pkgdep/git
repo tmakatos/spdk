@@ -27,7 +27,7 @@ function install_refspdk() {
 		release=$(git -C "$GIT_REPOS/spdk_repo/spdk" tag | sort --version-sort | grep -v rc | tail -n 1)
 		output_dir="$GIT_REPOS/spdk_abi_latest"
 	elif [[ "$version" == "LTS" ]]; then
-		release=$(git -C "$GIT_REPOS/spdk_repo/spdk" describe --tags --exclude=LTS LTS)
+		release=$(git -C "$GIT_REPOS/spdk_repo/spdk" describe LTS)
 		output_dir="$GIT_REPOS/spdk_abi_lts"
 	fi
 
@@ -95,7 +95,7 @@ function install_refspdk() {
 
 		# Prepare separate, fixed, cmdline for the FreeBSD, Issue #1397.
 		if [[ $OSID == freebsd ]]; then
-			config_params="--enable-debug"
+			config_params="--enable-debug --enable-werror"
 			config_params+=" --without-isal --with-fio=/usr/src/fio"
 
 			# TODO: Remove this if-block after 21.01 LTS is released and 20.01 LTS is deprecated.
@@ -168,17 +168,8 @@ function install_qat() {
 	# Patch name of the pci_aer function which was renamed in kernels >= 5.7.1. See .patch for details
 	if ((kernel_ver >= 0x050701)) || ! in_syms pci_cleanup_aer_uncorrect_error_status; then
 		# Patch only the driver version that was tested
-		if [[ ${DRIVER_LOCATION_QAT##*/} == qat1.7.l.4.9.0-00008.tar.gz ]]; then
-			patch --dir="$GIT_REPOS/QAT" -p1
-		fi < "$rootdir/test/common/config/pkgdep/patches/qat/0001-pci_aer.patch"
-		if ((kernel_ver < 0x050701)); then
-			# Older kernel build without pci_cleanup_aer_uncorrect_error_status()? This might be
-			# centos8's build.
-			if [[ ${DRIVER_LOCATION_QAT##*/} == qat1.7.l.4.12.0-00011.tar.gz ]]; then
-				patch --dir="$GIT_REPOS/QAT" -p1
-			fi < "$rootdir/test/common/config/pkgdep/patches/qat/0001-pci_aer_centos.patch"
-		fi
-	fi
+		[[ ${DRIVER_LOCATION_QAT##*/} == qat1.7.l.4.9.0-00008.tar.gz ]] && patch --dir="$GIT_REPOS/QAT" -p1
+	fi < "$rootdir/test/common/config/pkgdep/patches/qat/0001-pci_aer.patch"
 
 	# Patch use of cryptohash.h which was removed in favor of crypto/sha.h in kernels >= 5.8. See .patch for details
 	if ((kernel_ver >= 0x050800)); then
@@ -201,10 +192,10 @@ function install_rocksdb() {
 	# Rocksdb is installed for use with the blobfs tests.
 	if [ ! -d /usr/src/rocksdb ]; then
 		git clone "${GIT_REPO_ROCKSDB}" "$GIT_REPOS/rocksdb"
-		git -C "$GIT_REPOS/rocksdb" checkout 6.15.fb
+		git -C "$GIT_REPOS/rocksdb" checkout spdk-v5.6.1
 		sudo mv "$GIT_REPOS/rocksdb" /usr/src/
 	else
-		sudo git -C /usr/src/rocksdb checkout 6.15.fb
+		sudo git -C /usr/src/rocksdb checkout spdk-v5.6.1
 		echo "rocksdb already in /usr/src. Not checking out again"
 	fi
 }
@@ -399,140 +390,7 @@ function install_igb_uio() {
 	sudo depmod
 }
 
-function install_irdma() {
-	local RDMA_CORE_VERSION=27.0
-	local RDMA_CORE=https://github.com/linux-rdma/rdma-core/releases/download/v$RDMA_CORE_VERSION/rdma-core-$RDMA_CORE_VERSION.tar.gz
-
-	if [[ $ID != fedora ]]; then
-		echo "Installation of the irdma can be attempted only on Fedora"
-		return 0
-	fi
-
-	# Install extra dependencies needed by the rdma-core-27.0
-	install ninja-build pandoc perl-generators valgrind-devel python-docutils libnl3 libnl3-devel
-
-	rm -rf "$GIT_REPOS/irdma-$IRDMA_VERSION"
-	rm -rf "$GIT_REPOS/rdma-core-$RDMA_CORE_VERSION"
-
-	curl -L -o- "$IRDMA_DRIVER" | tar -C "$GIT_REPOS" -xzf -
-	[[ -e $GIT_REPOS/irdma-$IRDMA_VERSION/build.sh ]]
-
-	(
-		cd "$GIT_REPOS/irdma-$IRDMA_VERSION"
-		"$GIT_REPOS/irdma-$IRDMA_VERSION/build.sh"
-	)
-
-	# Fetch and build the rdma-core irdma depends on
-	curl -L -o- "$RDMA_CORE" | tar -C "$GIT_REPOS" -xzf -
-	[[ -e $GIT_REPOS/irdma-$IRDMA_VERSION/libirdma-$RDMA_CORE_VERSION.patch ]]
-
-	patch --dir="$GIT_REPOS/rdma-core-$RDMA_CORE_VERSION" -p2 \
-		< "$GIT_REPOS/irdma-$IRDMA_VERSION/libirdma-$RDMA_CORE_VERSION.patch"
-
-	# Note that paths and the name of the package are hardcoded into .spec, hence they need to stay like this.
-	[[ -e $GIT_REPOS/rdma-core-$RDMA_CORE_VERSION/redhat/rdma-core.spec ]]
-	mkdir -p "$HOME/rpmbuild/"{SOURCES,SPECS}
-	cp "$GIT_REPOS/rdma-core-$RDMA_CORE_VERSION/redhat/rdma-core.spec" "$HOME/rpmbuild/SPECS"
-
-	# Re-package the source
-	tar -czf "$HOME/rpmbuild/SOURCES/rdma-core-$RDMA_CORE_VERSION.tgz" -C "$GIT_REPOS" "rdma-core-$RDMA_CORE_VERSION"
-
-	# Build the rpms
-	(
-		cd "$HOME/rpmbuild/SPECS"
-		# Make sure stock ninja-build is used
-		PATH="/usr/bin:$PATH" rpmbuild -ba rdma-core.spec
-	)
-
-	# Now, don't install the packages since this will, most likely, conflict with packages already installed
-	# in the system. Instead, simply inform user what the next step is and note what potential issues it may
-	# have with the installation.
-
-	shopt -s nullglob
-	local rpms=("$HOME/rpmbuild/RPMS/x86_64/"*.rpm)
-	shopt -u nullglob
-	((${#rpms[@]} > 0))
-
-	cat <<-EOF
-
-		INFO: rdma-core-$RDMA_CORE_VERSION was successfully built, following packages are
-		available for installation:
-
-		$(printf '  - %s\n' "${rpms[@]##*/}")
-
-		Note that installing the above packages may raise conflicts with their
-		potentially newer versions already installed on the system. Dependent
-		packages may be uninstalled during the process as well. Please, run the
-		following command to finish the installation:
-
-		  $package_manager install [--allowerasing] $HOME/rpmbuild/RPMS/x86_64/*.rpm
-
-	EOF
-}
-
-function install_ice() {
-	rm -rf "$GIT_REPOS/ice-$ICE_VERSION"
-
-	curl -L -o- "$ICE_DRIVER" | tar -C "$GIT_REPOS" -xzf -
-	(
-		cd "$GIT_REPOS/ice-$ICE_VERSION/src"
-		make -j"$(nproc)" install
-	)
-}
-
-function install_sources() {
-	if [[ $ID == centos ]] && (( VERSION_ID == 7 )); then
-		# install proper version of the git first
-		install_git
-	fi
-
-	IFS="," read -ra conf_env <<< "$CONF"
-	for conf in "${conf_env[@]}"; do
-		export "INSTALL_${conf^^}=true"
-	done
-
-	if [[ $OSID == freebsd ]]; then
-		jobs=$(($(sysctl -n hw.ncpu) * 2))
-	else
-		jobs=$(($(nproc) * 2))
-		sources+=(
-			install_irdma
-			install_libiscsi
-			install_nvmecli
-			install_qat
-			install_rocksdb
-			install_flamegraph
-			install_qemu
-			install_igb_uio
-			install_ice
-		)
-		install_extra_pkgs
-	fi
-	sources+=(install_fio)
-	sources+=(install_vagrant)
-	sources+=(install_spdk)
-
-	sudo mkdir -p /usr/{,local}/src
-	sudo mkdir -p "$GIT_REPOS"
-
-	for source in "${sources[@]}"; do
-		source_conf=${source^^}
-		if [[ ${!source_conf} == true ]]; then
-			"$source"
-		fi
-	done
-
-	if [[ $INSTALL_REFSPDK == true ]]; then
-		# Serialize builds as refspdk depends on spdk
-		[[ $INSTALL_SPDK != true ]] && install_spdk
-		install_refspdk latest
-		install_refspdk LTS
-	fi
-}
-
 GIT_VERSION=2.25.1
-IRDMA_VERSION=1.2.21
-ICE_VERSION=1.2.1
 : ${GIT_REPO_SPDK=https://github.com/spdk/spdk.git}
 export GIT_REPO_SPDK
 : ${GIT_REPO_DPDK=https://github.com/spdk/dpdk.git}
@@ -555,10 +413,51 @@ export DRIVER_LOCATION_QAT
 export GIT_REPO_GIT
 : ${GIT_REPO_DPDK_KMODS=http://dpdk.org/git/dpdk-kmods}
 export GIT_REPO_DPDK_KMODS
-: ${IRDMA_DRIVER=https://downloadmirror.intel.com/29751/eng/irdma-$IRDMA_VERSION.tgz}
-export IRDMA_DRIVER
-: ${ICE_DRIVER=https://downloadmirror.intel.com/30234/eng/ice-$ICE_VERSION.tar.gz}
-export ICE_DRIVER
 GIT_REPOS=${GIT_REPOS:-$HOME}
 
 gcc_version=$(gcc -dumpversion) gcc_version=${gcc_version%%.*}
+if [[ $ID == centos ]] && (( VERSION_ID == 7 )); then
+	# install proper version of the git first
+	install_git
+fi
+
+IFS="," read -ra conf_env <<< "$CONF"
+for conf in "${conf_env[@]}"; do
+	export "INSTALL_${conf^^}=true"
+done
+
+if [[ $OSID == freebsd ]]; then
+	jobs=$(($(sysctl -n hw.ncpu) * 2))
+else
+	jobs=$(($(nproc) * 2))
+	sources+=(
+		install_libiscsi
+		install_nvmecli
+		install_qat
+		install_rocksdb
+		install_flamegraph
+		install_qemu
+		install_igb_uio
+	)
+	install_extra_pkgs
+fi
+sources+=(install_fio)
+sources+=(install_vagrant)
+sources+=(install_spdk)
+
+sudo mkdir -p /usr/{,local}/src
+sudo mkdir -p "$GIT_REPOS"
+
+for source in "${sources[@]}"; do
+	source_conf=${source^^}
+	if [[ ${!source_conf} == true ]]; then
+		"$source"
+	fi
+done
+
+if [[ $INSTALL_REFSPDK == true ]]; then
+	# Serialize builds as refspdk depends on spdk
+	[[ $INSTALL_SPDK != true ]] && install_spdk
+	install_refspdk latest
+	install_refspdk LTS
+fi

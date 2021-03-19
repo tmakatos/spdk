@@ -36,6 +36,7 @@
 
 #include <ocf/ocf.h>
 
+#include "ocf_env.h"
 #include "ctx.h"
 #include "data.h"
 

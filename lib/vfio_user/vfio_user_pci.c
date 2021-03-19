@@ -388,6 +388,7 @@ spdk_vfio_user_setup(const char *path)
 	ret = vfio_user_get_dev_info(device, &dev_info, sizeof(dev_info));
 	if (ret) {
 		SPDK_ERRLOG("Device get info failed\n");
+		close(device->fd);
 		goto cleanup;
 	}
 	device->pci_regions = dev_info.num_regions;
@@ -395,6 +396,7 @@ spdk_vfio_user_setup(const char *path)
 
 	ret = vfio_device_map_bars_and_config_region(device);
 	if (ret) {
+		close(device->fd);
 		goto cleanup;
 	}
 
@@ -402,6 +404,7 @@ spdk_vfio_user_setup(const char *path)
 	ret = vfio_device_dma_map(device);
 	if (ret) {
 		SPDK_ERRLOG("Container DMA map failed\n");
+		close(device->fd);
 		goto cleanup;
 	}
 
@@ -411,7 +414,6 @@ spdk_vfio_user_setup(const char *path)
 	return device;
 
 cleanup:
-	close(device->fd);
 	free(device);
 	return NULL;
 }

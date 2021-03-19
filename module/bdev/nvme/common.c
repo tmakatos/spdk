@@ -134,8 +134,6 @@ nvme_bdev_unregister_cb(void *io_device)
 		free(trid);
 	}
 
-	pthread_mutex_destroy(&nvme_bdev_ctrlr->mutex);
-
 	free(nvme_bdev_ctrlr->namespaces);
 	free(nvme_bdev_ctrlr);
 
@@ -170,18 +168,18 @@ nvme_bdev_ctrlr_do_destruct(void *ctx)
 void
 nvme_bdev_ctrlr_destruct(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr)
 {
-	pthread_mutex_lock(&nvme_bdev_ctrlr->mutex);
+	pthread_mutex_lock(&g_bdev_nvme_mutex);
 
 	assert(nvme_bdev_ctrlr->ref > 0);
 	nvme_bdev_ctrlr->ref--;
 
 	if (nvme_bdev_ctrlr->ref > 0 || !nvme_bdev_ctrlr->destruct ||
 	    nvme_bdev_ctrlr->resetting) {
-		pthread_mutex_unlock(&nvme_bdev_ctrlr->mutex);
+		pthread_mutex_unlock(&g_bdev_nvme_mutex);
 		return;
 	}
 
-	pthread_mutex_unlock(&nvme_bdev_ctrlr->mutex);
+	pthread_mutex_unlock(&g_bdev_nvme_mutex);
 
 	nvme_bdev_ctrlr_do_destruct(nvme_bdev_ctrlr);
 }
@@ -189,18 +187,14 @@ nvme_bdev_ctrlr_destruct(struct nvme_bdev_ctrlr *nvme_bdev_ctrlr)
 void
 nvme_bdev_ns_detach(struct nvme_bdev_ns *nvme_ns)
 {
-	struct nvme_bdev_ctrlr *nvme_bdev_ctrlr = nvme_ns->ctrlr;
-
-	assert(nvme_bdev_ctrlr != NULL);
-
-	pthread_mutex_lock(&nvme_bdev_ctrlr->mutex);
+	pthread_mutex_lock(&g_bdev_nvme_mutex);
 	assert(nvme_ns->ref > 0);
 	nvme_ns->ref--;
 	if (nvme_ns->ref > 0) {
-		pthread_mutex_unlock(&nvme_bdev_ctrlr->mutex);
+		pthread_mutex_unlock(&g_bdev_nvme_mutex);
 		return;
 	}
-	pthread_mutex_unlock(&nvme_bdev_ctrlr->mutex);
+	pthread_mutex_unlock(&g_bdev_nvme_mutex);
 
 	nvme_bdev_ctrlr_destruct(nvme_ns->ctrlr);
 }

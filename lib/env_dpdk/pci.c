@@ -246,17 +246,8 @@ pci_device_rte_dev_event(const char *device_name,
 
 		if (dev != NULL && can_detach) {
 			/* if device is not attached we can remove it right away.
-			 * Otherwise it will be removed at detach.
-			 *
-			 * Because the user's callback is invoked in eal interrupt
-			 * callback, the interrupt callback need to be finished before
-			 * it can be unregistered when detaching device. So finish
-			 * callback soon and use a deferred removal to detach device
-			 * is need. It is a workaround, once the device detaching be
-			 * moved into the eal in the future, the deferred removal could
-			 * be deleted.
-			 */
-			rte_eal_alarm_set(1, detach_rte_cb, dev->dev_handle);
+			* Otherwise it will be removed at detach. */
+			remove_rte_dev(dev->dev_handle);
 		}
 		break;
 	}
@@ -988,7 +979,9 @@ spdk_pci_device_unclaim(struct spdk_pci_device *dev)
 	dev->internal.claim_fd = -1;
 	unlink(dev_name);
 }
-#else /* !__linux__ */
+#endif /* __linux__ */
+
+#ifdef __FreeBSD__
 int
 spdk_pci_device_claim(struct spdk_pci_device *dev)
 {
@@ -1001,7 +994,7 @@ spdk_pci_device_unclaim(struct spdk_pci_device *dev)
 {
 	/* TODO */
 }
-#endif /* __linux__ */
+#endif /* __FreeBSD__ */
 
 int
 spdk_pci_addr_parse(struct spdk_pci_addr *addr, const char *bdf)
@@ -1078,38 +1071,4 @@ const char *
 spdk_pci_device_get_type(const struct spdk_pci_device *dev)
 {
 	return dev->type;
-}
-
-int
-spdk_pci_device_allow(struct spdk_pci_addr *pci_addr)
-{
-	struct rte_devargs *da;
-	char devargs_str[128];
-
-	da = calloc(1, sizeof(*da));
-	if (da == NULL) {
-		SPDK_ERRLOG("could not allocate rte_devargs\n");
-		return -ENOMEM;
-	}
-
-	snprintf(devargs_str, sizeof(devargs_str), "pci:%04x:%02x:%02x:%x",
-		 pci_addr->domain, pci_addr->bus, pci_addr->dev, pci_addr->func);
-	if (rte_devargs_parse(da, devargs_str) != 0) {
-		SPDK_ERRLOG("rte_devargs_parse() failed on '%s'\n", devargs_str);
-		free(da);
-		return -EINVAL;
-	}
-	da->policy = RTE_DEV_ALLOWED;
-	/* Note: if a devargs already exists for this device address, it just gets
-	 * overridden.  So we do not need to check if the devargs already exists.
-	 * DPDK will take care of memory management for the devargs structure after
-	 * it has been inserted, so there's nothing SPDK needs to track.
-	 */
-	if (rte_devargs_insert(&da) != 0) {
-		SPDK_ERRLOG("rte_devargs_insert() failed on '%s'\n", devargs_str);
-		free(da);
-		return -EINVAL;
-	}
-
-	return 0;
 }

@@ -136,11 +136,6 @@ struct ns_worker_stats {
 	uint64_t		total_tsc;
 	uint64_t		min_tsc;
 	uint64_t		max_tsc;
-	uint64_t		last_tsc;
-	uint64_t		busy_tsc;
-	uint64_t		idle_tsc;
-	uint64_t		last_busy_tsc;
-	uint64_t		last_idle_tsc;
 };
 
 struct ns_worker_ctx {
@@ -208,7 +203,7 @@ struct ns_fn_table {
 	int	(*submit_io)(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			     struct ns_entry *entry, uint64_t offset_in_ios);
 
-	int64_t	(*check_io)(struct ns_worker_ctx *ns_ctx);
+	void	(*check_io)(struct ns_worker_ctx *ns_ctx);
 
 	void	(*verify_io)(struct perf_task *task, struct ns_entry *entry);
 
@@ -236,8 +231,6 @@ static pthread_barrier_t g_worker_sync_barrier;
 
 static uint64_t g_tsc_rate;
 
-static bool g_monitor_perf_cores = false;
-
 static uint32_t g_io_align = 0x200;
 static bool g_io_align_specified;
 static uint32_t g_io_size_bytes;
@@ -251,7 +244,6 @@ static int g_queue_depth;
 static int g_nr_io_queues_per_ns = 1;
 static int g_nr_unused_io_queues;
 static int g_time_in_sec;
-static uint64_t g_elapsed_time_in_usec;
 static int g_warmup_time_in_sec;
 static uint32_t g_max_completions;
 static int g_dpdk_mem;
@@ -455,10 +447,10 @@ uring_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	return 0;
 }
 
-static int64_t
+static void
 uring_check_io(struct ns_worker_ctx *ns_ctx)
 {
-	int i, to_complete, to_submit, count = 0, ret = 0;
+	int i, count, to_complete, to_submit, ret = 0;
 	struct perf_task *task;
 
 	to_submit = ns_ctx->u.uring.io_pending;
@@ -468,7 +460,7 @@ uring_check_io(struct ns_worker_ctx *ns_ctx)
 		 * It will automatically call spdk_io_uring_enter appropriately. */
 		ret = io_uring_submit(&ns_ctx->u.uring.ring);
 		if (ret < 0) {
-			return -1;
+			return;
 		}
 		ns_ctx->u.uring.io_pending = 0;
 		ns_ctx->u.uring.io_inflight += to_submit;
@@ -489,7 +481,6 @@ uring_check_io(struct ns_worker_ctx *ns_ctx)
 			task_complete(task);
 		}
 	}
-	return count;
 }
 
 static void
@@ -589,7 +580,7 @@ aio_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	}
 }
 
-static int64_t
+static void
 aio_check_io(struct ns_worker_ctx *ns_ctx)
 {
 	int count, i;
@@ -607,7 +598,6 @@ aio_check_io(struct ns_worker_ctx *ns_ctx)
 	for (i = 0; i < count; i++) {
 		task_complete(ns_ctx->u.aio.events[i].data);
 	}
-	return count;
 }
 
 static void
@@ -894,7 +884,7 @@ perf_disconnect_cb(struct spdk_nvme_qpair *qpair, void *ctx)
 
 }
 
-static int64_t
+static void
 nvme_check_io(struct ns_worker_ctx *ns_ctx)
 {
 	int64_t rc;
@@ -904,7 +894,6 @@ nvme_check_io(struct ns_worker_ctx *ns_ctx)
 		fprintf(stderr, "NVMe io qpair process completion error\n");
 		exit(1);
 	}
-	return rc;
 }
 
 static void
@@ -961,7 +950,7 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 	opts.delay_cmd_submit = true;
 	opts.create_only = true;
 
-	ns_ctx->u.nvme.group = spdk_nvme_poll_group_create(NULL, NULL);
+	ns_ctx->u.nvme.group = spdk_nvme_poll_group_create(NULL);
 	if (ns_ctx->u.nvme.group == NULL) {
 		goto poll_group_failed;
 	}
@@ -1415,11 +1404,6 @@ print_periodic_performance(bool warmup)
 	double mb_this_second;
 	struct worker_thread *worker;
 	struct ns_worker_ctx *ns_ctx;
-	uint64_t busy_tsc;
-	uint64_t idle_tsc;
-	uint64_t core_busy_tsc = 0;
-	uint64_t core_idle_tsc = 0;
-	double core_busy_perc = 0;
 
 	if (!isatty(STDOUT_FILENO)) {
 		/* Don't print periodic stats if output is not going
@@ -1427,48 +1411,29 @@ print_periodic_performance(bool warmup)
 		 */
 		return;
 	}
+
 	io_this_second = 0;
 	TAILQ_FOREACH(worker, &g_workers, link) {
-		busy_tsc = 0;
-		idle_tsc = 0;
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 			io_this_second += ns_ctx->stats.io_completed - ns_ctx->stats.last_io_completed;
 			ns_ctx->stats.last_io_completed = ns_ctx->stats.io_completed;
-
-			if (g_monitor_perf_cores) {
-				busy_tsc += ns_ctx->stats.busy_tsc - ns_ctx->stats.last_busy_tsc;
-				idle_tsc += ns_ctx->stats.idle_tsc - ns_ctx->stats.last_idle_tsc;
-				ns_ctx->stats.last_busy_tsc = ns_ctx->stats.busy_tsc;
-				ns_ctx->stats.last_idle_tsc = ns_ctx->stats.idle_tsc;
-			}
-		}
-		if (g_monitor_perf_cores) {
-			core_busy_tsc += busy_tsc;
-			core_idle_tsc += idle_tsc;
-			core_busy_perc += (double)core_busy_tsc / (core_idle_tsc + core_busy_tsc) * 100;
 		}
 	}
+
 	mb_this_second = (double)io_this_second * g_io_size_bytes / (1024 * 1024);
-
-	printf("%s%9ju IOPS, %8.2f MiB/s", warmup ? "[warmup] " : "", io_this_second, mb_this_second);
-	if (g_monitor_perf_cores) {
-		printf("%3d Core(s): %6.2f%% Busy", g_num_workers, core_busy_perc);
-	}
-	printf("\r");
+	printf("%s%9ju IOPS, %8.2f MiB/s\r", warmup ? "[warmup] " : "", io_this_second, mb_this_second);
 	fflush(stdout);
 }
 
 static int
 work_fn(void *arg)
 {
-	uint64_t tsc_start, tsc_end, tsc_current, tsc_next_print;
+	uint64_t tsc_end, tsc_current, tsc_next_print;
 	struct worker_thread *worker = (struct worker_thread *) arg;
 	struct ns_worker_ctx *ns_ctx = NULL;
 	uint32_t unfinished_ns_ctx;
 	bool warmup = false;
 	int rc;
-	int64_t check_rc;
-	uint64_t check_now;
 
 	/* Allocate queue pairs for each namespace. */
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
@@ -1486,8 +1451,7 @@ work_fn(void *arg)
 		return 1;
 	}
 
-	tsc_start = spdk_get_ticks();
-	tsc_current = tsc_start;
+	tsc_current = spdk_get_ticks();
 	tsc_next_print = tsc_current + g_tsc_rate;
 
 	if (g_warmup_time_in_sec) {
@@ -1509,15 +1473,7 @@ work_fn(void *arg)
 		 * to replace each I/O that is completed.
 		 */
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
-			check_now = spdk_get_ticks();
-			check_rc = ns_ctx->entry->fn_table->check_io(ns_ctx);
-
-			if (check_rc > 0) {
-				ns_ctx->stats.busy_tsc += check_now - ns_ctx->stats.last_tsc;
-			} else {
-				ns_ctx->stats.idle_tsc += check_now - ns_ctx->stats.last_tsc;
-			}
-			ns_ctx->stats.last_tsc = check_now;
+			ns_ctx->entry->fn_table->check_io(ns_ctx);
 		}
 
 		tsc_current = spdk_get_ticks();
@@ -1547,14 +1503,6 @@ work_fn(void *arg)
 				break;
 			}
 		}
-	}
-
-	/* Capture the actual elapsed time when we break out of the main loop. This will account
-	 * for cases where we exit prematurely due to a signal. We only need to capture it on
-	 * one core, so use the main core.
-	 */
-	if (worker->lcore == g_main_core) {
-		g_elapsed_time_in_usec = (tsc_current - tsc_start) * SPDK_SEC_TO_USEC / g_tsc_rate;
 	}
 
 	/* drain the io of each ns_ctx in round robin to make the fairness */
@@ -1616,11 +1564,9 @@ static void usage(char *program_name)
 	printf("\t  traddr      Transport address (e.g. 0000:04:00.0 for PCIe or 192.168.100.8 for RDMA)\n");
 	printf("\t  trsvcid     Transport service identifier (e.g. 4420)\n");
 	printf("\t  subnqn      Subsystem NQN (default: %s)\n", SPDK_NVMF_DISCOVERY_NQN);
-	printf("\t  ns          NVMe namespace ID (all active namespaces are used by default)\n");
 	printf("\t  hostnqn     Host NQN\n");
 	printf("\t Example: -r 'trtype:PCIe traddr:0000:04:00.0' for PCIe or\n");
 	printf("\t          -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.100.8 trsvcid:4420' for NVMeoF\n");
-	printf("\t Note: can be specified multiple times to test multiple disks/targets.\n");
 	printf("\t[-e metadata configuration]\n");
 	printf("\t Keys:\n");
 	printf("\t  PRACT      Protection Information Action bit (PRACT=1 or PRACT=0)\n");
@@ -1642,7 +1588,6 @@ static void usage(char *program_name)
 	printf("\t[-A IO buffer alignment. Must be power of 2 and not less than cache line (%u)]\n",
 	       SPDK_CACHE_LINE_SIZE);
 	printf("\t[-S set the default sock impl, e.g. \"posix\"]\n");
-	printf("\t[-m display real-time overall cpu usage on used cores]\n");
 #ifdef SPDK_CONFIG_URING
 	printf("\t[-R enable using liburing to drive kernel devices (Default: libaio)]\n");
 #endif
@@ -1723,7 +1668,7 @@ print_performance(void)
 	TAILQ_FOREACH(worker, &g_workers, link) {
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 			if (ns_ctx->stats.io_completed != 0) {
-				io_per_second = (double)ns_ctx->stats.io_completed * 1000 * 1000 / g_elapsed_time_in_usec;
+				io_per_second = (double)ns_ctx->stats.io_completed / g_time_in_sec;
 				mb_per_second = io_per_second * g_io_size_bytes / (1024 * 1024);
 				average_latency = ((double)ns_ctx->stats.total_tsc / ns_ctx->stats.io_completed) * 1000 * 1000 /
 						  g_tsc_rate;
@@ -2075,7 +2020,7 @@ parse_args(int argc, char **argv)
 	int rc;
 
 	while ((op = getopt(argc, argv,
-			    "a:b:c:e:gi:lmo:q:r:k:s:t:w:z:A:C:DGHILM:NO:P:Q:RS:T:U:VZ:")) != -1) {
+			    "a:b:c:e:gi:lo:q:r:k:s:t:w:z:A:C:DGHILM:NO:P:Q:RS:T:U:VZ:")) != -1) {
 		switch (op) {
 		case 'a':
 		case 'A':
@@ -2169,9 +2114,6 @@ parse_args(int argc, char **argv)
 			break;
 		case 'l':
 			g_latency_ssd_tracking_enable = true;
-			break;
-		case 'm':
-			g_monitor_perf_cores = true;
 			break;
 		case 'r':
 			if (add_trid(optarg)) {

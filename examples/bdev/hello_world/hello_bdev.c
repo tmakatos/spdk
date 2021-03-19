@@ -38,6 +38,7 @@
 #include "spdk/event.h"
 #include "spdk/log.h"
 #include "spdk/string.h"
+#include "spdk/bdev_module.h"
 
 static char *g_bdev_name = "Malloc0";
 

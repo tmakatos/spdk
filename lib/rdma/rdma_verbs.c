@@ -60,18 +60,6 @@ spdk_rdma_qp_create(struct rdma_cm_id *cm_id, struct spdk_rdma_qp_init_attr *qp_
 		return NULL;
 	}
 
-	if (qp_attr->stats) {
-		spdk_rdma_qp->stats = qp_attr->stats;
-		spdk_rdma_qp->shared_stats = true;
-	} else {
-		spdk_rdma_qp->stats = calloc(1, sizeof(*spdk_rdma_qp->stats));
-		if (!spdk_rdma_qp->stats) {
-			SPDK_ERRLOG("qp statistics memory allocation failed\n");
-			free(spdk_rdma_qp);
-			return NULL;
-		}
-	}
-
 	rc = rdma_create_qp(cm_id, qp_attr->pd, &attr);
 	if (rc) {
 		SPDK_ERRLOG("Failed to create qp, errno %s (%d)\n", spdk_strerror(errno), errno);
@@ -115,10 +103,6 @@ spdk_rdma_qp_destroy(struct spdk_rdma_qp *spdk_rdma_qp)
 		rdma_destroy_qp(spdk_rdma_qp->cm_id);
 	}
 
-	if (!spdk_rdma_qp->shared_stats) {
-		free(spdk_rdma_qp->stats);
-	}
-
 	free(spdk_rdma_qp);
 }
 
@@ -153,11 +137,9 @@ spdk_rdma_qp_queue_send_wrs(struct spdk_rdma_qp *spdk_rdma_qp, struct ibv_send_w
 	assert(spdk_rdma_qp);
 	assert(first);
 
-	spdk_rdma_qp->stats->send.num_submitted_wrs++;
 	last = first;
 	while (last->next != NULL) {
 		last = last->next;
-		spdk_rdma_qp->stats->send.num_submitted_wrs++;
 	}
 
 	if (spdk_rdma_qp->send_wrs.first == NULL) {
@@ -186,7 +168,6 @@ spdk_rdma_qp_flush_send_wrs(struct spdk_rdma_qp *spdk_rdma_qp, struct ibv_send_w
 	rc = ibv_post_send(spdk_rdma_qp->qp, spdk_rdma_qp->send_wrs.first, bad_wr);
 
 	spdk_rdma_qp->send_wrs.first = NULL;
-	spdk_rdma_qp->stats->send.doorbell_updates++;
 
 	return rc;
 }

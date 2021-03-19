@@ -102,7 +102,7 @@ static struct spdk_sock_impl_opts g_spdk_uring_sock_impl_opts = {
 	.send_buf_size = MIN_SO_SNDBUF_SIZE,
 	.enable_recv_pipe = true,
 	.enable_quickack = false,
-	.enable_placement_id = 0,
+	.enable_placement_id = false,
 };
 
 #define SPDK_URING_SOCK_REQUEST_IOV(req) ((struct iovec *)((uint8_t *)req + sizeof(struct spdk_sock_request)))
@@ -585,20 +585,19 @@ static int
 uring_sock_close(struct spdk_sock *_sock)
 {
 	struct spdk_uring_sock *sock = __uring_sock(_sock);
+	int rc;
 
 	assert(TAILQ_EMPTY(&_sock->pending_reqs));
 	assert(sock->group == NULL);
 
-	/* If the socket fails to close, the best choice is to
-	 * leak the fd but continue to free the rest of the sock
-	 * memory. */
-	close(sock->fd);
-
 	spdk_pipe_destroy(sock->recv_pipe);
 	free(sock->recv_buf);
-	free(sock);
+	rc = close(sock->fd);
+	if (rc == 0) {
+		free(sock);
+	}
 
-	return 0;
+	return rc;
 }
 
 static ssize_t
@@ -920,14 +919,6 @@ sock_uring_group_reap(struct spdk_uring_sock_group_impl *group, int max, int max
 			break;
 		}
 
-		/* If the socket's cb_fn is NULL, just remove it from
-		 * the list and do not add it to socks array */
-		if (spdk_unlikely(sock->base.cb_fn == NULL)) {
-			sock->pending_recv = false;
-			TAILQ_REMOVE(&group->pending_recv, sock, link);
-			continue;
-		}
-
 		socks[count++] = &sock->base;
 	}
 
@@ -1098,34 +1089,16 @@ uring_sock_get_placement_id(struct spdk_sock *_sock, int *placement_id)
 		return rc;
 	}
 
-	if (g_spdk_uring_sock_impl_opts.enable_placement_id != 0) {
-		switch (g_spdk_uring_sock_impl_opts.enable_placement_id) {
-		case 1: {
 #if defined(SO_INCOMING_NAPI_ID)
-			struct spdk_uring_sock *sock = __uring_sock(_sock);
-			socklen_t len = sizeof(int);
+	struct spdk_uring_sock *sock = __uring_sock(_sock);
+	socklen_t salen = sizeof(int);
 
-			rc = getsockopt(sock->fd, SOL_SOCKET, SO_INCOMING_NAPI_ID, placement_id, &len);
-#endif
-			break;
-		}
-		case 2: {
-#if defined(SO_INCOMING_CPU)
-			struct spdk_uring_sock *sock = __uring_sock(_sock);
-			socklen_t len = sizeof(int);
-
-			rc = getsockopt(sock->fd, SOL_SOCKET, SO_INCOMING_CPU, placement_id, &len);
-#endif
-			break;
-		}
-		default:
-			break;
-		}
-	}
-
+	rc = getsockopt(sock->fd, SOL_SOCKET, SO_INCOMING_NAPI_ID, placement_id, &salen);
 	if (rc != 0) {
 		SPDK_ERRLOG("getsockopt() failed (errno=%d)\n", errno);
 	}
+
+#endif
 	return rc;
 }
 

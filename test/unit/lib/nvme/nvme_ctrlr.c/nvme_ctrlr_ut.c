@@ -1262,6 +1262,8 @@ setup_qpairs(struct spdk_nvme_ctrlr *ctrlr, uint32_t num_io_queues)
 {
 	uint32_t i;
 
+	CU_ASSERT(pthread_mutex_init(&ctrlr->ctrlr_lock, NULL) == 0);
+
 	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(ctrlr) == 0);
 
 	ctrlr->page_size = 0x1000;
@@ -1485,8 +1487,6 @@ test_spdk_nvme_ctrlr_reconnect_io_qpair(void)
 	struct spdk_nvme_qpair	qpair = {};
 	int rc;
 
-	CU_ASSERT(pthread_mutex_init(&ctrlr.ctrlr_lock, NULL) == 0);
-
 	/* Various states of controller disconnect. */
 	qpair.id = 1;
 	qpair.ctrlr = &ctrlr;
@@ -1533,8 +1533,6 @@ test_spdk_nvme_ctrlr_reconnect_io_qpair(void)
 	rc = spdk_nvme_ctrlr_reconnect_io_qpair(&qpair);
 	CU_ASSERT(g_connect_qpair_called == true);
 	CU_ASSERT(rc == 0)
-
-	CU_ASSERT(pthread_mutex_destroy(&ctrlr.ctrlr_lock) == 0);
 }
 
 static void
@@ -1742,8 +1740,6 @@ test_spdk_nvme_ctrlr_update_firmware(void)
 	struct spdk_nvme_status status;
 	enum spdk_nvme_fw_commit_action commit_action = SPDK_NVME_FW_COMMIT_REPLACE_IMG;
 
-	CU_ASSERT(pthread_mutex_init(&ctrlr.ctrlr_lock, NULL) == 0);
-
 	/* Set invalid size check function return value */
 	set_size = 5;
 	ret = spdk_nvme_ctrlr_update_firmware(&ctrlr, payload, set_size, slot, commit_action, &status);
@@ -1812,7 +1808,6 @@ test_spdk_nvme_ctrlr_update_firmware(void)
 	g_failed_status = NULL;
 	g_wait_for_completion_return_val = 0;
 
-	CU_ASSERT(pthread_mutex_destroy(&ctrlr.ctrlr_lock) == 0);
 	set_status_cpl = 0;
 }
 
@@ -1845,14 +1840,11 @@ test_nvme_ctrlr_test_active_ns(void)
 {
 	uint32_t		nsid, minor;
 	size_t			ns_id_count;
-	struct spdk_nvme_ctrlr	ctrlr = {};
+	struct spdk_nvme_ctrlr	ctrlr = {.state = NVME_CTRLR_STATE_READY};
 
 	ctrlr.page_size = 0x1000;
 
 	for (minor = 0; minor <= 2; minor++) {
-		SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
-		ctrlr.state = NVME_CTRLR_STATE_READY;
-
 		ctrlr.vs.bits.mjr = 1;
 		ctrlr.vs.bits.mnr = minor;
 		ctrlr.vs.bits.ter = 0;
@@ -1991,8 +1983,6 @@ test_spdk_nvme_ctrlr_set_trid(void)
 	struct spdk_nvme_ctrlr	ctrlr = {0};
 	struct spdk_nvme_transport_id	new_trid = {{0}};
 
-	CU_ASSERT(pthread_mutex_init(&ctrlr.ctrlr_lock, NULL) == 0);
-
 	ctrlr.is_failed = false;
 	ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
 	snprintf(ctrlr.trid.subnqn, SPDK_NVMF_NQN_MAX_LEN, "%s", "nqn.2016-06.io.spdk:cnode1");
@@ -2017,8 +2007,6 @@ test_spdk_nvme_ctrlr_set_trid(void)
 	CU_ASSERT(spdk_nvme_ctrlr_set_trid(&ctrlr, &new_trid) == 0);
 	CU_ASSERT(strncmp(ctrlr.trid.traddr, "192.168.100.9", SPDK_NVMF_TRADDR_MAX_LEN) == 0);
 	CU_ASSERT(strncmp(ctrlr.trid.trsvcid, "4421", SPDK_NVMF_TRSVCID_MAX_LEN) == 0);
-
-	CU_ASSERT(pthread_mutex_destroy(&ctrlr.ctrlr_lock) == 0);
 }
 
 static void
@@ -2030,7 +2018,6 @@ test_nvme_ctrlr_init_set_nvmf_ioccsz(void)
 	ctrlr.cdata.nvmf_specific.icdoff = 1;
 
 	/* Check PCI trtype, */
-	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
 	ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_PCIE;
 
 	ctrlr.state = NVME_CTRLR_STATE_IDENTIFY;
@@ -2047,7 +2034,6 @@ test_nvme_ctrlr_init_set_nvmf_ioccsz(void)
 	nvme_ctrlr_destruct(&ctrlr);
 
 	/* Check RDMA trtype, */
-	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
 	ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
 
 	ctrlr.state = NVME_CTRLR_STATE_IDENTIFY;
@@ -2066,7 +2052,6 @@ test_nvme_ctrlr_init_set_nvmf_ioccsz(void)
 	nvme_ctrlr_destruct(&ctrlr);
 
 	/* Check TCP trtype, */
-	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
 	ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_TCP;
 
 	ctrlr.state = NVME_CTRLR_STATE_IDENTIFY;
@@ -2085,7 +2070,6 @@ test_nvme_ctrlr_init_set_nvmf_ioccsz(void)
 	nvme_ctrlr_destruct(&ctrlr);
 
 	/* Check FC trtype, */
-	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
 	ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_FC;
 
 	ctrlr.state = NVME_CTRLR_STATE_IDENTIFY;
@@ -2104,7 +2088,6 @@ test_nvme_ctrlr_init_set_nvmf_ioccsz(void)
 	nvme_ctrlr_destruct(&ctrlr);
 
 	/* Check CUSTOM trtype, */
-	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
 	ctrlr.trid.trtype = SPDK_NVME_TRANSPORT_CUSTOM;
 
 	ctrlr.state = NVME_CTRLR_STATE_IDENTIFY;
@@ -2125,8 +2108,6 @@ static void
 test_nvme_ctrlr_init_set_num_queues(void)
 {
 	DECLARE_AND_CONSTRUCT_CTRLR();
-
-	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
 
 	ctrlr.state = NVME_CTRLR_STATE_IDENTIFY;
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0); /* -> SET_IDENTIFY_IOCS_SPECIFIC */
@@ -2149,8 +2130,6 @@ static void
 test_nvme_ctrlr_init_set_keep_alive_timeout(void)
 {
 	DECLARE_AND_CONSTRUCT_CTRLR();
-
-	SPDK_CU_ASSERT_FATAL(nvme_ctrlr_construct(&ctrlr) == 0);
 
 	ctrlr.opts.keep_alive_timeout_ms = 60000;
 	ctrlr.cdata.kas = 1;

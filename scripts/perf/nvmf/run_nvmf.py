@@ -4,32 +4,28 @@ import os
 import re
 import sys
 import json
+import paramiko
 import zipfile
 import threading
 import subprocess
 import itertools
 import time
 import uuid
-from collections import OrderedDict
-
-import paramiko
-import pandas as pd
-
 import rpc
 import rpc.client
+import pandas as pd
+from collections import OrderedDict
 from common import *
 
 
 class Server:
-    def __init__(self, name, username, password, mode, nic_ips, transport, remote_nic_ips=None):
+    def __init__(self, name, username, password, mode, nic_ips, transport):
         self.name = name
         self.mode = mode
         self.username = username
         self.password = password
         self.nic_ips = nic_ips
-        self.remote_nic_ips = remote_nic_ips
         self.transport = transport.lower()
-        self._nics_json_obj = {}
 
         if not re.match("^[A-Za-z0-9]*$", name):
             self.log_print("Please use a name which contains only letters or numbers")
@@ -39,16 +35,7 @@ class Server:
         print("[%s] %s" % (self.name, msg), flush=True)
 
     def get_uncommented_lines(self, lines):
-        return [line for line in lines if line and not line.startswith('#')]
-
-    def get_nic_name_by_ip(self, ip):
-        if not self._nics_json_obj:
-            nics_json_obj = self.exec_cmd(["ip", "-j", "address", "show"])
-            self._nics_json_obj = list(filter(lambda x: x["addr_info"], json.loads(nics_json_obj)))
-        for nic in self._nics_json_obj:
-            for addr in nic["addr_info"]:
-                if ip in addr["local"]:
-                    return nic["ifname"]
+        return [l for l in lines if l and not l.startswith('#')]
 
 
 class Target(Server):
@@ -65,7 +52,6 @@ class Target(Server):
         self.enable_dpdk_memory = False
         self.enable_zcopy = False
         self.scheduler_name = scheduler_settings
-        self._nics_json_obj = json.loads(check_output(["ip", "-j", "address", "show"]))
 
         if sar_settings:
             self.enable_sar, self.sar_delay, self.sar_interval, self.sar_count = sar_settings
@@ -331,11 +317,11 @@ class Target(Server):
 
 
 class Initiator(Server):
-    def __init__(self, name, username, password, mode, nic_ips, ip, remote_nic_ips, transport="rdma", cpu_frequency=None,
+    def __init__(self, name, username, password, mode, nic_ips, ip, transport="rdma", cpu_frequency=None,
                  nvmecli_bin="nvme", workspace="/tmp/spdk", cpus_allowed=None,
                  cpus_allowed_policy="shared", fio_bin="/usr/src/fio/fio"):
 
-        super(Initiator, self).__init__(name, username, password, mode, nic_ips, transport, remote_nic_ips)
+        super(Initiator, self).__init__(name, username, password, mode, nic_ips, transport)
 
         self.ip = ip
         self.spdk_dir = workspace
@@ -351,7 +337,6 @@ class Initiator(Server):
         self.ssh_connection.connect(self.ip, username=self.username, password=self.password)
         self.remote_call("sudo rm -rf %s/nvmf_perf" % self.spdk_dir)
         self.remote_call("mkdir -p %s" % self.spdk_dir)
-        self._nics_json_obj = json.loads(self.remote_call("ip -j address show")[0])
         self.set_cpu_frequency()
         self.sys_config()
 
@@ -441,7 +426,7 @@ ramp_time={ramp_time}
 runtime={run_time}
 """
         if "spdk" in self.mode:
-            subsystems = self.discover_subsystems(self.remote_nic_ips, subsys_no)
+            subsystems = self.discover_subsystems(self.nic_ips, subsys_no)
             bdev_conf = self.gen_spdk_bdev_conf(subsystems)
             self.remote_call("echo '%s' > %s/bdev.conf" % (bdev_conf, self.spdk_dir))
             ioengine = "%s/build/fio/spdk_bdev" % self.spdk_dir
@@ -660,11 +645,11 @@ class SPDKTarget(Target):
         rpc.client.print_dict(rpc.nvmf.nvmf_get_transports(self.client))
 
         if self.null_block:
-            self.spdk_tgt_add_nullblock(self.null_block)
-            self.spdk_tgt_add_subsystem_conf(self.nic_ips, self.null_block)
+            nvme_section = self.spdk_tgt_add_nullblock(self.null_block)
+            subsystems_section = self.spdk_tgt_add_subsystem_conf(self.nic_ips, self.null_block)
         else:
-            self.spdk_tgt_add_nvme_conf()
-            self.spdk_tgt_add_subsystem_conf(self.nic_ips)
+            nvme_section = self.spdk_tgt_add_nvme_conf()
+            subsystems_section = self.spdk_tgt_add_subsystem_conf(self.nic_ips)
         self.log_print("Done configuring SPDK NVMeOF Target")
 
     def spdk_tgt_add_nullblock(self, null_block_count):
@@ -776,16 +761,16 @@ class SPDKTarget(Target):
 
 
 class KernelInitiator(Initiator):
-    def __init__(self, name, username, password, mode, nic_ips, remote_nic_ips, ip, transport,
+    def __init__(self, name, username, password, mode, nic_ips, ip, transport,
                  cpus_allowed=None, cpus_allowed_policy="shared",
                  cpu_frequency=None, fio_bin="/usr/src/fio/fio", **kwargs):
 
-        super(KernelInitiator, self).__init__(name, username, password, mode, nic_ips, ip, remote_nic_ips, transport,
+        super(KernelInitiator, self).__init__(name, username, password, mode, nic_ips, ip, transport,
                                               cpus_allowed=cpus_allowed, cpus_allowed_policy=cpus_allowed_policy,
                                               cpu_frequency=cpu_frequency, fio_bin=fio_bin)
 
         self.extra_params = ""
-        if "extra_params" in kwargs.keys():
+        if kwargs["extra_params"]:
             self.extra_params = kwargs["extra_params"]
 
     def __del__(self):
@@ -837,10 +822,10 @@ class KernelInitiator(Initiator):
 
 
 class SPDKInitiator(Initiator):
-    def __init__(self, name, username, password, mode, nic_ips, remote_nic_ips, ip, transport="rdma",
+    def __init__(self, name, username, password, mode, nic_ips, ip, transport="rdma",
                  num_cores=1, cpus_allowed=None, cpus_allowed_policy="shared",
                  cpu_frequency=None, fio_bin="/usr/src/fio/fio", **kwargs):
-        super(SPDKInitiator, self).__init__(name, username, password, mode, nic_ips, ip, remote_nic_ips, transport,
+        super(SPDKInitiator, self).__init__(name, username, password, mode, nic_ips, ip, transport,
                                             cpus_allowed=cpus_allowed, cpus_allowed_policy=cpus_allowed_policy,
                                             cpu_frequency=cpu_frequency, fio_bin=fio_bin)
 
@@ -982,7 +967,7 @@ if __name__ == "__main__":
         configs = []
         for i in initiators:
             if i.mode == "kernel":
-                i.kernel_init_connect(i.remote_nic_ips, target_obj.subsys_no)
+                i.kernel_init_connect(i.nic_ips, target_obj.subsys_no)
 
             cfg = i.gen_fio_config(rw, fio_rw_mix_read, block_size, io_depth, target_obj.subsys_no,
                                    fio_num_jobs, fio_ramp_time, fio_run_time)

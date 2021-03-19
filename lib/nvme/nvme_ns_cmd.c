@@ -62,27 +62,19 @@ nvme_ns_check_request_length(uint32_t lba_count, uint32_t sectors_per_max_io,
 	return child_per_io >= qdepth;
 }
 
-static inline bool
-_nvme_md_excluded_from_xfer(struct spdk_nvme_ns *ns, uint32_t io_flags)
-{
-	return (io_flags & SPDK_NVME_IO_FLAGS_PRACT) &&
-	       (ns->flags & SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED) &&
-	       (ns->flags & SPDK_NVME_NS_DPS_PI_SUPPORTED) &&
-	       (ns->md_size == 8);
-}
-
 static inline uint32_t
 _nvme_get_host_buffer_sector_size(struct spdk_nvme_ns *ns, uint32_t io_flags)
 {
-	return _nvme_md_excluded_from_xfer(ns, io_flags) ?
-	       ns->sector_size : ns->extended_lba_size;
-}
+	uint32_t sector_size = ns->extended_lba_size;
 
-static inline uint32_t
-_nvme_get_sectors_per_max_io(struct spdk_nvme_ns *ns, uint32_t io_flags)
-{
-	return _nvme_md_excluded_from_xfer(ns, io_flags) ?
-	       ns->sectors_per_max_io_no_md : ns->sectors_per_max_io;
+	if ((io_flags & SPDK_NVME_IO_FLAGS_PRACT) &&
+	    (ns->flags & SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED) &&
+	    (ns->flags & SPDK_NVME_NS_DPS_PI_SUPPORTED) &&
+	    (ns->md_size == 8)) {
+		sector_size -= 8;
+	}
+
+	return sector_size;
 }
 
 static struct nvme_request *
@@ -253,13 +245,13 @@ _nvme_ns_cmd_split_request_prp(struct spdk_nvme_ns *ns,
 			req_current_length += sge_length;
 			if (req_current_length < req->payload_size) {
 				next_sge_fn(sgl_cb_arg, (void **)&address, &sge_length);
-				/*
-				 * If the next SGE is not page aligned, we will need to create a
-				 *  child request for what we have so far, and then start a new
-				 *  child request for the next SGE.
-				 */
-				start_valid = _is_page_aligned(address, page_size);
 			}
+			/*
+			 * If the next SGE is not page aligned, we will need to create a child
+			 *  request for what we have so far, and then start a new child request for
+			 *  the next SGE.
+			 */
+			start_valid = _is_page_aligned(address, page_size);
 		}
 
 		if (start_valid && end_valid && !last_sge) {
@@ -401,7 +393,7 @@ _nvme_ns_cmd_rw(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 {
 	struct nvme_request	*req;
 	uint32_t		sector_size = _nvme_get_host_buffer_sector_size(ns, io_flags);
-	uint32_t		sectors_per_max_io = _nvme_get_sectors_per_max_io(ns, io_flags);
+	uint32_t		sectors_per_max_io = ns->sectors_per_max_io;
 	uint32_t		sectors_per_stripe = ns->sectors_per_stripe;
 
 	req = nvme_allocate_request(qpair, payload, lba_count * sector_size, lba_count * ns->md_size,
@@ -416,12 +408,8 @@ _nvme_ns_cmd_rw(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 	/* Zone append commands cannot be split. */
 	if (opc == SPDK_NVME_OPC_ZONE_APPEND) {
 		assert(ns->csi == SPDK_NVME_CSI_ZNS);
-		/*
-		 * As long as we disable driver-assisted striping for Zone append commands,
-		 * _nvme_ns_cmd_rw() should never cause a proper request to be split.
-		 * If a request is split, after all, error handling is done in caller functions.
-		 */
-		sectors_per_stripe = 0;
+		_nvme_ns_cmd_setup_request(ns, req, opc, lba, lba_count, io_flags, apptag_mask, apptag);
+		return req;
 	}
 
 	/*
@@ -796,77 +784,6 @@ nvme_ns_cmd_zone_append_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair 
 			      SPDK_NVME_OPC_ZONE_APPEND,
 			      io_flags, apptag_mask, apptag, false);
 	if (req != NULL) {
-		/*
-		 * Zone append commands cannot be split (num_children has to be 0).
-		 * For NVME_PAYLOAD_TYPE_CONTIG, _nvme_ns_cmd_rw() should never cause a split
-		 * to happen, since a too large request would have already been failed by
-		 * nvme_ns_cmd_check_zone_append(), since zasl <= mdts.
-		 */
-		assert(req->num_children == 0);
-		if (req->num_children) {
-			nvme_request_free_children(req);
-			nvme_free_request(req);
-			return -EINVAL;
-		}
-		return nvme_qpair_submit_request(qpair, req);
-	} else if (nvme_ns_check_request_length(lba_count,
-						ns->sectors_per_max_io,
-						ns->sectors_per_stripe,
-						qpair->ctrlr->opts.io_queue_requests)) {
-		return -EINVAL;
-	} else {
-		return -ENOMEM;
-	}
-}
-
-int
-nvme_ns_cmd_zone_appendv_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
-				 uint64_t zslba, uint32_t lba_count,
-				 spdk_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t io_flags,
-				 spdk_nvme_req_reset_sgl_cb reset_sgl_fn,
-				 spdk_nvme_req_next_sge_cb next_sge_fn, void *metadata,
-				 uint16_t apptag_mask, uint16_t apptag)
-{
-	struct nvme_request *req;
-	struct nvme_payload payload;
-	int ret;
-
-	if (!_is_io_flags_valid(io_flags)) {
-		return -EINVAL;
-	}
-
-	if (reset_sgl_fn == NULL || next_sge_fn == NULL) {
-		return -EINVAL;
-	}
-
-	ret = nvme_ns_cmd_check_zone_append(ns, lba_count, io_flags);
-	if (ret) {
-		return ret;
-	}
-
-	payload = NVME_PAYLOAD_SGL(reset_sgl_fn, next_sge_fn, cb_arg, metadata);
-
-	req = _nvme_ns_cmd_rw(ns, qpair, &payload, 0, 0, zslba, lba_count, cb_fn, cb_arg,
-			      SPDK_NVME_OPC_ZONE_APPEND,
-			      io_flags, apptag_mask, apptag, true);
-	if (req != NULL) {
-		/*
-		 * Zone append commands cannot be split (num_children has to be 0).
-		 * For NVME_PAYLOAD_TYPE_SGL, _nvme_ns_cmd_rw() can cause a split.
-		 * However, _nvme_ns_cmd_split_request_sgl() and _nvme_ns_cmd_split_request_prp()
-		 * do not always cause a request to be split. These functions verify payload size,
-		 * verify num sge < max_sge, and verify SGE alignment rules (in case of PRPs).
-		 * If any of the verifications fail, they will split the request.
-		 * In our case, a split is very unlikely, since we already verified the size using
-		 * nvme_ns_cmd_check_zone_append(), however, we still need to call these functions
-		 * in order to perform the verification part. If they do cause a split, we return
-		 * an error here. For proper requests, these functions will never cause a split.
-		 */
-		if (req->num_children) {
-			nvme_request_free_children(req);
-			nvme_free_request(req);
-			return -EINVAL;
-		}
 		return nvme_qpair_submit_request(qpair, req);
 	} else if (nvme_ns_check_request_length(lba_count,
 						ns->sectors_per_max_io,
