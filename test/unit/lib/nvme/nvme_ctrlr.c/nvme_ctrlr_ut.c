@@ -2394,7 +2394,7 @@ test_nvme_ctrlr_add_remove_process(void)
 }
 
 static void *
-gpa_to_vva(void *prv, uint64_t addr, uint64_t len)
+gpa_to_vva(void *prv, uint64_t addr, uint64_t len, int prot)
 {
 	return (void *)(uintptr_t)addr;
 }

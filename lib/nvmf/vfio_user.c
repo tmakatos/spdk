@@ -386,7 +386,8 @@ max_queue_size(struct nvmf_vfio_user_ctrlr const *ctrlr)
 }
 
 static void *
-map_one(vfu_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec *iov)
+map_one(vfu_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg,
+	struct iovec *iov, int prot)
 {
 	int ret;
 
@@ -394,7 +395,7 @@ map_one(vfu_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg, struct iovec 
 	assert(sg != NULL);
 	assert(iov != NULL);
 
-	ret = vfu_addr_to_sg(ctx, (void *)(uintptr_t)addr, len, sg, 1, PROT_READ | PROT_WRITE);
+	ret = vfu_addr_to_sg(ctx, (void *)(uintptr_t)addr, len, sg, 1, prot);
 	if (ret < 0) {
 		return NULL;
 	}
@@ -440,7 +441,8 @@ asq_map(struct nvmf_vfio_user_ctrlr *ctrlr)
 	sq->head = ctrlr->doorbells[0] = 0;
 	sq->cqid = 0;
 	sq->addr = map_one(ctrlr->endpoint->vfu_ctx, regs->asq,
-			   sq->size * sizeof(struct spdk_nvme_cmd), sq->sg, &sq->iov);
+			   sq->size * sizeof(struct spdk_nvme_cmd), sq->sg,
+			   &sq->iov, PROT_READ | PROT_WRITE);
 	if (sq->addr == NULL) {
 		return -1;
 	}
@@ -516,7 +518,8 @@ acq_map(struct nvmf_vfio_user_ctrlr *ctrlr)
 	cq->size = regs->aqa.bits.acqs + 1;
 	cq->tail = 0;
 	cq->addr = map_one(ctrlr->endpoint->vfu_ctx, regs->acq,
-			   cq->size * sizeof(struct spdk_nvme_cpl), cq->sg, &cq->iov);
+			   cq->size * sizeof(struct spdk_nvme_cpl), cq->sg,
+			   &cq->iov, PROT_READ | PROT_WRITE);
 	if (cq->addr == NULL) {
 		return -1;
 	}
@@ -535,7 +538,7 @@ vu_req_to_sg_t(struct nvmf_vfio_user_req *vu_req, uint32_t iovcnt)
 }
 
 static void *
-_map_one(void *prv, uint64_t addr, uint64_t len)
+_map_one(void *prv, uint64_t addr, uint64_t len, int prot)
 {
 	struct spdk_nvmf_request *req = (struct spdk_nvmf_request *)prv;
 	struct spdk_nvmf_qpair *qpair;
@@ -551,7 +554,7 @@ _map_one(void *prv, uint64_t addr, uint64_t len)
 	assert(vu_req->iovcnt < NVMF_VFIO_USER_MAX_IOVECS);
 	ret = map_one(vu_qpair->ctrlr->endpoint->vfu_ctx, addr, len,
 		      vu_req_to_sg_t(vu_req, vu_req->iovcnt),
-		      &vu_req->iov[vu_req->iovcnt]);
+		      &vu_req->iov[vu_req->iovcnt], prot);
 	if (spdk_likely(ret != NULL)) {
 		vu_req->iovcnt++;
 	}
@@ -919,7 +922,8 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 	io_q->is_cq = is_cq;
 	io_q->size = qsize;
 	io_q->addr = map_one(ctrlr->endpoint->vfu_ctx, cmd->dptr.prp.prp1,
-			     io_q->size * entry_size, io_q->sg, &io_q->iov);
+			     io_q->size * entry_size, io_q->sg, &io_q->iov,
+			     PROT_READ | PROT_READ);
 	if (io_q->addr == NULL) {
 		sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		SPDK_ERRLOG("%s: failed to map I/O queue: %m\n", ctrlr_id(ctrlr));
@@ -1178,13 +1182,15 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 			struct nvme_q *sq = &qpair->sq;
 			struct nvme_q *cq = &qpair->cq;
 
-			sq->addr = map_one(ctrlr->endpoint->vfu_ctx, sq->prp1, sq->size * 64, sq->sg, &sq->iov);
+			sq->addr = map_one(ctrlr->endpoint->vfu_ctx, sq->prp1, sq->size * 64, sq->sg, &sq->iov,
+					   PROT_READ | PROT_WRITE);
 			if (!sq->addr) {
 				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap SQID %d %#lx-%#lx\n",
 					      i, sq->prp1, sq->prp1 + sq->size * 64);
 				continue;
 			}
-			cq->addr = map_one(ctrlr->endpoint->vfu_ctx, cq->prp1, cq->size * 16, cq->sg, &cq->iov);
+			cq->addr = map_one(ctrlr->endpoint->vfu_ctx, cq->prp1, cq->size * 16, cq->sg, &cq->iov,
+					   PROT_READ | PROT_WRITE);
 			if (!cq->addr) {
 				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap CQID %d %#lx-%#lx\n",
 					      i, cq->prp1, cq->prp1 + cq->size * 16);
