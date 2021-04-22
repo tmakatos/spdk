@@ -283,7 +283,7 @@ spdk_nvmf_subsystem_create(struct spdk_nvmf_tgt *tgt,
 	subsystem->id = sid;
 	subsystem->subtype = type;
 	subsystem->max_nsid = num_ns;
-	subsystem->next_cntlid = 0;
+	subsystem->next_cntlid = 123;
 	snprintf(subsystem->subnqn, sizeof(subsystem->subnqn), "%s", nqn);
 	pthread_mutex_init(&subsystem->mutex, NULL);
 	TAILQ_INIT(&subsystem->listeners);
