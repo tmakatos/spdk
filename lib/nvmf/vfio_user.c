@@ -213,6 +213,9 @@ struct nvmf_vfio_user_endpoint {
 	int					fd;
 	volatile uint32_t			*doorbells;
 
+	int					migr_fd;
+	void					*migr_data;
+
 	struct spdk_nvme_transport_id		trid;
 	const struct spdk_nvmf_subsystem	*subsystem;
 
@@ -315,6 +318,14 @@ nvmf_vfio_user_destroy_endpoint(struct nvmf_vfio_user_endpoint *endpoint)
 
 	if (endpoint->fd > 0) {
 		close(endpoint->fd);
+	}
+
+	if (endpoint->migr_data) {
+		munmap((void *)endpoint->migr_data, sizeof(struct vfio_user_nvme_state));
+	}
+
+	if (endpoint->migr_fd > 0) {
+		close(endpoint->migr_fd);
 	}
 
 	vfu_destroy_ctx(endpoint->vfu_ctx);
@@ -1668,7 +1679,7 @@ nvmf_vfio_user_listen(struct spdk_nvmf_transport *transport,
 {
 	struct nvmf_vfio_user_transport *vu_transport;
 	struct nvmf_vfio_user_endpoint *endpoint, *tmp;
-	char *path = NULL;
+	char path[PATH_MAX] = {};
 	char uuid[PATH_MAX] = {};
 	int fd;
 	int err;
@@ -1691,20 +1702,14 @@ nvmf_vfio_user_listen(struct spdk_nvmf_transport *transport,
 	endpoint->fd = -1;
 	memcpy(&endpoint->trid, trid, sizeof(endpoint->trid));
 
-	err = asprintf(&path, "%s/bar0", endpoint_id(endpoint));
-	if (err == -1) {
-		goto out;
-	}
-
+	snprintf(path, PATH_MAX, "%s/bar0", endpoint_id(endpoint));
 	fd = open(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
 	if (fd == -1) {
 		SPDK_ERRLOG("%s: failed to open device memory at %s: %m\n",
 			    endpoint_id(endpoint), path);
-		err = fd;
-		free(path);
+		err = -errno;
 		goto out;
 	}
-	free(path);
 
 	err = ftruncate(fd, NVMF_VFIO_USER_DOORBELLS_OFFSET + NVMF_VFIO_USER_DOORBELLS_SIZE);
 	if (err != 0) {
@@ -1721,8 +1726,31 @@ nvmf_vfio_user_listen(struct spdk_nvmf_transport *transport,
 
 	endpoint->fd = fd;
 
-	snprintf(uuid, PATH_MAX, "%s/cntrl", endpoint_id(endpoint));
+	snprintf(path, PATH_MAX, "%s/migr", endpoint_id(endpoint));
+	fd = open(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+	if (fd == -1) {
+		SPDK_ERRLOG("%s: failed to open device memory at %s: %m\n",
+			    endpoint_id(endpoint), path);
+		err = -errno;
+		goto out;
+	}
 
+	/* The beginning of migraton region uses MMIO access, here we leave a page for it */
+	err = ftruncate(fd, 4096 + sizeof(struct vfio_user_nvme_state));
+	if (err != 0) {
+		goto out;
+	}
+
+	endpoint->migr_data = mmap(NULL, sizeof(struct vfio_user_nvme_state),
+				   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 4096);
+	if (endpoint->migr_data == MAP_FAILED) {
+		endpoint->migr_data = NULL;
+		err = -errno;
+		goto out;
+	}
+	endpoint->migr_fd = fd;
+
+	snprintf(uuid, PATH_MAX, "%s/cntrl", endpoint_id(endpoint));
 	endpoint->vfu_ctx = vfu_create_ctx(VFU_TRANS_SOCK, uuid, LIBVFIO_USER_FLAG_ATTACH_NB,
 					   endpoint, VFU_DEV_TYPE_PCI);
 	if (endpoint->vfu_ctx == NULL) {
