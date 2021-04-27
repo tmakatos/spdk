@@ -165,6 +165,26 @@ enum nvmf_vfio_user_qpair_state {
 	VFIO_USER_QPAIR_ERROR,
 };
 
+/* Migration region, see <linux/vfio.h> */
+struct vfio_user_migration_region {
+	uint64_t last_data_offset;
+	uint64_t pending_bytes;
+};
+
+/*
+ * Controller state change when migrating:
+ *
+ * running-->stopping->stopped
+ * stopped-->resuming-->running
+ */
+enum nvmf_vfio_user_ctrlr_state {
+	VFIO_USER_CTRLR_STOPPED = 0,
+	VFIO_USER_CTRLR_RUNNING,
+	VFIO_USER_CTRLR_RESUMING,
+	VFIO_USER_CTRLR_STOPPING,
+	VFIO_USER_CTRLR_ERROR
+};
+
 struct nvmf_vfio_user_qpair {
 	struct spdk_nvmf_qpair			qpair;
 	struct spdk_nvmf_transport_poll_group	*group;
@@ -190,6 +210,8 @@ struct nvmf_vfio_user_ctrlr {
 
 	/* Number of connected queue pairs */
 	uint32_t				num_connected_qps;
+	enum nvmf_vfio_user_ctrlr_state		state;
+	struct vfio_user_migration_region	migr_reg;
 
 	struct spdk_thread			*thread;
 	struct spdk_poller			*mmio_poller;
