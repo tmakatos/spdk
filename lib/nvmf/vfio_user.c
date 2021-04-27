@@ -81,6 +81,37 @@ enum nvmf_vfio_user_req_state {
 	VFIO_USER_REQUEST_STATE_EXECUTING,
 };
 
+/* NVMe device state representative */
+struct vfio_user_nvme_sq_state {
+	uint16_t    sqid;
+	uint16_t    cqid;
+	uint32_t    head;
+	uint32_t    size;
+	uint64_t    dma_addr;
+};
+
+struct vfio_user_nvme_cq_state {
+	uint16_t    cqid;
+	uint16_t    phase;
+	uint32_t    tail;
+	uint32_t    size;
+	uint32_t    iv;
+	uint32_t    ien;
+	uint64_t    dma_addr;
+};
+
+struct vfio_user_nvme_state {
+	uint8_t config_space[PCI_CFG_SPACE_EXP_SIZE];
+	uint8_t bar0[NVME_REG_BAR0_SIZE];
+	uint8_t bar4[PAGE_SIZE];
+	uint8_t bar5[PAGE_SIZE];
+	uint32_t num_io_queues;
+	struct vfio_user_nvme_sq_state sqs[NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
+	struct vfio_user_nvme_cq_state cqs[NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR];
+	uint8_t reserved[504];
+};
+SPDK_STATIC_ASSERT(sizeof(struct vfio_user_nvme_state) == 0x8000, "Incorrect size");
+
 struct nvmf_vfio_user_req  {
 	struct spdk_nvmf_request		req;
 	struct spdk_nvme_cpl			rsp;
