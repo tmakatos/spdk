@@ -276,6 +276,9 @@ post_completion(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 		struct nvme_q *cq, uint32_t cdw0, uint16_t sc,
 		uint16_t sct);
 
+static void
+vfio_user_qpair_disconnect_cb(void *ctx);
+
 static char *
 endpoint_id(struct nvmf_vfio_user_endpoint *endpoint)
 {
@@ -1499,6 +1502,442 @@ init_pci_config_space(vfu_pci_config_space_t *p)
 	p->hdr.intr.ipin = 0x1;
 }
 
+static void
+vfio_user_ctrlr_dump_migr_data(const char *name, struct vfio_user_nvme_state *migr_data)
+{
+	struct spdk_nvme_registers *regs;
+	struct vfio_user_nvme_sq_state *sq;
+	struct vfio_user_nvme_cq_state *cq;
+	uint32_t i;
+
+	SPDK_DEBUGLOG(nvmf_vfio, "Dump %s\n", name);
+
+	regs = (struct spdk_nvme_registers *)migr_data->bar0;
+	SPDK_DEBUGLOG(nvmf_vfio, "Registers\n");
+	SPDK_DEBUGLOG(nvmf_vfio, "CSTS 0x%x\n", regs->csts.raw);
+	SPDK_DEBUGLOG(nvmf_vfio, "CAP  0x%"PRIx64"\n", regs->cap.raw);
+	SPDK_DEBUGLOG(nvmf_vfio, "VS   0x%x\n", regs->vs.raw);
+	SPDK_DEBUGLOG(nvmf_vfio, "CC   0x%x\n", regs->cc.raw);
+	SPDK_DEBUGLOG(nvmf_vfio, "AQA  0x%x\n", regs->aqa.raw);
+	SPDK_DEBUGLOG(nvmf_vfio, "ASQ  0x%"PRIx64"\n", regs->asq);
+	SPDK_DEBUGLOG(nvmf_vfio, "ACQ  0x%"PRIx64"\n", regs->acq);
+
+	SPDK_DEBUGLOG(nvmf_vfio, "Number of IO Queues %u\n", migr_data->num_io_queues);
+	for (i = 0; i <= migr_data->num_io_queues; i++) {
+		sq = &migr_data->sqs[i];
+		cq = &migr_data->cqs[i];
+
+		SPDK_DEBUGLOG(nvmf_vfio, "QID %u\n", i);
+		SPDK_DEBUGLOG(nvmf_vfio, "SQ SQID %u, CQID %u, HEAD %u, SIZE %u, DMA ADDR 0x%"PRIx64"\n",
+			      sq->sqid, sq->cqid, sq->head, sq->size, sq->dma_addr);
+		SPDK_DEBUGLOG(nvmf_vfio,
+			      "CQ CQID %u, PHASE %u, TAIL %u, SIZE %u, IV %u, IEN %u, DMA ADDR 0x%"PRIx64"\n",
+			      cq->cqid, cq->phase, cq->tail, cq->size, cq->iv, cq->ien, cq->dma_addr);
+		SPDK_DEBUGLOG(nvmf_vfio, "QID %u Done\n", i);
+	}
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s Dump Done\n", name);
+}
+
+static int
+vfio_user_ctrlr_resume(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
+{
+	struct nvmf_vfio_user_endpoint *endpoint = vu_ctrlr->endpoint;
+	struct vfio_user_nvme_state migr_data;
+	uint32_t i, qsize;
+	struct nvme_q io_q = {};
+	int ret;
+
+	memcpy(&migr_data, endpoint->migr_data, sizeof(migr_data));
+
+	vfio_user_ctrlr_dump_migr_data("RESUME", &migr_data);
+
+	/* restore PCI configuration space */
+	memcpy((void *)endpoint->pci_config_space, migr_data.config_space, PCI_CFG_SPACE_EXP_SIZE);
+
+	/* restore queue pairs */
+	for (i = 0; i <= migr_data.num_io_queues; i++) {
+		/* allocate qp */
+		if (i == 0) {
+			qsize = NVMF_VFIO_USER_DEFAULT_AQ_DEPTH;
+		} else {
+			qsize = migr_data.cqs[i].size;
+		}
+		ret = init_qp(vu_ctrlr, &vu_ctrlr->transport->transport, qsize, i);
+		if (ret) {
+			SPDK_ERRLOG("Construct cq with qid %u failed\n", i);
+			return -EFAULT;
+		}
+
+		/* restore cq */
+		memset(&io_q, 0, sizeof(io_q));
+		io_q.is_cq = true;
+		io_q.size = migr_data.cqs[i].size;
+		io_q.tail = migr_data.cqs[i].tail;
+		io_q.prp1 = migr_data.cqs[i].dma_addr;
+		io_q.ien = migr_data.cqs[i].ien;
+		io_q.iv = migr_data.cqs[i].iv;
+		io_q.addr = map_one(vu_ctrlr->endpoint->vfu_ctx, io_q.prp1, io_q.size * 16, &io_q.sg, &io_q.iov);
+		if (io_q.addr == NULL) {
+			SPDK_ERRLOG("Restore cq with qid %u PRP1 0x%"PRIx64" with size %u failed\n", i, io_q.prp1,
+				    io_q.size);
+			return -EFAULT;
+		}
+		insert_queue(vu_ctrlr, &io_q, true, i);
+
+		/* restore sq */
+		memset(&io_q, 0, sizeof(io_q));
+		io_q.size = migr_data.sqs[i].size;
+		io_q.head = migr_data.sqs[i].head;
+		io_q.prp1 = migr_data.sqs[i].dma_addr;
+		io_q.addr = map_one(vu_ctrlr->endpoint->vfu_ctx, io_q.prp1, io_q.size * 64, &io_q.sg, &io_q.iov);
+		if (io_q.addr == NULL) {
+			SPDK_ERRLOG("Restore sq with qid %u PRP1 0x%"PRIx64" with size %u failed\n", i, io_q.prp1,
+				    io_q.size);
+			return -EFAULT;
+		}
+		insert_queue(vu_ctrlr, &io_q, false, i);
+	}
+
+	return 0;
+}
+
+static void
+vfio_user_ctrlr_save(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
+{
+	struct spdk_nvmf_ctrlr *ctrlr = vu_ctrlr->ctrlr;
+	struct nvmf_vfio_user_endpoint *endpoint = vu_ctrlr->endpoint;
+	struct vfio_user_nvme_state migr_data;
+	struct spdk_nvme_registers *regs;
+	uint32_t *doorbell_base;
+	uint32_t i;
+
+	/* save PCI configuration space */
+	memcpy(migr_data.config_space, (void *)endpoint->pci_config_space, PCI_CFG_SPACE_EXP_SIZE);
+
+	regs = (struct spdk_nvme_registers *)&migr_data.bar0;
+	/* save mandarory registers */
+	regs->cap.raw = ctrlr->vcprop.cap.raw;
+	regs->vs.raw = ctrlr->vcprop.vs.raw;
+	regs->cc.raw = ctrlr->vcprop.cc.raw;
+	regs->aqa.raw = ctrlr->vcprop.aqa.raw;
+	regs->asq = ctrlr->vcprop.asq;
+	regs->acq = ctrlr->vcprop.acq;
+
+	/* save doorbells */
+	doorbell_base = (uint32_t *)&regs->doorbell[0].sq_tdbl;
+	memcpy(doorbell_base, (void *)vu_ctrlr->doorbells, 4096);
+	/* save queue pairs */
+	migr_data.num_io_queues = vu_ctrlr->num_connected_qps - 1;
+	for (i = 0; i <= migr_data.num_io_queues; i++) {
+		/* sq */
+		migr_data.sqs[i].sqid = i;
+		migr_data.sqs[i].cqid = vu_ctrlr->qp[i]->sq.cqid;
+		migr_data.sqs[i].head = vu_ctrlr->qp[i]->sq.head;
+		migr_data.sqs[i].size = vu_ctrlr->qp[i]->sq.size;
+		if (i != 0) {
+			migr_data.sqs[i].dma_addr = vu_ctrlr->qp[i]->sq.prp1;
+		} else {
+			migr_data.sqs[i].dma_addr = regs->asq;
+		}
+
+		/* cq */
+		migr_data.cqs[i].cqid = i;
+		migr_data.cqs[i].tail = vu_ctrlr->qp[i]->cq.tail;
+		migr_data.cqs[i].ien = vu_ctrlr->qp[i]->cq.ien;
+		migr_data.cqs[i].iv = vu_ctrlr->qp[i]->cq.iv;
+		migr_data.cqs[i].size = vu_ctrlr->qp[i]->cq.size;
+		if (i != 0) {
+			migr_data.cqs[i].dma_addr = vu_ctrlr->qp[i]->cq.prp1;
+		} else {
+			migr_data.cqs[i].dma_addr = regs->acq;
+		}
+	}
+
+	memcpy(endpoint->migr_data, &migr_data, sizeof(migr_data));
+
+	vfio_user_ctrlr_dump_migr_data("SAVE", &migr_data);
+}
+
+static void
+vfio_user_stop_queue_pair(void *ctx)
+{
+	struct nvmf_vfio_user_qpair *vu_qpair = ctx;
+
+	vu_qpair->state = VFIO_USER_QPAIR_INACTIVE;
+}
+
+static int
+vfio_user_ctrlr_stop_queue_qpairs(struct nvmf_vfio_user_ctrlr *ctrlr)
+{
+	uint32_t i;
+	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct spdk_nvmf_qpair *qpair;
+
+	for (i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		vu_qpair = ctrlr->qp[i];
+		if (!vu_qpair) {
+			continue;
+		}
+		qpair = &vu_qpair->qpair;
+		if (qpair->group->thread == spdk_get_thread()) {
+			vfio_user_stop_queue_pair((void *)vu_qpair);
+		} else {
+			spdk_thread_send_msg(qpair->group->thread, vfio_user_stop_queue_pair, vu_qpair);
+		}
+	}
+
+	return 0;
+}
+
+static int
+vfio_user_ctrlr_free_queue_qpairs(struct nvmf_vfio_user_ctrlr *ctrlr)
+{
+	uint32_t i;
+	struct nvmf_vfio_user_qpair *vu_qpair;
+
+	for (i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		vu_qpair = ctrlr->qp[i];
+		if (!vu_qpair) {
+			continue;
+		}
+		spdk_nvmf_qpair_disconnect(&vu_qpair->qpair, NULL, NULL);
+	}
+
+	return 0;
+}
+
+static int
+vfio_user_ctrlr_start_admin_queue(struct nvmf_vfio_user_ctrlr *ctrlr)
+{
+	uint32_t *doorbell_base;
+	struct spdk_nvme_registers *regs;
+	struct vfio_user_nvme_state *migr_data;
+	struct nvmf_vfio_user_qpair *vu_qpair;
+
+	migr_data = (struct vfio_user_nvme_state *)ctrlr->endpoint->migr_data;
+	regs = (struct spdk_nvme_registers *)migr_data->bar0;
+	doorbell_base = (uint32_t *)&regs->doorbell[0].sq_tdbl;
+
+	/* restore doorbells from saved registers */
+	memcpy((void *)ctrlr->doorbells, doorbell_base, 4096);
+
+	pthread_mutex_lock(&ctrlr->transport->lock);
+	vu_qpair = ctrlr->qp[0];
+	if (!vu_qpair) {
+		return -EINVAL;
+	}
+	TAILQ_INSERT_TAIL(&ctrlr->transport->new_qps, vu_qpair, link);
+	pthread_mutex_unlock(&ctrlr->transport->lock);
+
+	return 0;
+}
+
+static int
+vfio_user_ctrlr_start_io_queues(struct nvmf_vfio_user_ctrlr *vu_ctrlr)
+{
+	uint32_t i;
+	struct spdk_nvmf_ctrlr *ctrlr = vu_ctrlr->ctrlr;
+	struct nvmf_vfio_user_qpair *vu_qpair;
+	struct spdk_nvme_registers *regs;
+	struct vfio_user_nvme_state *migr_data;
+
+	migr_data = (struct vfio_user_nvme_state *)vu_ctrlr->endpoint->migr_data;
+	regs = (struct spdk_nvme_registers *)migr_data->bar0;
+	/* restore controller registers */
+	ctrlr->vcprop.cap.raw = regs->cap.raw;
+	ctrlr->vcprop.vs.raw = regs->vs.raw;
+	ctrlr->vcprop.cc.raw = regs->cc.raw;
+	ctrlr->vcprop.aqa.raw = regs->aqa.raw;
+	ctrlr->vcprop.asq = regs->asq;
+	ctrlr->vcprop.acq = regs->acq;
+
+	pthread_mutex_lock(&vu_ctrlr->transport->lock);
+	for (i = 1; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+		vu_qpair = vu_ctrlr->qp[i];
+		if (!vu_qpair) {
+			continue;
+		}
+		TAILQ_INSERT_TAIL(&vu_ctrlr->transport->new_qps, vu_qpair, link);
+	}
+	pthread_mutex_unlock(&vu_ctrlr->transport->lock);
+
+	return 0;
+}
+
+static int
+vfio_user_ctrlr_set_state(struct nvmf_vfio_user_ctrlr *ctrlr, enum nvmf_vfio_user_ctrlr_state state)
+{
+	if (ctrlr->state == state) {
+		return 0;
+	}
+
+	if (ctrlr->state == VFIO_USER_CTRLR_RUNNING && state == VFIO_USER_CTRLR_STOPPING) {
+		vfio_user_ctrlr_stop_queue_qpairs(ctrlr);
+		vfio_user_ctrlr_save(ctrlr);
+		ctrlr->state = VFIO_USER_CTRLR_STOPPING;
+		return 0;
+	} else if (ctrlr->state == VFIO_USER_CTRLR_RUNNING && state == VFIO_USER_CTRLR_STOPPED) {
+		vfio_user_ctrlr_save(ctrlr);
+		vfio_user_ctrlr_free_queue_qpairs(ctrlr);
+		ctrlr->state = VFIO_USER_CTRLR_STOPPED;
+		return 0;
+	} else if (ctrlr->state == VFIO_USER_CTRLR_STOPPING && state == VFIO_USER_CTRLR_STOPPED) {
+		vfio_user_ctrlr_save(ctrlr);
+		vfio_user_ctrlr_free_queue_qpairs(ctrlr);
+		ctrlr->state = VFIO_USER_CTRLR_STOPPED;
+		return 0;
+	} else if (ctrlr->state == VFIO_USER_CTRLR_STOPPED && state == VFIO_USER_CTRLR_RESUMING) {
+		ctrlr->state = VFIO_USER_CTRLR_RESUMING;
+		return 0;
+	} else if (ctrlr->state == VFIO_USER_CTRLR_RESUMING && state == VFIO_USER_CTRLR_RUNNING) {
+		ctrlr->state = VFIO_USER_CTRLR_RUNNING;
+		return 0;
+	} else {
+		SPDK_ERRLOG("Set state from %u to %u failed\n", ctrlr->state, state);
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+static int
+vfio_user_migration_device_state_transition(vfu_ctx_t *vfu_ctx, vfu_migr_state_t state)
+{
+	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
+	struct nvmf_vfio_user_ctrlr *ctrlr = endpoint->ctrlr;
+	int ret = 0;
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s controller state %u, migration state %u\n", endpoint_id(endpoint),
+		      ctrlr->state, state);
+
+	switch (state) {
+	case VFU_MIGR_STATE_STOP_AND_COPY:
+		ret = vfio_user_ctrlr_set_state(endpoint->ctrlr, VFIO_USER_CTRLR_STOPPING);
+		break;
+	case VFU_MIGR_STATE_STOP:
+		assert(ctrlr->state == VFIO_USER_CTRLR_RUNNING || ctrlr->state == VFIO_USER_CTRLR_STOPPING);
+		ret = vfio_user_ctrlr_set_state(endpoint->ctrlr, VFIO_USER_CTRLR_STOPPED);
+		break;
+	case VFU_MIGR_STATE_PRE_COPY:
+		ctrlr->migr_reg.pending_bytes = sizeof(struct vfio_user_nvme_state);
+		ctrlr->migr_reg.last_data_offset = 0;
+		break;
+	case VFU_MIGR_STATE_RESUME:
+		/* controller is in running state with ADMIN in the incoming VM */
+		if (ctrlr->state == VFIO_USER_CTRLR_RUNNING) {
+			ret = vfio_user_ctrlr_set_state(endpoint->ctrlr, VFIO_USER_CTRLR_STOPPED);
+			if (ret) {
+				break;
+			}
+			ret = vfio_user_ctrlr_set_state(endpoint->ctrlr, VFIO_USER_CTRLR_RESUMING);
+		}
+		break;
+	case VFU_MIGR_STATE_RUNNING:
+		/* first time to start up */
+		if (ctrlr->state == VFIO_USER_CTRLR_RUNNING) {
+			break;
+		}
+
+		assert(ctrlr->state == VFIO_USER_CTRLR_RESUMING);
+		assert(ctrlr->num_connected_qps == 0);
+		ret = vfio_user_ctrlr_resume(ctrlr);
+		if (ret) {
+			break;
+		}
+
+		ret = vfio_user_ctrlr_start_admin_queue(ctrlr);
+		if (ret) {
+			break;
+		}
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
+static uint64_t
+vfio_user_migration_get_pending_bytes(vfu_ctx_t *vfu_ctx)
+{
+	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
+	struct nvmf_vfio_user_ctrlr *ctrlr = endpoint->ctrlr;
+	struct vfio_user_migration_region *migr_reg = &ctrlr->migr_reg;
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s current state %u, pending bytes 0x%"PRIx64"\n", endpoint_id(endpoint),
+		      ctrlr->state, migr_reg->pending_bytes);
+
+	return migr_reg->pending_bytes;
+}
+
+static int
+vfio_user_migration_prepare_data(vfu_ctx_t *vfu_ctx, uint64_t *offset, uint64_t *size)
+{
+	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
+	struct nvmf_vfio_user_ctrlr *ctrlr = endpoint->ctrlr;
+	struct vfio_user_migration_region *migr_reg = &ctrlr->migr_reg;
+
+	if (migr_reg->last_data_offset == sizeof(struct vfio_user_nvme_state)) {
+		*offset = sizeof(struct vfio_user_nvme_state);
+		if (size) {
+			*size = 0;
+		}
+		migr_reg->pending_bytes = 0;
+	} else {
+		*offset = 0;
+		if (size) {
+			*size = sizeof(struct vfio_user_nvme_state);
+			migr_reg->last_data_offset = sizeof(struct vfio_user_nvme_state);
+		}
+	}
+
+	SPDK_DEBUGLOG(nvmf_vfio, "%s current state %u\n", endpoint_id(endpoint), ctrlr->state);
+
+	return 0;
+}
+
+static ssize_t
+vfio_user_migration_read_data(vfu_ctx_t *vfu_ctx, void *buf, uint64_t count, uint64_t offset)
+{
+	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
+	struct nvmf_vfio_user_ctrlr *ctrlr = endpoint->ctrlr;
+	struct vfio_user_migration_region *migr_reg = &ctrlr->migr_reg;
+
+	assert(count == sizeof(struct vfio_user_nvme_state));
+
+	memcpy(buf, endpoint->migr_data, count);
+	vfio_user_ctrlr_dump_migr_data("Read migration data",
+				       (struct vfio_user_nvme_state *)endpoint->migr_data);
+
+	migr_reg->pending_bytes = 0;
+
+	return 0;
+}
+
+static ssize_t
+vfio_user_migration_write_data(vfu_ctx_t *vfu_ctx, void *buf, uint64_t count, uint64_t offset)
+{
+	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
+
+	assert(count == sizeof(struct vfio_user_nvme_state));
+
+	vfio_user_ctrlr_dump_migr_data("Write migration data", (struct vfio_user_nvme_state *)buf);
+	memcpy(endpoint->migr_data, buf, count);
+
+	return 0;
+}
+
+static int
+vfio_user_migration_data_written(vfu_ctx_t *vfu_ctx, uint64_t count)
+{
+	SPDK_DEBUGLOG(nvmf_vfio, "write 0x%"PRIx64"\n", (uint64_t)count);
+
+	assert(count == sizeof(struct vfio_user_nvme_state));
+
+	return 0;
+}
+
 static int
 vfio_user_dev_info_fill(struct nvmf_vfio_user_endpoint *endpoint)
 {
@@ -1526,6 +1965,23 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_endpoint *endpoint)
 			.iov_base = (void *)NVMF_VFIO_USER_DOORBELLS_OFFSET,
 			.iov_len = NVMF_VFIO_USER_DOORBELLS_SIZE,
 		},
+	};
+
+	static struct iovec migr_sparse_mmap[] = {
+		{
+			.iov_base = (void *)4096,
+			.iov_len = sizeof(struct vfio_user_nvme_state),
+		},
+	};
+
+	const vfu_migration_callbacks_t migr_callbacks = {
+		.version = VFU_MIGR_CALLBACKS_VERS,
+		.transition = &vfio_user_migration_device_state_transition,
+		.get_pending_bytes = &vfio_user_migration_get_pending_bytes,
+		.prepare_data = &vfio_user_migration_prepare_data,
+		.read_data = &vfio_user_migration_read_data,
+		.data_written = &vfio_user_migration_data_written,
+		.write_data = &vfio_user_migration_write_data
 	};
 
 	ret = vfu_pci_init(vfu_ctx, VFU_PCI_TYPE_EXPRESS, PCI_HEADER_TYPE_NORMAL, 0);
@@ -1603,6 +2059,21 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_endpoint *endpoint)
 	ret = vfu_setup_device_nr_irqs(vfu_ctx, VFU_DEV_MSIX_IRQ, NVME_IRQ_MSIX_NUM);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup MSIX\n", vfu_ctx);
+		return ret;
+	}
+
+	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_MIGR_REGION_IDX,
+			       4096 + sizeof(struct vfio_user_nvme_state),
+			       NULL, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, migr_sparse_mmap,
+			       1, endpoint->migr_fd);
+	if (ret < 0) {
+		SPDK_ERRLOG("vfu_ctx %p failed to setup migration region\n", vfu_ctx);
+		return ret;
+	}
+
+	ret = vfu_setup_device_migration_callbacks(vfu_ctx, &migr_callbacks, 4096);
+	if (ret < 0) {
+		SPDK_ERRLOG("vfu_ctx %p failed to setup migration callbacks\n", vfu_ctx);
 		return ret;
 	}
 
@@ -2068,7 +2539,16 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 		vu_ctrlr->cntlid = vu_qpair->qpair.ctrlr->cntlid;
 		vu_ctrlr->thread = spdk_get_thread();
 		vu_ctrlr->ctrlr = vu_qpair->qpair.ctrlr;
-		vu_ctrlr->mmio_poller = SPDK_POLLER_REGISTER(vfio_user_poll_mmio, vu_ctrlr, 0);
+		/* we only start mmio poller once, even the ADMIN queue maybe disconnected during the
+		 * migration, we will not shutdown this poller when restarting ADMIN queue.
+		 */
+		if (!vu_ctrlr->mmio_poller) {
+			vu_ctrlr->mmio_poller = SPDK_POLLER_REGISTER(vfio_user_poll_mmio, vu_ctrlr, 0);
+		}
+		if (vu_ctrlr->state == VFIO_USER_CTRLR_RESUMING) {
+			vfio_user_ctrlr_start_io_queues(vu_ctrlr);
+		}
+		vu_ctrlr->state = VFIO_USER_CTRLR_RUNNING;
 	}
 	vu_ctrlr->num_connected_qps++;
 	pthread_mutex_unlock(&endpoint->lock);
