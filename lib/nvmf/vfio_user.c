@@ -1198,13 +1198,13 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 
 			sq->addr = map_one(ctrlr->endpoint->vfu_ctx, sq->prp1, sq->size * 64, &sq->sg, &sq->iov);
 			if (!sq->addr) {
-				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap SQID %d %#lx-%#lx\n",
+				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap SQID %d %#lx-%#lx: %m\n",
 					      i, sq->prp1, sq->prp1 + sq->size * 64);
 				continue;
 			}
 			cq->addr = map_one(ctrlr->endpoint->vfu_ctx, cq->prp1, cq->size * 16, &cq->sg, &cq->iov);
 			if (!cq->addr) {
-				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap CQID %d %#lx-%#lx\n",
+				SPDK_DEBUGLOG(nvmf_vfio, "Memory isn't ready to remap CQID %d %#lx-%#lx: %m\n",
 					      i, cq->prp1, cq->prp1 + cq->size * 16);
 				continue;
 			}
@@ -1301,7 +1301,7 @@ nvmf_vfio_user_prop_req_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 					      ctrlr_id(qpair->ctrlr));
 				ret = map_admin_queue(qpair->ctrlr);
 				if (ret) {
-					SPDK_ERRLOG("%s: failed to map Admin queue\n", ctrlr_id(qpair->ctrlr));
+					SPDK_ERRLOG("%s: failed to map Admin queue: %m%s\n", ctrlr_id(qpair->ctrlr), errno == EFAULT ? " (is guest RAM shared?)": "");
 					return ret;
 				}
 				qpair->state = VFIO_USER_QPAIR_ACTIVE;
