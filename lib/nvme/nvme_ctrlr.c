@@ -4476,6 +4476,7 @@ spdk_nvme_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
 	return -EINVAL;
 }
 
+/* FIXME require gpa_to_vva to set errno so that we don't blindly return EINVAL */ 
 int
 spdk_nvme_map_cmd(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs, uint32_t max_iovcnt,
 		  uint32_t len, size_t mps,
