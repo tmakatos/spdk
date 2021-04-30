@@ -2064,8 +2064,8 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_endpoint *endpoint)
 
 	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_MIGR_REGION_IDX,
 			       4096 + sizeof(struct vfio_user_nvme_state),
-			       NULL, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, migr_sparse_mmap,
-			       1, endpoint->migr_fd);
+			       NULL, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, NULL /*migr_sparse_mmap*/,
+			       0 /*1*/, endpoint->migr_fd);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup migration region\n", vfu_ctx);
 		return ret;
