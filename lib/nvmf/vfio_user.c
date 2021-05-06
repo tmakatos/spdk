@@ -1964,6 +1964,27 @@ vfio_user_migration_data_written(vfu_ctx_t *vfu_ctx, uint64_t count)
 }
 
 static int
+vfio_user_device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
+{
+	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
+	struct nvmf_vfio_user_ctrlr *vu_ctrlr;
+
+	SPDK_DEBUGLOG(nvmf_vfio, "Device reset type %u\n", type);
+
+	if (type == VFU_RESET_LOST_CONN) {
+		return 0;
+	}
+
+	assert(type == VFU_RESET_DEVICE);
+	vu_ctrlr = endpoint->ctrlr;
+	SPDK_DEBUGLOG(nvmf_vfio, "controller %s state %u\n", ctrlr_id(vu_ctrlr), vu_ctrlr->state);
+
+	vu_ctrlr->state = VFIO_USER_CTRLR_RUNNING;
+
+	return 0;
+}
+
+static int
 vfio_user_dev_info_fill(struct nvmf_vfio_user_transport *vu_transport,
 			struct nvmf_vfio_user_endpoint *endpoint)
 {
@@ -2080,6 +2101,12 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_transport *vu_transport,
 	ret = vfu_setup_device_dma(vfu_ctx, memory_region_add_cb, memory_region_remove_cb);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup dma callback\n", vfu_ctx);
+		return ret;
+	}
+
+	ret = vfu_setup_device_reset_cb(vfu_ctx, vfio_user_device_reset);
+	if (ret < 0) {
+		SPDK_ERRLOG("vfu_ctx %p failed to setup reset callback\n", vfu_ctx);
 		return ret;
 	}
 
