@@ -1600,20 +1600,18 @@ _free_ctrlr(void *ctx)
 		free_qp(ctrlr, i);
 	}
 
-	if (ctrlr->endpoint) {
-		ctrlr->endpoint->ctrlr = NULL;
-	}
-
 	spdk_poller_unregister(&ctrlr->mmio_poller);
 	free(ctrlr);
 }
 
 static int
-free_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr)
+free_ctrlr(struct nvmf_vfio_user_endpoint *endpoint, struct nvmf_vfio_user_ctrlr *ctrlr)
 {
 	assert(ctrlr != NULL);
 
 	SPDK_DEBUGLOG(nvmf_vfio, "free %s\n", ctrlr_id(ctrlr));
+
+	endpoint->ctrlr = NULL;
 
 	if (ctrlr->thread == spdk_get_thread()) {
 		_free_ctrlr(ctrlr);
@@ -1656,7 +1654,7 @@ out:
 	if (err != 0) {
 		SPDK_ERRLOG("%s: failed to create vfio-user controller: %s\n",
 			    endpoint_id(endpoint), strerror(-err));
-		if (free_ctrlr(ctrlr) != 0) {
+		if (free_ctrlr(endpoint, ctrlr) != 0) {
 			SPDK_ERRLOG("%s: failed to clean up\n",
 				    endpoint_id(endpoint));
 		}
@@ -1774,7 +1772,7 @@ nvmf_vfio_user_stop_listen(struct spdk_nvmf_transport *transport,
 		if (strcmp(trid->traddr, endpoint->trid.traddr) == 0) {
 			TAILQ_REMOVE(&vu_transport->endpoints, endpoint, link);
 			if (endpoint->ctrlr) {
-				err = free_ctrlr(endpoint->ctrlr);
+				err = free_ctrlr(endpoint, endpoint->ctrlr);
 				if (err != 0) {
 					SPDK_ERRLOG("%s: failed destroy controller: %s\n",
 						    endpoint_id(endpoint), strerror(-err));
@@ -1924,7 +1922,7 @@ vfio_user_qpair_disconnect_cb(void *ctx)
 	}
 
 	if (!ctrlr->num_connected_qps) {
-		free_ctrlr(ctrlr);
+		free_ctrlr(endpoint, ctrlr);
 		pthread_mutex_unlock(&endpoint->lock);
 		return;
 	}
@@ -1945,7 +1943,7 @@ vfio_user_destroy_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr)
 
 	pthread_mutex_lock(&endpoint->lock);
 	if (!ctrlr->num_connected_qps) {
-		free_ctrlr(ctrlr);
+		free_ctrlr(endpoint, ctrlr);
 		pthread_mutex_unlock(&endpoint->lock);
 		return 0;
 	}
@@ -2006,7 +2004,7 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 
 	if (spdk_nvme_cpl_is_error(&req->req.rsp->nvme_cpl)) {
 		SPDK_ERRLOG("SC %u, SCT %u\n", req->req.rsp->nvme_cpl.status.sc, req->req.rsp->nvme_cpl.status.sct);
-		free_ctrlr(ctrlr);
+		free_ctrlr(endpoint, ctrlr);
 		return -1;
 	}
 
