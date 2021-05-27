@@ -1475,7 +1475,7 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_transport *vu_transport,
 	struct pxcap pxcap = {
 		.hdr.id = PCI_CAP_ID_EXP,
 		.pxcaps.ver = 0x2,
-		.pxdcap = {.per = 0x1, .flrc = 0x1},
+		.pxdcap = {.rer = 0x1, .flrc = 0x1},
 		.pxdcap2.ctds = 0x1
 	};
 
@@ -1525,7 +1525,7 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_transport *vu_transport,
 	}
 
 	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_CFG_REGION_IDX, NVME_REG_CFG_SIZE,
-			       access_pci_config, VFU_REGION_FLAG_RW, NULL, 0, -1);
+			       access_pci_config, VFU_REGION_FLAG_RW, NULL, 0, -1, 0);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup cfg\n", vfu_ctx);
 		return ret;
@@ -1534,11 +1534,11 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_transport *vu_transport,
 	if (vu_transport->transport_opts.disable_mappable_bar0) {
 		ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX, NVME_REG_BAR0_SIZE,
 				       access_bar0_fn, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM,
-				       NULL, 0, -1);
+				       NULL, 0, -1, 0);
 	} else {
 		ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR0_REGION_IDX, NVME_REG_BAR0_SIZE,
 				       access_bar0_fn, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM,
-				       sparse_mmap, 1, endpoint->fd);
+				       sparse_mmap, 1, endpoint->fd, 0);
 	}
 
 	if (ret < 0) {
@@ -1547,16 +1547,16 @@ vfio_user_dev_info_fill(struct nvmf_vfio_user_transport *vu_transport,
 	}
 
 	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR4_REGION_IDX, PAGE_SIZE,
-			       NULL, VFU_REGION_FLAG_RW, NULL, 0, -1);
+			       NULL, VFU_REGION_FLAG_RW, NULL, 0, -1, 0);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup bar 4\n", vfu_ctx);
 		return ret;
 	}
 
 	ret = vfu_setup_region(vfu_ctx, VFU_PCI_DEV_BAR5_REGION_IDX, PAGE_SIZE,
-			       NULL, VFU_REGION_FLAG_RW, NULL, 0, -1);
+			       NULL, VFU_REGION_FLAG_RW, NULL, 0, -1, 0);
 	if (ret < 0) {
-		SPDK_ERRLOG("vfu_ctx %p failed to setup bar 5\n", vfu_ctx);
+		SPDK_ERRLOG("vfu_ctx %p failed to setup bar 5\n", vfu_ctx, 0);
 		return ret;
 	}
 
