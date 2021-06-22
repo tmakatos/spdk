@@ -47,7 +47,7 @@
 #include "spdk/util.h"
 #include "spdk/thread.h"
 
-#define NVMF_MAX_ASYNC_EVENTS	(4)
+#define NVMF_MAX_ASYNC_EVENTS	(16)
 
 /* The spec reserves cntlid values in the range FFF0h to FFFFh. */
 #define NVMF_MIN_CNTLID 1
